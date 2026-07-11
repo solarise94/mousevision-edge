@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.DS_Store
+output
+tmp_frames
+docs/*.pdf

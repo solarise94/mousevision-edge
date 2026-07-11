@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MouseVision Edge</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">MV</span>
+        <div>
+          <div class="title">MouseVision Edge</div>
+          <div class="subtitle">AI Edge Mouse Scale · 本地检查 UI</div>
+        </div>
+      </div>
+      <div class="controls" id="listControls">
+        <label class="field">
+          <span>箱号</span>
+          <input id="cageId" value="C57-023" />
+        </label>
+        <label class="field">
+          <span>批次</span>
+          <select id="runSelect"></select>
+        </label>
+        <label class="field">
+          <span>倍速</span>
+          <select id="batchSpeed">
+            <option value="2">2×</option>
+            <option value="4" selected>4×</option>
+            <option value="8">8×</option>
+          </select>
+        </label>
+        <button id="btnBatch" class="btn primary">整段视频跑完</button>
+        <button id="btnNew" class="btn">+ 新批次单只</button>
+        <button id="btnReset" class="btn">清空重来</button>
+      </div>
+      <div class="controls" id="detailControls" hidden>
+        <button id="btnBack" class="btn">← 返回列表</button>
+        <label class="field">
+          <span>倍速</span>
+          <select id="speed">
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select>
+        </label>
+        <button id="btnReview" class="btn">只读复核</button>
+        <button id="btnReanalyze" class="btn primary">重新分析并保存</button>
+        <button id="btnStop" class="btn">停止</button>
+      </div>
+    </header>
+
+    <!-- LIST VIEW -->
+    <section id="viewList">
+      <div class="list-head">
+        <div>
+          <h2>当前批次鼠只</h2>
+          <p class="muted">箱号固定 · 批次内序号 · 「整段视频」创建新批次，不覆盖旧批次 · 点卡片只读复核</p>
+        </div>
+        <div class="list-stat" id="listStat">共 0 只</div>
+      </div>
+      <div class="batch-banner" id="batchBanner" hidden>
+        <span id="batchText">整段回放中…</span>
+        <button id="btnBatchStop" class="btn">停止</button>
+      </div>
+      <div class="mouse-grid" id="mouseGrid"></div>
+      <div class="empty" id="listEmpty" hidden>
+        还没有记录。点击右上角「称量下一只」开始。
+      </div>
+    </section>
+
+    <!-- DETAIL / PLAYBACK VIEW -->
+    <section id="viewDetail" hidden>
+      <main class="stage">
+        <section class="viewport">
+          <img id="stream" src="/api/stream" alt="video stream" />
+          <div class="hud-top">
+            <div class="chip" id="clock">--</div>
+            <div class="chip rec" id="recChip" hidden>
+              <span class="dot"></span>
+              <span id="recText">REC 00:00</span>
+            </div>
+          </div>
+          <div class="hud-bottom-left" id="qrBadge">
+            <span class="ok-dot"></span>
+            <span id="qrText">已识别二维码 / QR Code OK</span>
+          </div>
+        </section>
+
+        <aside class="panel">
+          <div class="panel-head">
+            <span class="badge" id="detailBadge">当前记录 / Current Record</span>
+          </div>
+          <div class="photo-preview" id="photoPreviewWrap" hidden>
+            <img id="photoPreview" alt="stable photo" />
+            <div class="photo-caption">稳定体重照片</div>
+          </div>
+          <dl class="meta">
+            <div><dt>鼠序号</dt><dd id="mouseIndex">-</dd></div>
+            <div><dt>箱号</dt><dd id="boxIdLabel">-</dd></div>
+            <div><dt>品系</dt><dd id="strain">-</dd></div>
+            <div class="weight-row">
+              <dt>体重</dt>
+              <dd id="weight" class="weight">-- g</dd>
+            </div>
+            <div>
+              <dt>稳定状态</dt>
+              <dd id="stable"><span class="stable-off">等待</span></dd>
+            </div>
+            <div><dt>稳定度评分</dt><dd id="score">-</dd></div>
+            <div><dt>状态机</dt><dd id="state">EMPTY</dd></div>
+            <div><dt>备注</dt><dd id="note">-</dd></div>
+          </dl>
+          <div class="curve-wrap">
+            <div class="curve-label">重量曲线</div>
+            <canvas id="curve" width="280" height="90"></canvas>
+          </div>
+          <div class="panel-foot">
+            <div id="message">就绪</div>
+            <a id="photoLink" href="#" hidden target="_blank">原图</a>
+          </div>
+        </aside>
+      </main>
+
+      <footer class="workflow">
+        <div class="wf-left" id="qrStatus">
+          <span class="ok-dot"></span>
+          已识别二维码 / QR Code OK
+        </div>
+        <ol class="steps" id="steps">
+          <li data-key="scan">1 扫码</li>
+          <li data-key="weigh">2 放鼠称重</li>
+          <li data-key="stable">3 稳定读取</li>
+          <li data-key="save">4 记录保存</li>
+        </ol>
+        <div class="wf-right">
+          <div class="next-title">下一只 / Next</div>
+          <div class="next-hint" id="hint">选择鼠只后开始回放</div>
+        </div>
+      </footer>
+    </section>
+  </div>
+  <script src="/static/api-client.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
