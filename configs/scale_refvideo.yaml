@@ -1,0 +1,55 @@
+device_id: scale01
+
+# Frame geometry (720x1280 RefVideo)
+frame_width: 720
+frame_height: 1280
+
+# LCD detection / ROI
+lcd_detect:
+  mode: auto   # auto | fixed
+  hsv_low: [90, 40, 80]
+  hsv_high: [130, 255, 255]
+  min_area: 8000
+  min_width: 150
+  min_height: 40
+
+# Optional fixed ROI (used when lcd_detect.mode=fixed)
+weight_roi:
+  x: 145
+  y: 780
+  w: 430
+  h: 110
+
+# Mouse blob detector (UI overlay)
+mouse_detect:
+  gray_threshold: 70
+  min_area: 800
+  x_ratio: [0.12, 0.88]
+
+templates_dir: assets/templates
+
+# Template matching
+match_threshold: 0.50
+min_digit_confidence: 0.45
+expected_digits: [3, 4]
+
+# Ring buffer
+buffer_seconds: 12.0
+buffer_max_items: 400
+
+# State machine thresholds (grams)
+empty_max: 0.15
+enter_min: 1.0
+leave_max: 0.30
+leave_hold_frames: 10
+weighing_min_samples: 5
+
+# Curve analyzer
+platform_window_seconds: 0.8
+platform_max_std: 0.35
+near_zero: 0.5
+photo_match_tol: 0.02
+photo_min_confidence: 0.45
+
+# Video processing
+frame_stride: 2  # process every Nth frame

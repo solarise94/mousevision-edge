@@ -1,0 +1,17 @@
+services:
+  mousevision:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: mousevision-edge:dev
+    container_name: mousevision-edge
+    ports:
+      - "8766:8766"
+    environment:
+      MOUSEVISION_HOST: "0.0.0.0"
+      MOUSEVISION_PORT: "8766"
+      MOUSEVISION_OUTPUT_DIR: "/app/output"
+      MOUSEVISION_MAX_UPLOAD_MB: "250"
+    volumes:
+      - ./output:/app/output:Z
+    restart: unless-stopped

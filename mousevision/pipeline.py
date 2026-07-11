@@ -1,0 +1,131 @@
+"""End-to-end weighing pipeline (CLI)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from mousevision.driver import SessionDriver
+from mousevision.run import create_run_dir, finish_run
+from mousevision.source.video import VideoFileSource
+from mousevision.upload_queue import UploadQueue
+
+
+@dataclass
+class PipelineResult:
+    output_dir: Path | None
+    states: list[str]
+    record: dict[str, Any] | None
+    samples: int
+    readable: int
+    records: list[dict[str, Any]] | None = None
+    output_dirs: list[Path] | None = None
+    run_dir: Path | None = None
+    run_id: str | None = None
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+class WeighingPipeline:
+    def __init__(self, config: dict[str, Any], templates_dir: str | Path) -> None:
+        self.config = config
+        self.templates_dir = templates_dir
+        self.device_id = str(config.get("device_id", "scale01"))
+
+    def run_video(
+        self,
+        video_path: str | Path,
+        *,
+        cage_id: str,
+        output_root: str | Path,
+        frame_stride: int | None = None,
+        stop_after_first: bool = True,
+        upload_queue: UploadQueue | None = None,
+        create_run: bool = True,
+        run_dir: Path | None = None,
+        run_id: str | None = None,
+        persist: bool = True,
+        start_ordinal: int = 1,
+        project_id: str = "default",
+    ) -> PipelineResult:
+        stride = (
+            frame_stride
+            if frame_stride is not None
+            else int(self.config.get("frame_stride", 1))
+        )
+        states_seen: list[str] = []
+        samples = 0
+        readable = 0
+
+        out_root = Path(output_root)
+        rid = run_id
+        if run_dir is not None:
+            active_run = Path(run_dir)
+        elif create_run:
+            active_run, manifest = create_run_dir(
+                out_root,
+                cage_id=cage_id,
+                mode="video",
+                source_id=str(video_path),
+                device_id=self.device_id,
+                run_id=rid,
+                project_id=project_id,
+                requested_ordinal=start_ordinal,
+            )
+            rid = str(manifest["run_id"])
+        else:
+            active_run = out_root
+            rid = rid or ""
+
+        queue = upload_queue
+        if queue is None and persist:
+            queue = UploadQueue(Path(output_root) / "upload_queue.db")
+
+        driver = SessionDriver(
+            config=self.config,
+            templates_dir=self.templates_dir,
+            output_root=active_run,
+            cage_id=cage_id,
+            run_id=rid or "",
+            device_id=self.device_id,
+            persist=persist,
+            upload_queue=queue if persist else None,
+            start_ordinal=start_ordinal,
+            project_id=project_id,
+        )
+
+        source = VideoFileSource(video_path, frame_stride=stride)
+        try:
+            for frame in source.frames():
+                event = driver.process_frame(frame)
+                samples += 1
+                if event.weight is not None:
+                    readable += 1
+                if not states_seen or states_seen[-1] != event.state.value:
+                    states_seen.append(event.state.value)
+                if driver.saved_events and stop_after_first:
+                    break
+        finally:
+            source.close()
+            if create_run and persist:
+                finish_run(active_run, status="completed" if driver.saved_events else "empty")
+
+        records = [e.record for e in driver.saved_events]
+        dirs = [e.output_dir for e in driver.saved_events]
+        return PipelineResult(
+            output_dir=dirs[-1] if dirs else None,
+            states=states_seen,
+            record=records[-1] if records else None,
+            samples=samples,
+            readable=readable,
+            records=records,
+            output_dirs=dirs,
+            run_dir=active_run,
+            run_id=rid,
+        )
