@@ -467,22 +467,30 @@ def verify_cages_view(
     }
 
 
+_EXPORT_FIELDS = [
+    "record_id",
+    "cage_id",
+    "strain",
+    "ordinal",
+    "weight",
+    "weight_source",
+    "confidence",
+    "status",
+    "verified",
+    "photo_mouse_detected",
+    "photo_verified",
+    "photo_observed_weight",
+    "photo_weight_delta",
+    "photo_selection",
+    "timestamp",
+    "notes",
+    "run_id",
+]
+
+
 def export_csv(records: list[dict[str, Any]]) -> bytes:
     buf = io.StringIO()
-    fields = [
-        "record_id",
-        "cage_id",
-        "strain",
-        "ordinal",
-        "weight",
-        "confidence",
-        "status",
-        "verified",
-        "timestamp",
-        "notes",
-        "run_id",
-    ]
-    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer = csv.DictWriter(buf, fieldnames=_EXPORT_FIELDS, extrasaction="ignore")
     writer.writeheader()
     for rec in records:
         writer.writerow(rec)
@@ -495,22 +503,20 @@ def export_xlsx(records: list[dict[str, Any]]) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "records"
-    headers = [
-        "record_id",
-        "cage_id",
-        "strain",
-        "ordinal",
-        "weight",
-        "confidence",
-        "status",
-        "verified",
-        "timestamp",
-        "notes",
-        "run_id",
-    ]
-    ws.append(headers)
+    ws.append(_EXPORT_FIELDS)
     for rec in records:
-        ws.append([rec.get(h) for h in headers])
+        ws.append([rec.get(h) for h in _EXPORT_FIELDS])
+    # Add a notes sheet explaining the photo/weight semantics.
+    ws2 = wb.create_sheet("说明")
+    ws2.append(["字段", "说明"])
+    ws2.append(["weight", "体重,来自稳定称重曲线中位数 (stable_curve_median)"])
+    ws2.append(["weight_source", "体重计算方法"])
+    ws2.append(["photo_mouse_detected", "代表照片帧是否检测到小鼠在秤上"])
+    ws2.append(["photo_verified", "照片是否验证了小鼠在秤状态 (True=有鼠, False=兜底帧)"])
+    ws2.append(["photo_observed_weight", "照片帧的 OCR 读数,仅供参考,可能与 weight 略有差异"])
+    ws2.append(["photo_weight_delta", "照片 OCR 读数与算法体重的差值 (审计用)"])
+    ws2.append(["photo_selection", "照片选择策略: mouse_on_scale / platform_midpoint"])
+    ws2.append(["verification_method", "点击回放视频确认实际称重过程"])
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()

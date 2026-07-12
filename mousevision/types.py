@@ -43,7 +43,7 @@ class AnalysisResult:
     photo_selection: str = "platform_midpoint"
     weight_source: str = "stable_curve_median"
     photo_mouse_detected: bool = False
-    photo_verified: bool = True
+    photo_verified: bool = False
 
 
 @dataclass

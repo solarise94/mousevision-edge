@@ -136,37 +136,66 @@ class SessionDriver:
 
         return event
 
-    def _select_photo_with_mouse(self, analysis: "AnalysisResult") -> tuple[Any, bool, str]:
-        """Choose a photo frame preferring mouse-on-scale, overriding the
-        analyzer's curve-only pick when a better frame is found.
+    def _select_photo_with_mouse(self, analysis: "AnalysisResult") -> tuple[Any, bool, str, float, float, float]:
+        """Choose a photo frame preferring mouse-on-scale.
 
-        Returns (frame, mouse_detected, selection_label).
+        Candidate scope (narrowing -> widening):
+          1. Platform window [platform_start_ms, platform_end_ms]
+          2. ENTER..LEAVE full session
+          3. Analyzer midpoint fallback (no mouse detection)
+
+        When a mouse-detected frame is chosen, ALL photo audit fields are
+        synced from the actual selected frame so record.json matches photo.jpg.
+
+        Returns (frame, mouse_detected, selection_label, frame_index,
+                  observed_weight, weight_delta).
         """
-        from mousevision.types import AnalysisResult as _AR  # noqa: avoid cycle
-
         analyzer_idx = analysis.photo_frame_index
+        analyzer_frame = self.buffer.nearest_frame(analyzer_idx)
         items = list(self.buffer.items())
-        if not items:
-            frame = self.buffer.nearest_frame(analyzer_idx)
-            return frame, False, "platform_midpoint"
+        if not items or analyzer_frame is None:
+            return analyzer_frame, False, "platform_midpoint", analyzer_idx, analysis.photo_observed_weight or 0.0, analysis.photo_weight_delta or 0.0
 
-        # Detect mouse on each buffered frame. Cache LCD boxes to avoid re-detect.
-        mouse_flags: dict[int, bool] = {}
-        for item in items:
-            idx = item.frame.index
+        # Read mouse detection params from config (same as UI live preview).
+        md_cfg = self.config.get("mouse_detect", {})
+        md_gray = int(md_cfg.get("gray_threshold", 70))
+        md_area = int(md_cfg.get("min_area", 800))
+        md_xr = tuple(md_cfg.get("x_ratio", (0.12, 0.88)))
+
+        def _check_mouse(item):
             lcd = self.reader.lcd_box(item.frame.image)
-            mouse_flags[idx] = detect_mouse_box(item.frame.image, lcd) is not None
+            return detect_mouse_box(item.frame.image, lcd, gray_thr=md_gray, min_area=md_area, x_ratio=md_xr) is not None
 
-        mouse_indices = [idx for idx, has in mouse_flags.items() if has]
-        if not mouse_indices:
-            # No mouse detected anywhere — keep analyzer's midpoint pick.
-            frame = self.buffer.nearest_frame(analyzer_idx)
-            return frame, False, "platform_midpoint"
+        # Scope 1: platform window
+        plat_lo = analysis.platform_start_ms
+        plat_hi = analysis.platform_end_ms
+        plat_items = [
+            it for it in items
+            if plat_lo <= it.frame.timestamp_ms <= plat_hi
+        ]
+        # Scope 2: ENTER..LEAVE
+        enter_ms = self.sm.session.enter_ms
+        leave_ms = self.sm.session.leave_ms
+        session_items = [
+            it for it in items
+            if (enter_ms is None or it.frame.timestamp_ms >= enter_ms)
+            and (leave_ms is None or it.frame.timestamp_ms <= leave_ms)
+        ] if enter_ms is not None else items
 
-        # Prefer a mouse frame near the analyzer's platform midpoint index.
-        best_idx = min(mouse_indices, key=lambda idx: abs(idx - analyzer_idx))
-        frame = self.buffer.frame_by_index(best_idx) or self.buffer.nearest_frame(best_idx)
-        return frame, True, "mouse_on_scale"
+        # Try platform scope first, then session scope.
+        for scope_items, scope_label in [(plat_items, "mouse_on_scale"), (session_items, "mouse_on_scale")]:
+            if not scope_items:
+                continue
+            mouse_items = [it for it in scope_items if _check_mouse(it)]
+            if mouse_items:
+                # Pick the one closest to the analyzer's platform midpoint index.
+                best = min(mouse_items, key=lambda it: abs(it.frame.index - analyzer_idx))
+                observed = float(best.weight) if best.weight is not None else 0.0
+                delta = abs(observed - analysis.weight)
+                return best.frame, True, scope_label, best.frame.index, round(observed, 2), round(delta, 3)
+
+        # Fallback: analyzer midpoint, no mouse detected.
+        return analyzer_frame, False, "platform_midpoint", analyzer_idx, analysis.photo_observed_weight or 0.0, analysis.photo_weight_delta or 0.0
 
     def _handle_analyze(self) -> None:
         analysis = self.analyzer.analyze(self.sm.session.curve)
@@ -177,10 +206,14 @@ class SessionDriver:
             self.buffer.clear()
             return
 
-        photo_frame, mouse_detected, selection_label = self._select_photo_with_mouse(analysis)
+        photo_frame, mouse_detected, selection_label, photo_idx, observed_w, weight_delta = self._select_photo_with_mouse(analysis)
         analysis.photo_mouse_detected = mouse_detected
         analysis.photo_selection = selection_label
-        analysis.photo_verified = mouse_detected  # verified = mouse was seen
+        analysis.photo_verified = mouse_detected
+        # Sync ALL photo audit fields to the actual selected frame.
+        analysis.photo_frame_index = photo_idx
+        analysis.photo_observed_weight = observed_w
+        analysis.photo_weight_delta = weight_delta
         history = [
             {
                 "previous": t.previous.value,
