@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MouseVision Edge</title>
+  <link rel="stylesheet" href="/static/shared/theme.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; min-height: 100%;
+      background:
+        radial-gradient(1200px 600px at 20% -10%, #243041 0%, transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, #1a2a22 0%, transparent 45%),
+        var(--mv-bg);
+      color: var(--mv-text);
+      font-family: inherit;
+    }
+    .entry {
+      max-width: 520px;
+      margin: 0 auto;
+      padding: 48px 20px 64px;
+      display: grid;
+      gap: 28px;
+      text-align: center;
+    }
+    .brand { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+    .logo {
+      width: 56px; height: 56px; border-radius: 16px;
+      display: grid; place-items: center;
+      background: linear-gradient(145deg, var(--mv-green), var(--mv-green-dim));
+      color: #0b1a12; font-weight: 800; font-size: 20px;
+    }
+    h1 { margin: 0; font-size: 24px; }
+    .sub { color: var(--mv-muted); margin: 0; font-size: 14px; }
+    .choices { display: grid; gap: 14px; }
+    .choice {
+      display: grid; gap: 6px; text-align: left;
+      padding: 18px 20px;
+      border: 1px solid var(--mv-line);
+      border-radius: var(--mv-radius);
+      background: var(--mv-panel);
+      color: inherit;
+      cursor: pointer;
+      transition: border-color 0.15s, transform 0.15s;
+    }
+    .choice:hover { border-color: rgba(61, 220, 132, 0.45); transform: translateY(-1px); }
+    .choice.recommended { border-color: rgba(61, 220, 132, 0.55); box-shadow: 0 0 0 1px rgba(61,220,132,0.15); }
+    .choice-title { font-size: 17px; font-weight: 700; }
+    .choice-desc { color: var(--mv-muted); font-size: 13px; }
+    .badge-rec {
+      display: inline-block; font-size: 11px; font-weight: 700;
+      color: var(--mv-green); background: rgba(61,220,132,0.12);
+      border: 1px solid rgba(61,220,132,0.3);
+      border-radius: 999px; padding: 3px 8px; margin-left: 8px;
+    }
+    .foot { color: var(--mv-muted); font-size: 12px; }
+    .foot a { color: var(--mv-green); }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="entry" id="entryRoot">
+    <div class="brand">
+      <span class="logo">MV</span>
+      <h1>MouseVision Edge</h1>
+      <p class="sub">小鼠体重数据管理系统</p>
+    </div>
+    <div class="choices" id="choices" hidden>
+      <button type="button" class="choice" id="btnRecord" data-to="mobile">
+        <span class="choice-title">现场录制<span class="badge-rec" id="recBadge" hidden>推荐</span></span>
+        <span class="choice-desc">扫码选箱、录像上传、排队分析</span>
+      </button>
+      <button type="button" class="choice" id="btnManage" data-to="manage">
+        <span class="choice-title">数据管理<span class="badge-rec" id="mgrBadge" hidden>推荐</span></span>
+        <span class="choice-desc">核对、发布、导出与箱子管理</span>
+      </button>
+    </div>
+    <p class="foot" id="redirecting" hidden>正在跳转…</p>
+    <p class="foot"><a href="/legacy">算法检查台（旧版）</a></p>
+  </div>
+  <script src="/static/entry.js"></script>
+</body>
+</html>

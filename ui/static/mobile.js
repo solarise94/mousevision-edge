@@ -1075,7 +1075,7 @@
         ]),
         h("div", { class: "card" }, [
           h("div", { class: "li-sub" }, "管理端"),
-          h("button", { class: "btn ghost", onClick: () => (location.href = "/") }, "打开桌面管理端"),
+          h("button", { class: "btn ghost", onClick: () => (location.href = "/?intent=manage") }, "打开管理端"),
         ]),
       ])
     );
