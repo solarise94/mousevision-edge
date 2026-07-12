@@ -99,6 +99,54 @@ class UploadQueue:
             finally:
                 conn.close()
 
+    def update_by_record_id(
+        self, record_id: str, record: dict[str, Any], record_path: Path, photo_path: Path | None
+    ) -> bool:
+        """Refresh a queued item after its ordinal/path changed (e.g. renumber).
+
+        Updates record_path, photo_path and payload for the given record_id.
+        Returns True if a row was updated.
+        """
+        if not record_id:
+            return False
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE upload_queue
+                    SET record_path = ?, photo_path = ?, payload = ?, updated_at = ?
+                    WHERE record_id = ?
+                    """,
+                    (
+                        str(record_path),
+                        str(photo_path) if photo_path else None,
+                        json.dumps(record, ensure_ascii=False),
+                        now,
+                        record_id,
+                    ),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def delete_by_record_id(self, record_id: str) -> int:
+        """Remove queued items for a record (e.g. when the record is deleted)."""
+        if not record_id:
+            return 0
+        with self.lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "DELETE FROM upload_queue WHERE record_id = ?", (record_id,)
+                )
+                conn.commit()
+                return cur.rowcount
+            finally:
+                conn.close()
+
     def list_pending(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.lock:
             conn = self._connect()

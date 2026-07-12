@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import sqlite3
 import threading
@@ -365,6 +366,8 @@ class AnalysisJobManager:
         templates_dir: str | Path,
         analysis_fn: AnalysisFn | None = None,
         reserve_ordinals: Callable[[str, int, str], int] | None = None,
+        release_ordinals: Callable[[str, int], None] | None = None,
+        upload_queue: "UploadQueue | None" = None,
     ) -> None:
         self.store = store
         self.output_root = Path(output_root)
@@ -373,6 +376,10 @@ class AnalysisJobManager:
         self.analysis_fn = analysis_fn or self._run_pipeline
         # (cage_id, count, project_id) -> first reserved ordinal
         self.reserve_ordinals = reserve_ordinals
+        # (cage_id, ordinal) -> release a reserved ordinal (best-effort, tail-only)
+        self.release_ordinals = release_ordinals
+        # Shared upload queue; injected so renumber refresh is authoritative.
+        self.upload_queue = upload_queue
         self._pipeline: WeighingPipeline | None = None
         if analysis_fn is None:
             config = load_config(self.config_path)
@@ -439,6 +446,8 @@ class AnalysisJobManager:
             if job is None or job.get("status") != "queued":
                 continue
             video_path = job.get("video_path")
+            cage_id = str(job.get("cage_id") or "")
+            requested_ordinal = job.get("requested_ordinal")
             try:
                 self.store.update(
                     job_id,
@@ -451,6 +460,15 @@ class AnalysisJobManager:
                 )
                 result = self.analysis_fn(job)
                 count = int(result.get("record_count") or 0)
+                # Zero-detect: the reserved slot detected nothing. Release it
+                # (best-effort, tail-only) so a run of empty videos does not
+                # permanently consume ordinals (design §3.5.2 rule 3).
+                if (
+                    count == 0
+                    and self.release_ordinals is not None
+                    and requested_ordinal is not None
+                ):
+                    self.release_ordinals(cage_id, int(requested_ordinal))
                 self.store.update(
                     job_id,
                     status="completed",
@@ -458,11 +476,21 @@ class AnalysisJobManager:
                     progress=1.0,
                     run_id=result.get("run_id"),
                     record_count=count,
-                    message=f"分析完成，共检出 {count} 只",
+                    message=("未检出鼠只" if count == 0 else f"分析完成，共检出 {count} 只"),
                     error=None,
                     completed_at=_now(),
                 )
             except Exception as exc:
+                # Analysis failed: release the reserved ordinal so failed jobs
+                # do not permanently occupy a slot (design §3.5.2 rule 3).
+                if (
+                    self.release_ordinals is not None
+                    and requested_ordinal is not None
+                ):
+                    try:
+                        self.release_ordinals(cage_id, int(requested_ordinal))
+                    except Exception:
+                        pass
                 self.store.update(
                     job_id,
                     status="failed",
@@ -496,23 +524,88 @@ class AnalysisJobManager:
             create_run=True,
             start_ordinal=start_ordinal,
             project_id=project_id,
+            upload_queue=self.upload_queue,
         )
         records = result.records or []
         count = len(records)
         # Multi-detect: a job that reserved 1 slot produced N>1 records. Reserve
         # the extra N-1 ordinals now and renumber the trailing records so they
         # never overlap another cage's numbers (design §3.5.2 rule 4).
+        # A renumber failure is NOT swallowed — it must fail the job so the
+        # colliding ordinals are never presented as a successful result, and
+        # any half-applied rename is rolled back by renumber_records itself.
+        # The extra reserved range is also released on failure so it does not
+        # leak (note: with tail-only release the range may still leave a gap if
+        # another reservation advanced next_ordinal — see design §3.5.2).
         if count > 1 and self.reserve_ordinals is not None and result.run_dir is not None:
+            extra_base = int(self.reserve_ordinals(cage_id, count - 1, project_id))
+            new_ordinals = [start_ordinal] + list(
+                range(extra_base, extra_base + count - 1)
+            )
             try:
-                extra_base = int(self.reserve_ordinals(cage_id, count - 1, project_id))
-                new_ordinals = [start_ordinal] + list(
-                    range(extra_base, extra_base + count - 1)
-                )
                 renumber_records(result.run_dir, new_ordinals)
             except Exception:
-                # Renumber is best-effort; keep original records on failure.
-                pass
+                # Renumber failed (rolled back by renumber_records). Release the
+                # extra reserved range so it is not permanently leaked.
+                if self.release_ordinals is not None:
+                    for extra_ord in range(extra_base, extra_base + count - 1):
+                        try:
+                            self.release_ordinals(cage_id, extra_ord)
+                        except Exception:
+                            pass
+                raise
+            # Renumber moved mouse_NNN dirs and rewrote record.json; refresh the
+            # upload queue so sync sees the final paths and ordinals, not the
+            # pre-renumber ones the driver enqueued mid-analysis.
+            self._refresh_queue_after_renumber(result.run_dir)
+            # records dicts are stale post-renumber; re-read for the return path.
+            records = self._read_records(result.run_dir)
         return {
             "run_id": result.run_id,
             "record_count": count,
         }
+
+    @staticmethod
+    def _read_records(run_dir: Path) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for rec_path in sorted(Path(run_dir).glob("mouse_*/record.json")):
+            try:
+                out.append(json.loads(rec_path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+        return out
+
+    def _refresh_queue_after_renumber(self, run_dir: Path) -> None:
+        """Update each record's queue entry (path + payload) post-renumber.
+
+        Re-reads the final record.json files and pushes fresh path/payload into
+        the upload queue keyed by record_id, so later WiFi sync sees the renamed
+        directories and final ordinals instead of the pre-renumber snapshot.
+
+        This is NOT best-effort: if the queue is unavailable or any record fails
+        to refresh, an exception propagates so the job is marked failed rather
+        than leaving stale (now-invalid) paths in the sync queue.
+        """
+        if self.upload_queue is None:
+            # No shared queue (e.g. unit tests with a custom analysis_fn). Nothing
+            # to refresh — the driver's internal queue was never populated.
+            return
+        missing: list[str] = []
+        for rec_path in sorted(Path(run_dir).glob("mouse_*/record.json")):
+            rec = json.loads(rec_path.read_text(encoding="utf-8"))
+            rid = rec.get("record_id")
+            if not rid:
+                continue
+            photo = rec_path.parent / "photo.jpg"
+            updated = self.upload_queue.update_by_record_id(
+                rid,
+                rec,
+                rec_path,
+                photo if photo.exists() else None,
+            )
+            if not updated:
+                missing.append(rid)
+        if missing:
+            raise RuntimeError(
+                f"upload queue refresh failed for record_ids: {missing}"
+            )

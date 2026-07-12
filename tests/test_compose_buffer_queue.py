@@ -63,6 +63,44 @@ def test_upload_queue_idempotent_on_record_id(tmp_path: Path):
     assert len(q.list_pending()) == 1
 
 
+def test_upload_queue_update_after_renumber(tmp_path: Path):
+    """Renumber moved a record's dir; queue must reflect new path + ordinal."""
+    import json
+
+    q = UploadQueue(tmp_path / "queue.db")
+    q.enqueue(
+        {"record_id": "rec-A", "cage_id": "C57-023", "ordinal": 2, "actual_ordinal": 2},
+        record_path=tmp_path / "run" / "mouse_002" / "record.json",
+        photo_path=tmp_path / "run" / "mouse_002" / "photo.jpg",
+    )
+    updated = q.update_by_record_id(
+        "rec-A",
+        {"record_id": "rec-A", "cage_id": "C57-023", "ordinal": 5, "actual_ordinal": 5},
+        record_path=tmp_path / "run" / "mouse_005" / "record.json",
+        photo_path=tmp_path / "run" / "mouse_005" / "photo.jpg",
+    )
+    assert updated is True
+    pending = q.list_pending()
+    assert "mouse_005" in pending[0]["record_path"]
+    payload = json.loads(q._connect().execute(
+        "SELECT payload FROM upload_queue WHERE record_id=?", ("rec-A",)
+    ).fetchone()["payload"])
+    assert payload["actual_ordinal"] == 5
+
+
+def test_upload_queue_delete_by_record_id(tmp_path: Path):
+    """Deleting a record removes it from the sync queue (bug #4)."""
+    q = UploadQueue(tmp_path / "queue.db")
+    q.enqueue(
+        {"record_id": "rec-D", "cage_id": "C57-023", "weight": 16.0},
+        record_path=tmp_path / "r.json",
+    )
+    assert len(q.list_pending()) == 1
+    n = q.delete_by_record_id("rec-D")
+    assert n == 1
+    assert len(q.list_pending()) == 0
+
+
 def test_create_run_dir_isolated(tmp_path: Path):
     a, ma = create_run_dir(tmp_path, cage_id="C57-023")
     b, mb = create_run_dir(tmp_path, cage_id="C57-023")
