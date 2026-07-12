@@ -203,7 +203,7 @@ async function loadMice() {
     const ordinal = m.ordinal ?? m.index;
     card.innerHTML = `
       <div class="thumb">
-        <img src="${m.photo_url}" alt="mouse ${ordinal}" loading="lazy" />
+        <img src="${m.photo_url}?size=thumb" alt="mouse ${ordinal}" loading="lazy" />
         <span class="idx">#${String(ordinal).padStart(2, "0")}</span>
       </div>
       <div class="card-body">

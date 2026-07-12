@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import re
 import shutil
@@ -1361,18 +1362,54 @@ def api_record(
     return mouse
 
 
+def _serve_photo(path: Path, size: str = "thumb") -> Response:
+    """Serve a record photo, optionally as a compressed thumbnail.
+
+    size=thumb: resize to 320px wide, JPEG q80, cached to .thumbs/.
+    size=full: serve the original unchanged.
+    Record photos are immutable, so responses get long-lived cache headers.
+    """
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="照片不存在")
+    if size != "thumb":
+        return FileResponse(path, headers={"Cache-Control": "max-age=31536000, immutable"})
+
+    thumb_dir = DEFAULT_OUTPUT / ".thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    st = path.stat()
+    key = hashlib.sha1(f"{path}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:24]
+    thumb_path = thumb_dir / f"{key}.jpg"
+
+    if not thumb_path.exists():
+        img = cv2.imread(str(path))
+        if img is None:
+            return FileResponse(path, headers={"Cache-Control": "max-age=31536000, immutable"})
+        h, w = img.shape[:2]
+        if w > 320:
+            new_h = max(1, int(h * 320 / w))
+            img = cv2.resize(img, (320, new_h), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return FileResponse(path, headers={"Cache-Control": "max-age=31536000, immutable"})
+        thumb_path.write_bytes(buf.tobytes())
+
+    return FileResponse(
+        thumb_path,
+        headers={"Cache-Control": "max-age=31536000, immutable", "ETag": f'"{key}"'},
+    )
+
+
 @app.get("/api/records/{record_id}/photo", response_model=None)
 def api_record_photo(
     record_id: str,
+    size: str = Query("thumb", pattern="^(thumb|full)$"),
     include_deleted: bool = Query(False),
     user: dict[str, Any] | None = Depends(current_user),
 ):
     allow_deleted = bool(include_deleted and user and user.get("role") in {"admin", "operator"})
     mouse = _assert_record_readable(record_id, include_deleted=allow_deleted)
     path = DEFAULT_OUTPUT / mouse["dir"] / mouse.get("photo", "photo.jpg")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="照片不存在")
-    return FileResponse(path)
+    return _serve_photo(path, size)
 
 
 @app.delete("/api/records/{record_id}", dependencies=[Depends(require_write_access)])
@@ -1880,14 +1917,18 @@ def api_mouse(index: int, run_id: str | None = Query(None)) -> dict[str, Any]:
 
 
 @app.get("/api/mice/{index}/photo", response_model=None)
-def api_mouse_photo(index: int, run_id: str | None = Query(None)):
+def api_mouse_photo(
+    index: int,
+    run_id: str | None = Query(None),
+    size: str = Query("thumb", pattern="^(thumb|full)$"),
+):
     mouse = registry.get(index, run_id=run_id)
     if mouse is None:
         return {"error": "not found"}
     path = DEFAULT_OUTPUT / mouse["dir"] / mouse.get("photo", "photo.jpg")
     if not path.exists():
         return {"error": "photo missing"}
-    return FileResponse(path)
+    return _serve_photo(path, size)
 
 
 class StartPlaybackRequest(BaseModel):

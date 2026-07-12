@@ -20,6 +20,8 @@
     logs: [],
     settings: {},
     pendingBadge: 0,
+    miceGroups: [],
+    expandedCages: {},
   };
 
   const ROUTES = [
@@ -158,6 +160,8 @@
           state.page = 1;
         }
         await loadRecords();
+        const r = await api("/api/mice-admin");
+        state.miceGroups = r.items || [];
       }
       if (state.route === "overview") await loadOverview();
       if (state.route === "boxes") {
@@ -576,7 +580,7 @@
           onClick: () => onSelect(rec),
         });
         const thumb = h("div", { class: "thumb" });
-        thumb.appendChild(h("img", { src: rec.photo_url, alt: "" }));
+        thumb.appendChild(h("img", { src: rec.photo_url + "?size=thumb", alt: "" }));
         thumb.appendChild(h("span", { class: "idx" }, `#${String(rec.ordinal).padStart(2, "0")}`));
         thumb.appendChild(h("span", { class: `status-badge status-${rec.status}` }, statusLabel(rec.status)));
         card.appendChild(thumb);
@@ -594,8 +598,8 @@
   function detailPanel(rec) {
     if (!rec) return h("div", { class: "detail empty" }, "选择一条记录查看详情");
     const photo = rec.status === "deleted"
-      ? `${rec.photo_url}?include_deleted=true`
-      : rec.photo_url;
+      ? `${rec.photo_url}?include_deleted=true&size=full`
+      : `${rec.photo_url}?size=full`;
     const dl = h("dl");
     const rows = [
       ["记录 ID", rec.record_id],
@@ -700,24 +704,64 @@
       } catch (_) {}
       render();
     }
-    const pager = h("div", { class: "pager" });
-    const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
-    pager.appendChild(h("button", {
-      class: "btn", disabled: state.page <= 1,
-      onClick: () => { state.page--; loadRecords().then(render); },
-    }, "上一页"));
-    pager.appendChild(h("span", null, `${state.page} / ${pages}`));
-    pager.appendChild(h("button", {
-      class: "btn", disabled: state.page >= pages,
-      onClick: () => { state.page++; loadRecords().then(render); },
-    }, "下一页"));
+
+    // Two-level cage → mice list. Filter miceGroups by current tab.
+    const groups = (state.miceGroups || []).map((g) => {
+      const recs = g.records.filter((r) => {
+        if (state.tab === "all") return true;
+        return r.status === state.tab;
+      });
+      const weights = recs.map((r) => r.weight).filter((w) => w != null);
+      const mean = weights.length ? (weights.reduce((a, b) => a + b, 0) / weights.length) : null;
+      const pendingN = g.records.filter((r) => r.status === "pending").length;
+      return { ...g, filtered: recs, mean_weight: mean, pending_n: pendingN };
+    }).filter((g) => g.filtered.length > 0);
+
+    function toggleCage(cageId) {
+      state.expandedCages[cageId] = !state.expandedCages[cageId];
+      render();
+    }
+
+    const cageList = h("div", { class: "cage-row-list" });
+    if (!groups.length) {
+      cageList.appendChild(h("div", { class: "empty" }, "暂无记录"));
+    }
+    groups.forEach((g) => {
+      const expanded = !!state.expandedCages[g.cage_id];
+      const row = h("div", { class: `cage-row${expanded ? " expanded" : ""}` });
+      const head = h("div", { class: "cage-row-head", onClick: () => toggleCage(g.cage_id) },
+        h("span", { class: "cage-row-caret" }, expanded ? "▾" : "▸"),
+        h("strong", null, g.cage_id),
+        h("span", { class: "muted" }, g.strain),
+        h("span", { class: "muted" }, `${g.filtered.length} 只`),
+        g.mean_weight != null ? h("span", { class: "muted" }, `均 ${fmtWeight(g.mean_weight)}`) : null,
+        g.pending_n > 0 ? h("span", { class: "cage-row-badge" }, `${g.pending_n} 待核对`) : null
+      );
+      row.appendChild(head);
+      if (expanded) {
+        const thumbs = h("div", { class: "cage-thumbs" });
+        g.filtered.forEach((rec) => {
+          const thumb = h("div", {
+            class: `cage-thumb${state.selectedId === rec.record_id ? " selected" : ""}`,
+            onClick: () => select(rec),
+          });
+          thumb.appendChild(h("img", { src: rec.photo_url + "?size=thumb", alt: "" }));
+          thumb.appendChild(h("span", { class: "cage-thumb-idx" }, `#${String(rec.ordinal).padStart(2, "0")}`));
+          const wspan = h("span", { class: "cage-thumb-w" }, fmtWeight(rec.weight));
+          thumb.appendChild(wspan);
+          thumbs.appendChild(thumb);
+        });
+        row.appendChild(h("div", { class: "cage-row-body" }, thumbs));
+      }
+      cageList.appendChild(row);
+    });
 
     return [
       filtersBar(() => loadRecords().then(render)),
       kpiRow(state.stats),
       tabBar,
       h("div", { class: "data-layout" },
-        h("div", null, recordGrid(select), pager),
+        cageList,
         detailPanel(state.selected)
       ),
     ];
@@ -906,7 +950,7 @@
       const thumbs = h("div", { class: "cage-thumbs" });
       cage.records.forEach((rec) => {
         const thumb = h("div", { class: "cage-thumb" });
-        thumb.appendChild(h("img", { src: rec.photo_url, alt: "" }));
+        thumb.appendChild(h("img", { src: rec.photo_url + "?size=thumb", alt: "" }));
         thumb.appendChild(h("span", { class: "cage-thumb-idx" }, `#${String(rec.ordinal).padStart(2, "0")}`));
         const wspan = h("span", { class: isOutlier(rec.weight) ? "cage-thumb-w warn" : "cage-thumb-w" }, fmtWeight(rec.weight));
         thumb.appendChild(wspan);

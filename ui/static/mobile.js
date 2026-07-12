@@ -798,7 +798,7 @@
     const ordinal = it.actual_ordinal || it.requested_ordinal;
     const clickable = it.status === "completed" && it.record_id;
     const thumb = it.photo_url
-      ? h("img", { class: "thumb", src: it.photo_url, loading: "lazy" })
+      ? h("img", { class: "thumb", src: it.photo_url + "?size=thumb", loading: "lazy" })
       : h("div", { class: "thumb placeholder" }, "🐭");
     const title =
       it.status === "completed" && it.weight != null
