@@ -46,7 +46,14 @@ python -m ui.app
 | 手机管理 | `/mobile/manage` | 手机上查看箱子与记录 |
 | 算法检查台 | `/legacy` | 旧版桌面回放/复核 UI |
 
-管理后台首次启动会自动创建 `admin` 账号，默认密码 `admin123`（可通过环境变量 `MOUSEVISION_ADMIN_PASSWORD` 覆盖）。登录后请在「用户管理」中修改密码。
+管理后台首次启动会自动创建 `admin` 账号：
+
+- 若设置了 `MOUSEVISION_ADMIN_PASSWORD`，使用该密码；
+- 否则生成一次性随机密码并打印到服务日志。
+
+两种情况均强制首次登录修改密码（`must_change_password`）；改密完成前，除 `/api/me`、`/api/me/password`、`/api/logout` 外的管理 API 会返回 403。
+
+共享 `MOUSEVISION_API_TOKEN` **仅用于手机/旧版检查台写接口**，不会注入到 `/` 或 `/pc`，也**不会**映射为管理员会话。
 
 ## Web 录像与后台分析
 

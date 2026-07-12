@@ -1,17 +1,49 @@
-"""Operation audit log store."""
+"""Operation audit log store with sensitive-field scrubbing."""
 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
 from datetime import datetime
 from typing import Any
 
+SENSITIVE_KEYS = frozenset(
+    {
+        "password",
+        "password_hash",
+        "salt",
+        "token",
+        "secret",
+        "api_token",
+        "session",
+        "mv_session",
+        "x_mousevision_token",
+    }
+)
+
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def scrub_sensitive(value: Any) -> Any:
+    """Recursively redact password/token/secret fields before persistence."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key).lower() in SENSITIVE_KEYS or any(
+                s in str(key).lower() for s in ("password", "secret", "token")
+            ):
+                out[key] = "***"
+            else:
+                out[key] = scrub_sensitive(item)
+        return out
+    if isinstance(value, list):
+        return [scrub_sensitive(item) for item in value]
+    return value
 
 
 class AuditStore:
@@ -19,6 +51,7 @@ class AuditStore:
         self.db_path = db_path
         self.lock = threading.Lock()
         self._init_db()
+        self.scrub_existing_logs()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
@@ -52,6 +85,37 @@ class AuditStore:
             finally:
                 conn.close()
 
+    def scrub_existing_logs(self) -> int:
+        """Best-effort cleanup of previously logged plaintext secrets."""
+        pattern = re.compile(
+            r'"(password|password_hash|salt|token|secret|api_token|session)"\s*:\s*"[^"]*"',
+            re.I,
+        )
+        updated = 0
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT id, detail FROM audit_logs WHERE detail IS NOT NULL"
+                ).fetchall()
+                for row in rows:
+                    raw = row["detail"] or ""
+                    try:
+                        parsed = json.loads(raw)
+                        scrubbed = scrub_sensitive(parsed)
+                        new_text = json.dumps(scrubbed, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        new_text = pattern.sub(r'"\1":"***"', raw)
+                    if new_text != raw:
+                        conn.execute(
+                            "UPDATE audit_logs SET detail = ? WHERE id = ?",
+                            (new_text, row["id"]),
+                        )
+                        updated += 1
+            finally:
+                conn.close()
+        return updated
+
     def log(
         self,
         *,
@@ -63,7 +127,10 @@ class AuditStore:
     ) -> dict[str, Any]:
         entry_id = str(uuid.uuid4())
         at = _now()
-        detail_text = json.dumps(detail, ensure_ascii=False) if detail is not None else None
+        safe_detail = scrub_sensitive(detail) if detail is not None else None
+        detail_text = (
+            json.dumps(safe_detail, ensure_ascii=False) if safe_detail is not None else None
+        )
         with self.lock:
             conn = self._connect()
             try:
@@ -84,7 +151,7 @@ class AuditStore:
             "action": action,
             "target_type": target_type,
             "target_id": target_id,
-            "detail": detail,
+            "detail": safe_detail,
         }
 
     def list(self, *, limit: int = 50, offset: int = 0, action: str | None = None) -> dict[str, Any]:
@@ -116,7 +183,7 @@ class AuditStore:
             item = dict(row)
             if item.get("detail"):
                 try:
-                    item["detail"] = json.loads(item["detail"])
+                    item["detail"] = scrub_sensitive(json.loads(item["detail"]))
                 except json.JSONDecodeError:
                     pass
             items.append(item)

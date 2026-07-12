@@ -44,10 +44,16 @@ API：`GET /api/records`、`POST /api/records/{id}/publish` 等，见 [ui/app.py
 
 ## 鉴权
 
-- **会话登录**：`POST /api/login`，Cookie `mv_session`
+- **会话登录**：`POST /api/login`，Cookie `mv_session`（HTTPS 下自动 / 可通过 `MOUSEVISION_HTTPS=1` 设置 `Secure`）
 - **角色**：`admin` / `operator` / `viewer`
-- **兼容**：写 API 仍接受 `X-MouseVision-Token`（与手机端、部署代理一致）
+- **强制改密**：首次 seed 的 admin 必须调用 `POST /api/me/password` 后才能访问管理 API
+- **共享 token**：仅注入到 `/mobile` 与 `/legacy`，供上传/回放写接口使用；**不注入** `/`、`/pc`，且 **永不** 映射为 admin 会话
+- **登录限流**：同一 IP 5 分钟内失败 5 次返回 429
 
-## 算法检查台（旧版）
+## 软删除语义
 
-原桌面回放 UI 保留在 `/legacy`，详情面板中的「回放复核」会打开该页面并触发只读 `/api/start`。
+`DELETE /api/records/{id}` 仅写 `records_meta.status=deleted`，磁盘文件保留。
+
+- 默认读取（手机本箱列表、详情、照片）隐藏已删除记录
+- 管理端 `tab=deleted` 或 `include_deleted=true` 才可见
+- `POST /api/records/{id}/restore` 恢复为 `pending`

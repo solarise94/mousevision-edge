@@ -56,10 +56,23 @@
 
   async function api(url, options = {}) {
     const res = await apiFetch(url, options);
-    if (res.status === 401 && !url.includes("/api/login")) {
+    if (res.status === 401 && !url.includes("/api/login") && !url.includes("/api/me/password")) {
       state.user = null;
       navigate("login");
       throw new Error("unauthorized");
+    }
+    if (res.status === 403) {
+      let detail = "权限不足";
+      try {
+        const j = await res.clone().json();
+        detail = j.detail || detail;
+      } catch (_) {}
+      if (detail.includes("修改密码") || res.headers.get("X-Must-Change-Password") === "1") {
+        state.route = "change-password";
+        render();
+        throw new Error(detail);
+      }
+      throw new Error(detail);
     }
     if (!res.ok) {
       let msg = res.statusText;
@@ -106,6 +119,11 @@
     }
     if (!state.user && state.route !== "login") {
       navigate("login", true);
+      return;
+    }
+    if (state.user?.must_change_password) {
+      state.route = "change-password";
+      render();
       return;
     }
     await loadRoute();
@@ -229,6 +247,12 @@
           h("strong", null, state.user?.display_name || state.user?.username || ""),
           state.user?.role || "",
           h("br"),
+          h("button", {
+            class: "btn ghost",
+            style: "padding:4px 0;font-size:12px",
+            onClick: () => { state.route = "change-password"; render(); },
+          }, "修改密码"),
+          h("br"),
           h("a", { href: "/mobile", style: "color:var(--mv-green)" }, "手机录制"),
           " · ",
           h("a", { href: "/", style: "color:var(--mv-green)" }, "入口")
@@ -339,6 +363,9 @@
 
   function detailPanel(rec) {
     if (!rec) return h("div", { class: "detail empty" }, "选择一条记录查看详情");
+    const photo = rec.status === "deleted"
+      ? `${rec.photo_url}?include_deleted=true`
+      : rec.photo_url;
     const dl = h("dl");
     const rows = [
       ["记录 ID", rec.record_id],
@@ -372,7 +399,7 @@
       "div",
       { class: "detail" },
       h("h3", null, "记录详情"),
-      h("div", { class: "media" }, h("img", { src: rec.photo_url, alt: "" })),
+      h("div", { class: "media" }, h("img", { src: photo, alt: "" })),
       dl,
       rec.notes ? h("p", { class: "muted", style: "font-size:12px" }, `备注: ${rec.notes}`) : null,
       actions
@@ -437,7 +464,10 @@
     async function select(rec) {
       state.selectedId = rec.record_id;
       state.selected = rec;
-      try { state.selected = await api(`/api/records/${rec.record_id}`); } catch (_) {}
+      try {
+        const qs = rec.status === "deleted" ? "?include_deleted=true" : "";
+        state.selected = await api(`/api/records/${rec.record_id}${qs}`);
+      } catch (_) {}
       render();
     }
     const pager = h("div", { class: "pager" });
@@ -670,6 +700,59 @@
     return [form];
   }
 
+  function viewChangePassword(forced) {
+    const cur = h("input", { type: "password", placeholder: "当前密码" });
+    const next = h("input", { type: "password", placeholder: "新密码（至少 8 位）" });
+    const again = h("input", { type: "password", placeholder: "确认新密码" });
+    const err = h("p", { class: "muted", style: "color:var(--mv-danger)" });
+    return h(
+      "div",
+      { class: "login-wrap" },
+      h(
+        "div",
+        { class: "login-card" },
+        h("h1", null, forced ? "请修改密码" : "修改密码"),
+        h("p", { class: "muted", style: "text-align:center;margin:0" },
+          forced ? "首次登录必须修改默认/随机密码后才能继续使用管理台" : "更新当前登录账号密码"),
+        h("label", { class: "field" }, h("span", null, "当前密码"), cur),
+        h("label", { class: "field" }, h("span", null, "新密码"), next),
+        h("label", { class: "field" }, h("span", null, "确认新密码"), again),
+        err,
+        h("button", {
+          class: "btn primary",
+          onClick: async () => {
+            if (next.value.length < 8) {
+              err.textContent = "新密码至少 8 位";
+              return;
+            }
+            if (next.value !== again.value) {
+              err.textContent = "两次输入的新密码不一致";
+              return;
+            }
+            try {
+              const r = await api("/api/me/password", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  current_password: cur.value,
+                  new_password: next.value,
+                }),
+              });
+              state.user = r.user;
+              navigate("data", true);
+              await loadRoute();
+            } catch (e) {
+              err.textContent = e.message || "修改失败";
+            }
+          },
+        }, "保存新密码"),
+        !forced
+          ? h("button", { class: "btn ghost", onClick: () => navigate("data") }, "返回")
+          : null
+      )
+    );
+  }
+
   function viewLogin() {
     const user = h("input", { placeholder: "用户名", value: "admin" });
     const pass = h("input", { type: "password", placeholder: "密码" });
@@ -695,6 +778,11 @@
                 body: JSON.stringify({ username: user.value, password: pass.value }),
               });
               state.user = r.user;
+              if (r.user.must_change_password) {
+                state.route = "change-password";
+                render();
+                return;
+              }
               navigate("data", true);
               await loadRoute();
             } catch (e) {
@@ -703,7 +791,7 @@
           },
         }, "登录"),
         h("p", { class: "muted", style: "font-size:12px;text-align:center" },
-          "默认账号 admin / admin123（首次登录请修改密码）")
+          "默认账号 admin；若未设置 MOUSEVISION_ADMIN_PASSWORD，首次启动密码打印在服务日志中")
       )
     );
   }
@@ -712,6 +800,10 @@
     $app.replaceChildren();
     if (state.route === "login" || !state.user) {
       $app.appendChild(viewLogin());
+      return;
+    }
+    if (state.route === "change-password" || state.user.must_change_password) {
+      $app.appendChild(viewChangePassword(Boolean(state.user.must_change_password)));
       return;
     }
     const views = {

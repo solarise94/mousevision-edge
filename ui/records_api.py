@@ -52,6 +52,7 @@ def collect_records(
     q: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    include_deleted: bool = False,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     df = _parse_ts(date_from)
@@ -71,6 +72,8 @@ def collect_records(
                 continue
             meta = meta_store.ensure(record_id)
             status = meta["status"]
+            if status == "deleted" and not include_deleted and tab != "deleted":
+                continue
             if tab and tab != "all" and status != tab:
                 if tab == "pending" and status != "pending":
                     continue
@@ -125,14 +128,22 @@ def overview_stats(
     meta_store: RecordsMetaStore,
     output_root: Path,
 ) -> dict[str, Any]:
-    records = collect_records(registry, meta_store, output_root)
-    weights = [float(r["weight"]) for r in records if r.get("weight") is not None]
+    records = collect_records(
+        registry, meta_store, output_root, include_deleted=True
+    )
+    weights = [
+        float(r["weight"])
+        for r in records
+        if r.get("weight") is not None and r.get("status") != "deleted"
+    ]
     status_counts = {"pending": 0, "published": 0, "deleted": 0}
     daily: dict[str, int] = {}
     for rec in records:
         status_counts[rec.get("status", "pending")] = (
             status_counts.get(rec.get("status", "pending"), 0) + 1
         )
+        if rec.get("status") == "deleted":
+            continue
         ts = rec.get("timestamp")
         if ts:
             day = ts[:10]
@@ -140,7 +151,7 @@ def overview_stats(
     avg_weight = round(sum(weights) / len(weights), 2) if weights else None
     meta_counts = meta_store.counts()
     return {
-        "total_records": len(records),
+        "total_records": status_counts.get("pending", 0) + status_counts.get("published", 0),
         "pending_count": status_counts.get("pending", 0),
         "published_count": status_counts.get("published", 0),
         "deleted_count": status_counts.get("deleted", 0),
@@ -158,7 +169,9 @@ def mice_admin_view(
     meta_store: RecordsMetaStore,
     output_root: Path,
 ) -> list[dict[str, Any]]:
-    records = collect_records(registry, meta_store, output_root, tab="all")
+    records = collect_records(
+        registry, meta_store, output_root, tab="all", include_deleted=False
+    )
     by_cage: dict[str, list[dict[str, Any]]] = {}
     for rec in records:
         cage = rec["cage_id"]

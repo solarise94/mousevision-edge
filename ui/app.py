@@ -17,7 +17,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -40,7 +40,12 @@ from mousevision.upload_queue import UploadQueue
 from ui.audit import AuditStore
 from ui.auth import (
     api_token,
+    check_login_rate_limit,
+    clear_login_failures,
+    cookie_secure,
     current_user,
+    record_login_failure,
+    require_active_user,
     require_api_token,
     require_role,
     require_user,
@@ -772,7 +777,8 @@ def index(to: str | None = Query(None)) -> HTMLResponse | RedirectResponse:
     redirect = _entry_redirect((to or "").lower())
     if redirect is not None:
         return redirect
-    return HTMLResponse(_inject_api_token((STATIC / "entry.html").read_text(encoding="utf-8")))
+    # Entry page must NOT inject shared API token (PC login bypass risk).
+    return HTMLResponse((STATIC / "entry.html").read_text(encoding="utf-8"))
 
 
 @app.get("/legacy", response_class=HTMLResponse)
@@ -782,12 +788,13 @@ def legacy_index() -> HTMLResponse:
 
 @app.get("/pc", response_class=HTMLResponse)
 def pc_index() -> HTMLResponse:
-    return HTMLResponse(_inject_api_token((STATIC / "pc" / "index.html").read_text(encoding="utf-8")))
+    # PC admin uses session cookies only — never inject shared token into HTML.
+    return HTMLResponse((STATIC / "pc" / "index.html").read_text(encoding="utf-8"))
 
 
 @app.get("/pc/{path:path}", response_class=HTMLResponse)
 def pc_spa(path: str) -> HTMLResponse:
-    return HTMLResponse(_inject_api_token((STATIC / "pc" / "index.html").read_text(encoding="utf-8")))
+    return HTMLResponse((STATIC / "pc" / "index.html").read_text(encoding="utf-8"))
 
 
 @app.get("/mobile", response_class=HTMLResponse)
@@ -1242,7 +1249,10 @@ def _item_from_record(job: dict[str, Any], mouse: dict[str, Any]) -> dict[str, A
 
 @app.get("/api/boxes/{cage_id}/records")
 def api_box_records(cage_id: str) -> dict[str, Any]:
-    """Unified list: merge pending jobs and completed records (design §8.1a)."""
+    """Unified list: merge pending jobs and completed records (design §8.1a).
+
+    Soft-deleted records are hidden from this mobile-facing endpoint.
+    """
     jobs = job_store.list_by_cage(cage_id)
     items: list[dict[str, Any]] = []
     for job in jobs:
@@ -1255,6 +1265,9 @@ def api_box_records(cage_id: str) -> dict[str, Any]:
                 continue
             mice_sorted = sorted(mice, key=lambda m: int(m.get("ordinal") or 0))
             for mouse in mice_sorted:
+                rid = mouse.get("record_id")
+                if rid and records_meta.effective_status(str(rid)) == "deleted":
+                    continue
                 item = _item_from_record(job, mouse)
                 if len(mice_sorted) > 1:
                     item["warning"] = "multi_detected"
@@ -1276,11 +1289,24 @@ def api_box_records(cage_id: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-@app.get("/api/records/{record_id}")
-def api_record(record_id: str) -> dict[str, Any]:
+def _assert_record_readable(record_id: str, *, include_deleted: bool = False) -> dict[str, Any]:
     mouse = registry.get_by_record_id(record_id)
     if mouse is None:
         raise HTTPException(status_code=404, detail="记录不存在")
+    status = records_meta.effective_status(record_id)
+    if status == "deleted" and not include_deleted:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return mouse
+
+
+@app.get("/api/records/{record_id}")
+def api_record(
+    record_id: str,
+    include_deleted: bool = Query(False),
+    user: dict[str, Any] | None = Depends(current_user),
+) -> dict[str, Any]:
+    allow_deleted = bool(include_deleted and user and user.get("role") in {"admin", "operator"})
+    mouse = _assert_record_readable(record_id, include_deleted=allow_deleted)
     mouse["photo_url"] = f"/api/records/{record_id}/photo"
     mouse["label"] = f"第 {int(mouse.get('actual_ordinal', mouse['ordinal'])):02d} 只"
     raw_path = DEFAULT_OUTPUT / mouse["dir"] / "record.json"
@@ -1305,10 +1331,13 @@ def api_record(record_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/records/{record_id}/photo", response_model=None)
-def api_record_photo(record_id: str):
-    mouse = registry.get_by_record_id(record_id)
-    if mouse is None:
-        raise HTTPException(status_code=404, detail="记录不存在")
+def api_record_photo(
+    record_id: str,
+    include_deleted: bool = Query(False),
+    user: dict[str, Any] | None = Depends(current_user),
+):
+    allow_deleted = bool(include_deleted and user and user.get("role") in {"admin", "operator"})
+    mouse = _assert_record_readable(record_id, include_deleted=allow_deleted)
     path = DEFAULT_OUTPUT / mouse["dir"] / mouse.get("photo", "photo.jpg")
     if not path.exists():
         raise HTTPException(status_code=404, detail="照片不存在")
@@ -1452,7 +1481,11 @@ def api_records(
     date_to: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    include_deleted: bool = Query(False),
+    user: dict[str, Any] = Depends(require_active_user),
 ) -> dict[str, Any]:
+    # tab=deleted always includes deleted; otherwise require explicit flag.
+    show_deleted = tab == "deleted" or include_deleted
     items = collect_records(
         registry,
         records_meta,
@@ -1463,6 +1496,7 @@ def api_records(
         q=q,
         date_from=date_from,
         date_to=date_to,
+        include_deleted=show_deleted,
     )
     total = len(items)
     start = (page - 1) * page_size
@@ -1484,12 +1518,12 @@ def api_records(
 
 
 @app.get("/api/overview")
-def api_overview() -> dict[str, Any]:
+def api_overview(user: dict[str, Any] = Depends(require_active_user)) -> dict[str, Any]:
     return overview_stats(registry, records_meta, DEFAULT_OUTPUT)
 
 
 @app.get("/api/mice-admin")
-def api_mice_admin() -> dict[str, Any]:
+def api_mice_admin(user: dict[str, Any] = Depends(require_active_user)) -> dict[str, Any]:
     return {"items": mice_admin_view(registry, records_meta, DEFAULT_OUTPUT)}
 
 
@@ -1502,8 +1536,9 @@ def api_export(
     q: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
-    user: dict[str, Any] = Depends(require_user),
+    user: dict[str, Any] = Depends(require_active_user),
 ) -> Response:
+    show_deleted = tab == "deleted"
     items = collect_records(
         registry,
         records_meta,
@@ -1514,6 +1549,7 @@ def api_export(
         q=q,
         date_from=date_from,
         date_to=date_to,
+        include_deleted=show_deleted,
     )
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if format == "xlsx":
@@ -1544,10 +1580,13 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/api/login")
-def api_login(body: LoginRequest) -> JSONResponse:
+def api_login(request: Request, body: LoginRequest) -> JSONResponse:
+    check_login_rate_limit(request)
     user = user_store.authenticate(body.username, body.password)
     if user is None:
+        record_login_failure(request)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+    clear_login_failures(request)
     token = user_store.create_session(user["id"])
     _audit(user["username"], "auth.login", target_type="user", target_id=user["id"])
     resp = JSONResponse({"ok": True, "user": user})
@@ -1556,17 +1595,21 @@ def api_login(body: LoginRequest) -> JSONResponse:
         token,
         httponly=True,
         samesite="lax",
+        secure=cookie_secure(request),
         max_age=7 * 24 * 3600,
     )
     return resp
 
 
 @app.post("/api/logout")
-def api_logout(mv_session: str | None = Cookie(None, alias=SESSION_COOKIE)) -> JSONResponse:
+def api_logout(
+    request: Request,
+    mv_session: str | None = Cookie(None, alias=SESSION_COOKIE),
+) -> JSONResponse:
     if mv_session:
         user_store.delete_session(mv_session)
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(SESSION_COOKIE)
+    resp.delete_cookie(SESSION_COOKIE, secure=cookie_secure(request))
     return resp
 
 
@@ -1575,6 +1618,31 @@ def api_me(user: dict[str, Any] | None = Depends(current_user)) -> dict[str, Any
     if user is None:
         return {"authenticated": False}
     return {"authenticated": True, "user": user}
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8)
+
+
+@app.post("/api/me/password")
+def api_change_own_password(
+    body: ChangePasswordRequest,
+    user: dict[str, Any] = Depends(require_user),
+) -> dict[str, Any]:
+    """Change own password; allowed even when must_change_password is set."""
+    if user.get("id") == "token":
+        raise HTTPException(status_code=400, detail="API token 账号不能改密")
+    full = user_store.get_by_username(user["username"])
+    if full is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    from ui.users import verify_password
+
+    if not verify_password(body.current_password, full["_password_hash"], full["_salt"]):
+        raise HTTPException(status_code=401, detail="当前密码不正确")
+    updated = user_store.update_user(user["id"], password=body.new_password)
+    _audit(user["username"], "auth.change_password", target_type="user", target_id=user["id"])
+    return {"ok": True, "user": updated}
 
 
 class UserCreate(BaseModel):
@@ -1610,7 +1678,13 @@ def api_create_user(
         )
     except KeyError:
         raise HTTPException(status_code=409, detail="用户名已存在")
-    _audit(actor["username"], "user.create", target_type="user", target_id=user["id"])
+    _audit(
+        actor["username"],
+        "user.create",
+        target_type="user",
+        target_id=user["id"],
+        detail={"username": body.username, "role": body.role},
+    )
     return JSONResponse(user, status_code=201)
 
 
@@ -1625,6 +1699,7 @@ def api_update_user(
         user = user_store.update_user(user_id, **changes)
     except KeyError:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # AuditStore scrubbing redacts password; still pass full changes for completeness.
     _audit(actor["username"], "user.update", target_type="user", target_id=user_id, detail=changes)
     return user
 
@@ -1654,7 +1729,7 @@ def api_logs(
 
 
 @app.get("/api/settings")
-def api_get_settings(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+def api_get_settings(user: dict[str, Any] = Depends(require_active_user)) -> dict[str, Any]:
     return settings_store.get()
 
 
