@@ -24,7 +24,7 @@
   const ROUTES = [
     { id: "data", label: "数据管理", section: "数据管理" },
     { id: "overview", label: "数据总览", section: "数据管理" },
-    { id: "verify", label: "数据核对", section: "数据管理", badge: () => state.pendingBadge },
+    { id: "verify", label: "快捷核对", section: "数据管理", badge: () => state.pendingBadge },
     { id: "publish", label: "发布管理", section: "数据管理" },
     { id: "export", label: "导出管理", section: "数据管理" },
     { id: "boxes", label: "箱子管理", section: "基础信息" },
@@ -36,10 +36,10 @@
 
   const TITLES = Object.fromEntries(ROUTES.map((r) => [r.id, r.label]));
 
-  // Routes that pin the data tab. verify => pending, publish => published.
-  // Must be applied BEFORE loadRecords() fetches, otherwise the grid shows the
-  // previous tab's data (race between loadRoute() and render()).
-  const ROUTE_TAB = { verify: "pending", publish: "published" };
+  // publish route pins the published tab on the data grid.
+  // verify has its own quick-verify view (cage-grouped), not the data grid.
+  // Applied BEFORE loadRecords() fetches to avoid showing the previous tab.
+  const ROUTE_TAB = { publish: "published" };
 
   function h(tag, props, ...children) {
     const el = document.createElement(tag);
@@ -135,10 +135,21 @@
     render();
   }
 
+  async function loadVerifyCages() {
+    const p = new URLSearchParams();
+    ["cage_id", "strain", "date_from", "date_to"].forEach((k) => {
+      if (state.filters[k]) p.set(k, state.filters[k]);
+    });
+    state.verifyCages = await api(`/api/verify-cages?${p}`);
+    state.pendingBadge = state.verifyCages.total_records || 0;
+  }
+
   async function loadRoute() {
     if (!state.user) return;
     try {
-      if (["data", "verify", "publish"].includes(state.route)) {
+      if (state.route === "verify") {
+        await loadVerifyCages();
+      } else if (["data", "publish"].includes(state.route)) {
         // Pin tab from route before fetching; "data" keeps whatever tab the
         // user last selected. Reset to page 1 so filters don't strand the view.
         if (state.route in ROUTE_TAB) {
@@ -165,7 +176,9 @@
         const r = await api("/api/users");
         state.users = r.items || [];
       }
-      state.pendingBadge = state.stats.pending_count || 0;
+      if (state.pendingBadge === undefined || state.pendingBadge === 0) {
+        state.pendingBadge = state.stats.pending_count || 0;
+      }
       render();
     } catch (e) {
       console.error(e);
@@ -214,6 +227,90 @@
       ctx.fillStyle = "#3ddc84";
       ctx.fillRect(10 + i * (barW + 4), ch - bh - 10, barW, bh);
     });
+  }
+
+  // Weight distribution: histogram bars + normal fit curve + ±2g threshold lines.
+  function drawDistChart(canvas, ws) {
+    if (!canvas || !ws || ws.n === 0) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width = canvas.clientWidth * 2;
+    const H = canvas.height = canvas.clientHeight * 2;
+    ctx.scale(2, 2);
+    const cw = W / 2, ch = H / 2;
+    ctx.clearRect(0, 0, cw, ch);
+    const padL = 32, padR = 12, padT = 12, padB = 28;
+    const plotW = cw - padL - padR;
+    const plotH = ch - padT - padB;
+
+    const bins = ws.hist_bins;
+    const counts = ws.hist_counts;
+    const fitX = ws.fit_x;
+    const fitY = ws.fit_y;
+    const wmin = ws.min, wmax = ws.max;
+    // x-axis domain spans histogram bins (or fit range if wider)
+    const xLo = Math.min(bins[0], fitX[0] || wmin);
+    const xHi = Math.max(bins[bins.length - 1], fitX[fitX.length - 1] || wmax);
+    const xRange = xHi - xLo || 1;
+    const yMax = Math.max(...counts, ...(fitY.length ? [Math.max(...fitY)] : []), 1);
+
+    const xPx = (v) => padL + ((v - xLo) / xRange) * plotW;
+    const yPx = (v) => padT + plotH - (v / yMax) * plotH;
+
+    // Histogram bars
+    const barW = Math.max(2, (plotW / counts.length) - 3);
+    ctx.fillStyle = "rgba(61,220,132,0.35)";
+    counts.forEach((c, i) => {
+      const bx = xPx(bins[i]);
+      const bh = (c / yMax) * plotH;
+      ctx.fillRect(bx, padT + plotH - bh, barW, bh);
+    });
+
+    // Normal fit curve
+    if (fitX.length > 1) {
+      ctx.strokeStyle = "#f2f4f7";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      fitX.forEach((x, i) => {
+        const px = xPx(x), py = yPx(fitY[i]);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+    }
+
+    // ±2g threshold lines (red dashed)
+    [ws.threshold_low, ws.threshold_high].forEach((tv) => {
+      if (tv == null || tv < xLo || tv > xHi) return;
+      ctx.strokeStyle = "rgba(255,77,79,0.6)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(xPx(tv), padT);
+      ctx.lineTo(xPx(tv), padT + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+
+    // Mean line (subtle)
+    if (ws.mean != null) {
+      ctx.strokeStyle = "rgba(245,166,35,0.7)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(xPx(ws.mean), padT);
+      ctx.lineTo(xPx(ws.mean), padT + plotH);
+      ctx.stroke();
+    }
+
+    // Axis labels
+    ctx.fillStyle = "#9aa3af";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    [xLo, ws.mean, xHi].forEach((v) => {
+      if (v == null) return;
+      ctx.fillText(`${v.toFixed(1)}`, xPx(v), ch - 10);
+    });
+    ctx.textAlign = "right";
+    ctx.fillText(`${yMax.toFixed(0)}`, padL - 4, padT + 8);
+    ctx.fillText("0", padL - 4, padT + plotH);
   }
 
   function shell(nodes) {
@@ -298,12 +395,18 @@
   }
 
   function kpiRow(stats) {
+    // average_weight may be a number (raw) or a pre-formatted string (e.g.
+    // overview passes "Mean ± SEM g"); only format if it's numeric.
+    const avgDisplay =
+      typeof stats.average_weight === "string"
+        ? stats.average_weight
+        : fmtWeight(stats.average_weight);
     const cards = [
       ["总记录数", stats.total_records, ""],
       ["待核对", stats.pending_count, "green"],
       ["已发布", stats.published_count, "green"],
       ["已删除", stats.deleted_count, ""],
-      ["平均体重", stats.average_weight != null ? `${stats.average_weight} g` : "--", "green"],
+      ["平均体重", avgDisplay, "green"],
     ];
     return h(
       "div",
@@ -508,30 +611,165 @@
 
   function viewOverview() {
     const o = state.overview || {};
+    const ws = o.weight_stats || { n: 0 };
     const dailyCanvas = h("canvas");
     const weightCanvas = h("canvas");
     setTimeout(() => {
       drawChart(dailyCanvas, o.daily_counts || [], "count");
-      const wpoints = (o.weight_samples || []).map((w, i) => ({ count: w, i }));
-      drawChart(weightCanvas, wpoints.slice(0, 30), "count");
+      drawDistChart(weightCanvas, ws);
     }, 50);
+
+    // Mean ± SEM card + range card + ±2g compliance card.
+    const meanSem = ws.mean != null ? `${ws.mean} ± ${ws.sem} g` : "--";
+    const rangeStr = ws.min != null ? `${ws.min}–${ws.max} g` : "--";
+    const oor = ws.out_of_range || 0;
+    const total = ws.n || 0;
+    const compliant = total - oor;
+    const compliantStr = total > 0 ? `${compliant}/${total}` : "--";
+    const compliantWarn = oor > 0;
+
     return [
       kpiRow({
         total_records: o.total_records,
         pending_count: o.pending_count,
         published_count: o.published_count,
         deleted_count: o.deleted_count,
-        average_weight: o.average_weight,
+        average_weight: meanSem,
       }),
+      h("div", { class: "kpi-row" },
+        h("div", { class: "kpi" },
+          h("div", { class: "label" }, "体重范围"),
+          h("div", { class: "value green" }, rangeStr),
+          ws.range != null ? h("div", { class: "delta" }, `Δ ${ws.range} g`) : null
+        ),
+        h("div", { class: "kpi" },
+          h("div", { class: "label" }, "±2g 合规"),
+          h("div", { class: `value ${compliantWarn ? "warn" : "green"}` }, compliantStr),
+          h("div", { class: "delta" }, compliantWarn ? `${oor} 只超限` : "全部合规")
+        ),
+        h("div", { class: "kpi" },
+          h("div", { class: "label" }, "中位数 / 标准差"),
+          h("div", { class: "value" }, ws.median != null ? `${ws.median} / ${ws.std} g` : "--"),
+          h("div", { class: "delta" }, `n = ${total}`)
+        )
+      ),
       h("div", { class: "chart-box" }, h("div", { class: "muted", style: "margin-bottom:8px" }, "每日记录数"), dailyCanvas),
-      h("div", { class: "chart-box" }, h("div", { class: "muted", style: "margin-bottom:8px" }, "体重样本分布"), weightCanvas),
+      h("div", { class: "chart-box" },
+        h("div", { class: "muted", style: "margin-bottom:8px" }, "体重分布 (直方图 + 正态拟合)"),
+        weightCanvas
+      ),
     ];
   }
 
-  function viewVerify() {
-    // tab is pinned by loadRoute() via ROUTE_TAB; don't mutate here to avoid
-    // clobbering the user's tab selection when they return to "数据管理".
-    return viewData();
+  function viewQuickVerify() {
+    const vc = state.verifyCages || { cages: [], total_cages: 0, total_records: 0, average_weight: null };
+    const cages = vc.cages || [];
+    const avg = vc.average_weight;
+    const isOutlier = (w) =>
+      w != null && avg != null && Math.abs(w - avg) > 2.0;
+
+    // Slim filter bar: only cage_id, strain, date range (no free-text q).
+    const fbar = h("div", { class: "filters" });
+    const ff = [
+      ["date_from", "开始日期", "date"],
+      ["date_to", "结束日期", "date"],
+      ["strain", "品系", "text"],
+      ["cage_id", "箱号", "text"],
+    ];
+    ff.forEach(([key, label, type]) => {
+      const inp = h("input", { type, value: state.filters[key] || "", placeholder: label });
+      inp.addEventListener("input", (e) => (state.filters[key] = e.target.value));
+      fbar.appendChild(h("label", { class: "field" }, h("span", null, label), inp));
+    });
+    fbar.appendChild(h("button", {
+      class: "btn primary",
+      onClick: () => { loadVerifyCages().then(render); },
+    }, "筛选"));
+    fbar.appendChild(h("button", {
+      class: "btn",
+      onClick: () => {
+        ["cage_id", "strain", "date_from", "date_to"].forEach((k) => (state.filters[k] = ""));
+        loadVerifyCages().then(render);
+      },
+    }, "重置"));
+
+    const kpi = kpiRow({
+      total_records: vc.total_cages,
+      pending_count: vc.total_records,
+      published_count: null,
+      deleted_count: null,
+      average_weight: avg,
+    });
+    // Override KPI labels for verify context.
+    const kpiCards = kpi.querySelectorAll(".kpi");
+    if (kpiCards[0]) kpiCards[0].querySelector(".label").textContent = "待核对笼数";
+    if (kpiCards[1]) kpiCards[1].querySelector(".label").textContent = "待核对记录数";
+
+    if (!cages.length) {
+      return [fbar, kpi, h("div", { class: "empty" }, "没有待核对的记录")];
+    }
+
+    async function passCage(cage) {
+      const ids = cage.records.map((r) => r.record_id).filter(Boolean);
+      if (!ids.length) return;
+      await api("/api/records/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ record_ids: ids, action: "publish" }),
+      });
+      await loadVerifyCages();
+      render();
+    }
+
+    async function delOne(rec) {
+      if (!confirm(`删除 ${rec.cage_id} 第 ${rec.ordinal} 只 (${fmtWeight(rec.weight)})？`)) return;
+      await api(`/api/records/${rec.record_id}`, { method: "DELETE" });
+      await loadVerifyCages();
+      render();
+    }
+
+    const list = cages.map((cage) => {
+      const weightsLine = cage.records.map((r) => {
+        const cls = isOutlier(r.weight) ? "cage-weight warn" : "cage-weight";
+        return h("span", { class: cls }, fmtWeight(r.weight).replace(" g", ""));
+      });
+      const thumbs = h("div", { class: "cage-thumbs" });
+      cage.records.forEach((rec) => {
+        const thumb = h("div", { class: "cage-thumb" });
+        thumb.appendChild(h("img", { src: rec.photo_url, alt: "" }));
+        thumb.appendChild(h("span", { class: "cage-thumb-idx" }, `#${String(rec.ordinal).padStart(2, "0")}`));
+        const wspan = h("span", { class: isOutlier(rec.weight) ? "cage-thumb-w warn" : "cage-thumb-w" }, fmtWeight(rec.weight));
+        thumb.appendChild(wspan);
+        if (canWrite()) {
+          const del = h("button", {
+            class: "thumb-del",
+            title: "删除该只",
+            onClick: (e) => { e.stopPropagation(); delOne(rec); },
+          }, "×");
+          thumb.appendChild(del);
+        }
+        thumbs.appendChild(thumb);
+      });
+      const card = h("div", { class: "cage-card" },
+        h("div", { class: "cage-card-head" },
+          h("strong", null, cage.cage_id),
+          h("span", { class: "muted" }, `${cage.strain} · ${cage.count} 只 · 均 ${fmtWeight(cage.mean_weight)}`)
+        ),
+        h("div", { class: "cage-weights" }, ...weightsLine),
+        thumbs,
+        canWrite()
+          ? h("div", { class: "cage-actions" },
+              h("button", {
+                class: "btn primary",
+                onClick: () => passCage(cage),
+              }, `整笼通过 (${cage.count} 只)`)
+            )
+          : null
+      );
+      return card;
+    });
+
+    return [fbar, kpi, h("div", { class: "cage-list" }, ...list)];
   }
 
   function viewPublish() {
@@ -822,7 +1060,7 @@
     const views = {
       data: viewData,
       overview: viewOverview,
-      verify: viewVerify,
+      verify: viewQuickVerify,
       publish: viewPublish,
       export: viewExport,
       boxes: viewBoxes,

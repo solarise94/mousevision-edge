@@ -61,6 +61,7 @@ from ui.records_api import (
     export_xlsx,
     mice_admin_view,
     overview_stats,
+    verify_cages_view,
 )
 from ui.records_meta import RecordsMetaStore
 from ui.registry import MouseRegistry
@@ -1555,6 +1556,20 @@ def api_overview(user: dict[str, Any] = Depends(require_active_user)) -> dict[st
 @app.get("/api/mice-admin")
 def api_mice_admin(user: dict[str, Any] = Depends(require_active_user)) -> dict[str, Any]:
     return {"items": mice_admin_view(registry, records_meta, DEFAULT_OUTPUT)}
+
+
+@app.get("/api/verify-cages")
+def api_verify_cages(
+    strain: str | None = Query(None),
+    cage_id: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    user: dict[str, Any] = Depends(require_active_user),
+) -> dict[str, Any]:
+    return verify_cages_view(
+        registry, records_meta, DEFAULT_OUTPUT,
+        strain=strain, cage_id=cage_id, date_from=date_from, date_to=date_to,
+    )
 
 
 @app.get("/api/export")

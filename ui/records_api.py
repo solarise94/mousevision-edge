@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from ui.boxes import strain_from_cage
 from ui.records_meta import RecordsMetaStore
 from ui.registry import MouseRegistry
@@ -123,6 +125,65 @@ def collect_records(
     return items
 
 
+def _compute_weight_stats(weights: list[float]) -> dict[str, Any]:
+    """Normal-distribution stats for continuous weight data.
+
+    Returns mean/SEM/min/max/range, a ±2g compliance check, a 0.5g histogram,
+    and a normal PDF fit curve for the overview chart. Uses numpy only (no
+    scipy): weights are continuous, so a Gaussian fit is the mathematically
+    correct model (Poisson is for integer counts).
+    """
+    n = len(weights)
+    if n == 0:
+        return {
+            "mean": None, "sem": None, "std": None, "min": None, "max": None,
+            "range": None, "median": None, "n": 0,
+            "threshold_low": None, "threshold_high": None, "out_of_range": 0,
+            "hist_bins": [], "hist_counts": [], "fit_x": [], "fit_y": [],
+        }
+    w = np.array(weights, dtype=float)
+    mean = float(w.mean())
+    std = float(w.std(ddof=1)) if n > 1 else 0.0
+    sem = std / float(np.sqrt(n)) if n > 1 else 0.0
+    wmin, wmax = float(w.min()), float(w.max())
+    # ±2g compliance window around the mean
+    thr_lo, thr_hi = mean - 2.0, mean + 2.0
+    out_of_range = int(np.sum((w < thr_lo) | (w > thr_hi)))
+    # 0.5g histogram bins spanning the data range
+    lo = np.floor(wmin * 2) / 2  # snap down to 0.5g
+    hi = np.ceil(wmax * 2) / 2   # snap up to 0.5g
+    if hi <= lo:
+        hi = lo + 0.5
+    bin_edges = np.arange(lo, hi + 0.5, 0.5)
+    counts, _ = np.histogram(w, bins=bin_edges)
+    # Normal PDF fit curve over μ±3σ, 40 sample points
+    sigma = std if std > 1e-9 else 1.0
+    fit_x = np.linspace(mean - 3 * sigma, mean + 3 * sigma, 40)
+    fit_y = (1.0 / (sigma * np.sqrt(2 * np.pi))) * np.exp(
+        -0.5 * ((fit_x - mean) / sigma) ** 2
+    )
+    # Scale fit curve to histogram counts so they share an axis
+    bin_width = 0.5
+    fit_y_scaled = fit_y * n * bin_width
+    return {
+        "mean": round(mean, 2),
+        "sem": round(sem, 2),
+        "std": round(std, 2),
+        "min": round(wmin, 2),
+        "max": round(wmax, 2),
+        "range": round(wmax - wmin, 2),
+        "median": round(float(np.median(w)), 2),
+        "n": n,
+        "threshold_low": round(thr_lo, 2),
+        "threshold_high": round(thr_hi, 2),
+        "out_of_range": out_of_range,
+        "hist_bins": [round(float(b), 2) for b in bin_edges],
+        "hist_counts": [int(c) for c in counts],
+        "fit_x": [round(float(x), 2) for x in fit_x],
+        "fit_y": [round(float(y), 2) for y in fit_y_scaled],
+    }
+
+
 def overview_stats(
     registry: MouseRegistry,
     meta_store: RecordsMetaStore,
@@ -161,6 +222,7 @@ def overview_stats(
             {"date": k, "count": daily[k]} for k in sorted(daily.keys())
         ],
         "weight_samples": weights[:200],
+        "weight_stats": _compute_weight_stats(weights),
     }
 
 
@@ -190,6 +252,54 @@ def mice_admin_view(
             }
         )
     return rows
+
+
+def verify_cages_view(
+    registry: MouseRegistry,
+    meta_store: RecordsMetaStore,
+    output_root: Path,
+    *,
+    strain: str | None = None,
+    cage_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Cage-grouped view of pending records for quick verification.
+
+    Only cages with at least one pending record are returned. Each cage carries
+    its pending records (sorted by ordinal), a mean weight, and the strain.
+    """
+    records = collect_records(
+        registry, meta_store, output_root,
+        tab="pending",
+        strain=strain,
+        cage_id=cage_id,
+        date_from=date_from,
+        date_to=date_to,
+        include_deleted=False,
+    )
+    by_cage: dict[str, list[dict[str, Any]]] = {}
+    for rec in records:
+        by_cage.setdefault(rec["cage_id"], []).append(rec)
+    cages = []
+    all_weights: list[float] = []
+    for cage, recs in sorted(by_cage.items()):
+        recs.sort(key=lambda r: int(r.get("ordinal") or 0))
+        weights = [float(r["weight"]) for r in recs if r.get("weight") is not None]
+        all_weights.extend(weights)
+        cages.append({
+            "cage_id": cage,
+            "strain": strain_from_cage(cage),
+            "count": len(recs),
+            "mean_weight": round(sum(weights) / len(weights), 2) if weights else None,
+            "records": recs,
+        })
+    return {
+        "cages": cages,
+        "total_cages": len(cages),
+        "total_records": len(records),
+        "average_weight": round(sum(all_weights) / len(all_weights), 2) if all_weights else None,
+    }
 
 
 def export_csv(records: list[dict[str, Any]]) -> bytes:
