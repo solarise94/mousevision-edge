@@ -247,11 +247,33 @@ class UserStore:
                 )
                 if cur.rowcount == 0:
                     raise KeyError(user_id)
+                # Password changes invalidate all existing sessions.
+                if "password_hash" in updates:
+                    conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             finally:
                 conn.close()
         user = self.get_by_id(user_id)
         assert user is not None
         return user
+
+    def delete_sessions(
+        self, user_id: str, *, keep_token: str | None = None
+    ) -> int:
+        with self.lock:
+            conn = self._connect()
+            try:
+                if keep_token:
+                    cur = conn.execute(
+                        "DELETE FROM sessions WHERE user_id = ? AND token != ?",
+                        (user_id, keep_token),
+                    )
+                else:
+                    cur = conn.execute(
+                        "DELETE FROM sessions WHERE user_id = ?", (user_id,)
+                    )
+                return int(cur.rowcount)
+            finally:
+                conn.close()
 
     def delete_user(self, user_id: str) -> None:
         with self.lock:
