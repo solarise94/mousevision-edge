@@ -86,7 +86,13 @@ class UserStore:
     def _seed_admin(self) -> None:
         if self.count() > 0:
             return
-        default_pw = os.getenv("MOUSEVISION_ADMIN_PASSWORD", "admin123")
+        configured = os.getenv("MOUSEVISION_ADMIN_PASSWORD", "").strip()
+        if configured:
+            default_pw = configured
+            generated = False
+        else:
+            default_pw = secrets.token_urlsafe(12)
+            generated = True
         self.create_user(
             username="admin",
             password=default_pw,
@@ -94,6 +100,17 @@ class UserStore:
             display_name="超级管理员",
             must_change_password=1,
         )
+        if generated:
+            print(
+                "[MouseVision] 已创建管理员 admin，一次性随机密码："
+                f"{default_pw}（请立即登录并修改；也可设置 MOUSEVISION_ADMIN_PASSWORD）",
+                flush=True,
+            )
+        else:
+            print(
+                "[MouseVision] 已创建管理员 admin（使用 MOUSEVISION_ADMIN_PASSWORD），首次登录须改密",
+                flush=True,
+            )
 
     def count(self) -> int:
         with self.lock:
