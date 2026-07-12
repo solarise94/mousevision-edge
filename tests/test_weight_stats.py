@@ -13,6 +13,9 @@ from ui.records_api import (
     _compute_weight_stats,
     _compute_cage_weight_view,
     _fill_daily_counts,
+    _parse_date_to,
+    _parse_date_from,
+    collect_records,
     verify_cages_view,
 )
 from ui.records_meta import RecordsMetaStore
@@ -51,13 +54,22 @@ def test_weight_stats_small_sample_hides_fit():
 
 
 def test_weight_stats_large_sample_shows_fit():
-    """n >= 30 should show the fit curve."""
+    """n >= 30 with single cohort should show the fit curve."""
     rng = np.random.default_rng(42)
     weights = rng.normal(16.5, 0.5, 30).tolist()
-    ws = _compute_weight_stats(weights)
+    ws = _compute_weight_stats(weights, is_single_cohort=True)
     assert ws["show_fit"] is True
     assert len(ws["fit_x"]) == 40
     assert len(ws["fit_y"]) == 40
+
+
+def test_weight_stats_fit_hidden_for_mixed_cohort():
+    """n >= 30 but mixed cohort (no cage filter) must NOT show fit."""
+    rng = np.random.default_rng(42)
+    weights = rng.normal(16.5, 0.5, 30).tolist()
+    ws = _compute_weight_stats(weights, is_single_cohort=False)
+    assert ws["show_fit"] is False
+    assert ws["fit_x"] == []
 
 
 def test_weight_stats_histogram_shape():
@@ -114,11 +126,33 @@ def test_cage_weight_skips_none_weight():
 # ---------------------------------------------------------------------------
 
 def test_fill_daily_counts_fills_gaps():
-    out = _fill_daily_counts({"2026-07-10": 5, "2026-07-12": 3}, None, None)
+    """With explicit bounds, gaps between data days are filled with 0."""
+    out = _fill_daily_counts({"2026-07-10": 5, "2026-07-12": 3}, "2026-07-10", "2026-07-12")
     assert len(out) == 3
     assert out[1] == {"date": "2026-07-11", "count": 0}
     assert out[0]["count"] == 5
     assert out[2]["count"] == 3
+
+
+def test_fill_daily_counts_default_window():
+    """Without explicit bounds, defaults to last 30 days from latest data."""
+    out = _fill_daily_counts({"2026-07-10": 5, "2026-07-12": 3}, None, None)
+    # Latest = 2026-07-12, default 30 days back = 2026-06-12 -> 31 days inclusive
+    assert len(out) == 31
+    assert out[-1]["date"] == "2026-07-12"
+    assert out[-1]["count"] == 3
+    assert out[-3]["date"] == "2026-07-10"
+    assert out[-3]["count"] == 5
+
+
+def test_fill_daily_counts_clamps_long_span():
+    """Spans longer than max_days are clamped."""
+    out = _fill_daily_counts(
+        {"2026-01-01": 1, "2026-07-12": 2},
+        "2026-01-01", "2026-07-12",
+        max_days=10,
+    )
+    assert len(out) == 11  # 10 days back + 1 inclusive
 
 
 def test_fill_daily_counts_respects_bounds():
@@ -187,3 +221,50 @@ def test_verify_cages_excludes_published_and_deleted(tmp_path: Path):
     result = verify_cages_view(reg, meta, output)
     assert result["total_records"] == 1
     assert result["cages"][0]["records"][0]["record_id"] == "rec-C57-023-3"
+
+
+# ---------------------------------------------------------------------------
+# Date boundary parsing (P1: date_to must include the full day)
+# ---------------------------------------------------------------------------
+
+def test_parse_date_to_extends_to_next_midnight():
+    """date_to='2026-07-12' should become 2026-07-13 00:00 (exclusive upper)."""
+    from datetime import datetime
+    dt = _parse_date_to("2026-07-12")
+    assert dt == datetime(2026, 7, 13, 0, 0, 0)
+
+
+def test_parse_date_to_keeps_full_timestamp():
+    """A full timestamp should be used as-is (not extended)."""
+    from datetime import datetime
+    dt = _parse_date_to("2026-07-12T15:30:00")
+    assert dt == datetime(2026, 7, 12, 15, 30, 0)
+
+
+def test_parse_date_from_is_inclusive_midnight():
+    from datetime import datetime
+    dt = _parse_date_from("2026-07-12")
+    assert dt == datetime(2026, 7, 12, 0, 0, 0)
+
+
+def test_collect_records_date_to_includes_full_day(tmp_path: Path):
+    """Records at 12:00 on the date_to day must NOT be excluded."""
+    output = tmp_path / "output"
+    run_dir, man = create_run_dir(output, cage_id="C57-023", mode="video")
+    session_dir = run_dir / "mouse_001"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    img = np.zeros((20, 20, 3), dtype=np.uint8)
+    cv2.imwrite(str(session_dir / "photo.jpg"), img)
+    (session_dir / "record.json").write_text(json.dumps({
+        "box_id": "C57-023", "cage_id": "C57-023", "weight": 16.0,
+        "confidence": 0.9, "timestamp": "2026-07-12T15:30:00",
+        "device": "scale01", "photo": "photo.jpg", "ordinal": 1,
+        "run_id": man["run_id"], "record_id": "rec-late",
+    }), encoding="utf-8")
+    finish_run(run_dir)
+    reg = MouseRegistry(tmp_path / "reg.json", output)
+    meta = RecordsMetaStore(str(tmp_path / "meta.db"))
+    # Same day for from and to - must include the 15:30 record
+    items = collect_records(reg, meta, output, date_from="2026-07-12", date_to="2026-07-12")
+    assert len(items) == 1
+    assert items[0]["record_id"] == "rec-late"

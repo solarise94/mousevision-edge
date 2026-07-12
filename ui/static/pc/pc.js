@@ -290,9 +290,10 @@
     const counts = ws.hist_counts;
     const fitX = ws.fit_x || [];
     const fitY = ws.fit_y || [];
-    // x-axis domain = histogram bin range (fit curve, if shown, stays within)
-    const xLo = bins[0];
-    const xHi = bins[bins.length - 1];
+    // x-axis domain = union of histogram bins and fit curve range, so the
+    // normal curve never draws outside the plot area.
+    const xLo = Math.min(bins[0], ...(fitX.length ? [fitX[0]] : []));
+    const xHi = Math.max(bins[bins.length - 1], ...(fitX.length ? [fitX[fitX.length - 1]] : []));
     const xRange = xHi - xLo || 1;
     const yMax = Math.max(...counts, ...(fitY.length ? [Math.max(...fitY)] : []), 1);
 
@@ -868,7 +869,7 @@
       h("div", { class: "chart-box" },
         h("div", { class: "chart-title" },
           h("span", { class: "muted" }, ws.show_fit ? "体重分布 (直方图 + 正态拟合)" : "体重分布 (直方图)"),
-          ws.show_fit ? null : h("span", { class: "chart-note" }, `n=${ws.n} < 30, 拟合已隐藏`)
+          ws.show_fit ? null : h("span", { class: "chart-note" }, ws.n < 30 ? `n=${ws.n} < 30, 拟合已隐藏` : "需筛选单一箱号才显示拟合")
         ),
         distCanvas
       ),

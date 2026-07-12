@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,36 @@ def _parse_ts(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _parse_date_from(value: str | None) -> datetime | None:
+    """Parse a date-from bound. Date-only 'YYYY-MM-DD' -> midnight inclusive."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # If only a date was given (no time component), it's already midnight.
+    return dt
+
+
+def _parse_date_to(value: str | None) -> datetime | None:
+    """Parse a date-to bound as an exclusive upper bound (next midnight).
+
+    '2026-07-12' -> 2026-07-13 00:00:00, so all records on July 12 are included.
+    A full timestamp '2026-07-12T15:30:00' is used as-is (exclusive).
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # If only a date (length 10, no 'T'), extend to next midnight.
+    if "T" not in value and len(value) == 10:
+        return dt + timedelta(days=1)
+    return dt
 
 
 def _load_record_json(output_root: Path, mouse: dict[str, Any]) -> dict[str, Any]:
@@ -57,8 +87,8 @@ def collect_records(
     include_deleted: bool = False,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    df = _parse_ts(date_from)
-    dt = _parse_ts(date_to)
+    df = _parse_date_from(date_from)
+    dt = _parse_date_to(date_to)
 
     for run in registry.list_runs():
         for mouse in registry._mice_in_dir(Path(run["path"]), run_id=run["run_id"]):
@@ -83,9 +113,13 @@ def collect_records(
                     continue
             ts = mouse.get("timestamp") or raw.get("timestamp")
             ts_dt = _parse_ts(ts)
-            if df and ts_dt and ts_dt < df:
+            # If a date filter is set but the record has no parseable timestamp,
+            # exclude it rather than silently letting it bypass the filter.
+            if (df or dt) and ts_dt is None:
                 continue
-            if dt and ts_dt and ts_dt > dt:
+            if df and ts_dt < df:
+                continue
+            if dt and ts_dt >= dt:
                 continue
             notes = meta.get("notes") or ""
             if q:
@@ -125,14 +159,17 @@ def collect_records(
     return items
 
 
-def _compute_weight_stats(weights: list[float]) -> dict[str, Any]:
+def _compute_weight_stats(
+    weights: list[float], *, is_single_cohort: bool = False
+) -> dict[str, Any]:
     """Descriptive stats for continuous weight data (QC overview).
 
-    Returns Mean±SD (not SEM — SD describes individual spread, which is what
+    Returns Mean±SD (not SEM - SD describes individual spread, which is what
     QC needs), min/max/range/median, a histogram with adaptive binning, and a
-    normal PDF fit curve. The fit is only provided when n >= 30; below that a
-    Gaussian overlay has no statistical support and would mislead. Uses numpy
-    only (no scipy).
+    normal PDF fit curve. The fit is only shown when the data is a single
+    homogeneous cohort (one cage) AND n >= 30: n>=30 alone does NOT make raw
+    weights normal (CLT applies to sample means, not the data itself), and
+    mixing cages/strains/batches can be multimodal. Uses numpy only (no scipy).
     """
     n = len(weights)
     if n == 0:
@@ -160,8 +197,8 @@ def _compute_weight_stats(weights: list[float]) -> dict[str, Any]:
     bin_edges = np.arange(lo, hi + bin_width / 2, bin_width)
     counts, _ = np.histogram(w, bins=bin_edges)
 
-    # Normal PDF fit — only when n >= 30 (CLT threshold for meaningful fit).
-    show_fit = n >= 30 and sd > 1e-9
+    # Normal PDF fit - only for single cohort + n >= 30 (see docstring).
+    show_fit = n >= 30 and sd > 1e-9 and is_single_cohort
     if show_fit:
         sigma = sd
         fit_x = np.linspace(mean - 3 * sigma, mean + 3 * sigma, 40)
@@ -292,7 +329,7 @@ def overview_stats(
         "average_weight": avg_weight,
         "meta_overlay": meta_counts,
         "daily_counts": daily_filled,
-        "weight_stats": _compute_weight_stats(weights),
+        "weight_stats": _compute_weight_stats(weights, is_single_cohort=bool(cage_id)),
         "cage_weights": _compute_cage_weight_view(active),
         "filters": {
             "strain": strain, "cage_id": cage_id,
@@ -306,25 +343,46 @@ def _fill_daily_counts(
     daily: dict[str, int],
     date_from: str | None,
     date_to: str | None,
+    *,
+    max_days: int = 90,
+    default_days: int = 30,
 ) -> list[dict[str, Any]]:
     """Return daily counts with gaps filled as 0 over a contiguous date range.
 
-    Range is [min(earliest data, date_from), max(latest data, date_to)] so the
-    chart axis shows real time spacing. If no data and no bounds, returns [].
+    When no explicit bounds are given, defaults to the last ``default_days``
+    from the latest data point. Spans longer than ``max_days`` are clamped to
+    ``max_days`` ending at the latest point to prevent millions of objects and
+    chart overcrowding.
     """
     if not daily and not date_from and not date_to:
         return []
     days_present = sorted(daily.keys())
-    start = date_from or days_present[0] if days_present else date_from
-    end = date_to or days_present[-1] if days_present else date_to
-    if not start or not end:
-        return [{"date": k, "count": daily[k]} for k in days_present]
     from datetime import datetime as _dt, timedelta as _td
-    try:
-        cur = _dt.fromisoformat(start)
-        last = _dt.fromisoformat(end)
-    except ValueError:
+    # Resolve end bound
+    if date_to:
+        try:
+            last = _dt.fromisoformat(date_to[:10])
+        except ValueError:
+            last = _dt.fromisoformat(days_present[-1]) if days_present else None
+    elif days_present:
+        last = _dt.fromisoformat(days_present[-1])
+    else:
+        return []
+    # Resolve start bound
+    if date_from:
+        try:
+            cur = _dt.fromisoformat(date_from[:10])
+        except ValueError:
+            cur = last - _td(days=default_days) if last else None
+    elif days_present:
+        cur = last - _td(days=default_days)
+    else:
+        return []
+    if not cur or not last:
         return [{"date": k, "count": daily[k]} for k in days_present]
+    # Clamp span to max_days
+    if (last - cur).days > max_days:
+        cur = last - _td(days=max_days)
     out = []
     while cur <= last:
         key = cur.strftime("%Y-%m-%d")
