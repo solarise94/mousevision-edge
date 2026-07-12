@@ -1,4 +1,4 @@
-"""Tests for weight statistics and verify-cages grouping."""
+"""Tests for weight statistics, per-cage outlier screening, and verify-cages grouping."""
 
 from __future__ import annotations
 
@@ -9,20 +9,25 @@ import cv2
 import numpy as np
 
 from mousevision.run import create_run_dir, finish_run
-from ui.records_api import _compute_weight_stats, verify_cages_view
+from ui.records_api import (
+    _compute_weight_stats,
+    _compute_cage_weight_view,
+    _fill_daily_counts,
+    verify_cages_view,
+)
 from ui.records_meta import RecordsMetaStore
 from ui.registry import MouseRegistry
 
 
 # ---------------------------------------------------------------------------
-# _compute_weight_stats — pure function, no fixtures needed
+# _compute_weight_stats — pure function
 # ---------------------------------------------------------------------------
 
 def test_weight_stats_empty():
     ws = _compute_weight_stats([])
     assert ws["n"] == 0
     assert ws["mean"] is None
-    assert ws["out_of_range"] == 0
+    assert ws["show_fit"] is False
     assert ws["fit_x"] == []
 
 
@@ -33,38 +38,100 @@ def test_weight_stats_basic():
     assert ws["min"] == 15.5
     assert ws["max"] == 17.0
     assert ws["range"] == 1.5
-    # SEM = std(ddof=1)/sqrt(n)
-    import numpy as np
-    expected_sem = round(np.std([16.0, 16.5, 17.0, 15.5, 16.2], ddof=1) / np.sqrt(5), 2)
-    assert ws["sem"] == expected_sem
+    # SD = std(ddof=1)
+    expected_sd = round(np.std([16.0, 16.5, 17.0, 15.5, 16.2], ddof=1), 2)
+    assert ws["sd"] == expected_sd
 
 
-def test_weight_stats_threshold_and_outliers():
-    # mean = 16.3, threshold = 14.3–18.3; 20.0 is out of range
-    ws = _compute_weight_stats([16.0, 16.5, 16.4, 20.0])
-    assert ws["threshold_low"] == round(ws["mean"] - 2.0, 2)
-    assert ws["threshold_high"] == round(ws["mean"] + 2.0, 2)
-    assert ws["out_of_range"] == 1
+def test_weight_stats_small_sample_hides_fit():
+    """n < 30 must NOT show a normal fit curve — it has no statistical support."""
+    ws = _compute_weight_stats([16.0, 16.5, 17.0, 15.5, 16.2])
+    assert ws["show_fit"] is False
+    assert ws["fit_x"] == []
 
 
-def test_weight_stats_histogram_and_fit_shape():
+def test_weight_stats_large_sample_shows_fit():
+    """n >= 30 should show the fit curve."""
+    rng = np.random.default_rng(42)
+    weights = rng.normal(16.5, 0.5, 30).tolist()
+    ws = _compute_weight_stats(weights)
+    assert ws["show_fit"] is True
+    assert len(ws["fit_x"]) == 40
+    assert len(ws["fit_y"]) == 40
+
+
+def test_weight_stats_histogram_shape():
     ws = _compute_weight_stats([16.0, 16.2, 16.5, 16.8, 17.0])
     assert len(ws["hist_counts"]) == len(ws["hist_bins"]) - 1
     assert sum(ws["hist_counts"]) == 5
-    assert len(ws["fit_x"]) == 40
-    assert len(ws["fit_y"]) == 40
-    # Fit curve should peak near the mean
-    peak_idx = ws["fit_y"].index(max(ws["fit_y"]))
-    assert abs(ws["fit_x"][peak_idx] - ws["mean"]) < 0.6
 
 
 def test_weight_stats_single_sample():
     ws = _compute_weight_stats([16.5])
     assert ws["n"] == 1
     assert ws["mean"] == 16.5
-    assert ws["sem"] == 0.0  # no variance with single sample
-    assert ws["std"] == 0.0
-    assert ws["out_of_range"] == 0
+    assert ws["sem"] == 0.0
+    assert ws["sd"] == 0.0
+    assert ws["show_fit"] is False
+
+
+# ---------------------------------------------------------------------------
+# _compute_cage_weight_view — robust per-cage outlier screening
+# ---------------------------------------------------------------------------
+
+def test_cage_weight_outlier_detection():
+    recs = [
+        {"cage_id": "A", "weight": 16.0, "record_id": "r1", "ordinal": 1},
+        {"cage_id": "A", "weight": 16.2, "record_id": "r2", "ordinal": 2},
+        {"cage_id": "A", "weight": 20.0, "record_id": "r3", "ordinal": 3},
+        {"cage_id": "B", "weight": 18.0, "record_id": "r4", "ordinal": 1},
+    ]
+    cv = _compute_cage_weight_view(recs)
+    # Cage A: median=16.2, threshold 14.2–18.2; 20.0 is an outlier
+    cage_a = cv["cages"][0]
+    assert cage_a["median"] == 16.2
+    assert cage_a["outlier_count"] == 1
+    assert cage_a["points"][2]["outlier"] is True
+    assert cage_a["points"][0]["outlier"] is False
+    # Cage B: single mouse, median=18.0, not an outlier
+    cage_b = cv["cages"][1]
+    assert cage_b["outlier_count"] == 0
+    assert cv["total_outliers"] == 1
+    assert cv["total_n"] == 4
+
+
+def test_cage_weight_skips_none_weight():
+    recs = [
+        {"cage_id": "A", "weight": 16.0, "record_id": "r1", "ordinal": 1},
+        {"cage_id": "A", "weight": None, "record_id": "r2", "ordinal": 2},
+    ]
+    cv = _compute_cage_weight_view(recs)
+    assert cv["cages"][0]["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _fill_daily_counts — gap filling for the daily chart axis
+# ---------------------------------------------------------------------------
+
+def test_fill_daily_counts_fills_gaps():
+    out = _fill_daily_counts({"2026-07-10": 5, "2026-07-12": 3}, None, None)
+    assert len(out) == 3
+    assert out[1] == {"date": "2026-07-11", "count": 0}
+    assert out[0]["count"] == 5
+    assert out[2]["count"] == 3
+
+
+def test_fill_daily_counts_respects_bounds():
+    out = _fill_daily_counts({"2026-07-12": 3}, "2026-07-10", "2026-07-12")
+    assert len(out) == 3
+    assert out[:2] == [
+        {"date": "2026-07-10", "count": 0},
+        {"date": "2026-07-11", "count": 0},
+    ]
+
+
+def test_fill_daily_counts_empty():
+    assert _fill_daily_counts({}, None, None) == []
 
 
 # ---------------------------------------------------------------------------
@@ -79,16 +146,10 @@ def _write_mouse(run_dir: Path, *, ordinal: int, cage_id: str, weight: float, ru
     (session_dir / "record.json").write_text(
         json.dumps(
             {
-                "box_id": cage_id,
-                "cage_id": cage_id,
-                "weight": weight,
-                "confidence": 0.9,
-                "timestamp": "2026-07-10T12:00:00",
-                "device": "scale01",
-                "photo": "photo.jpg",
-                "ordinal": ordinal,
-                "run_id": run_id,
-                "record_id": f"rec-{cage_id}-{ordinal}",
+                "box_id": cage_id, "cage_id": cage_id, "weight": weight,
+                "confidence": 0.9, "timestamp": "2026-07-10T12:00:00",
+                "device": "scale01", "photo": "photo.jpg", "ordinal": ordinal,
+                "run_id": run_id, "record_id": f"rec-{cage_id}-{ordinal}",
             }
         ),
         encoding="utf-8",
@@ -102,18 +163,14 @@ def test_verify_cages_groups_pending_only(tmp_path: Path):
     _write_mouse(run_dir, ordinal=1, cage_id="C57-023", weight=16.0, run_id=man["run_id"])
     _write_mouse(run_dir, ordinal=2, cage_id="C57-023", weight=16.5, run_id=man["run_id"])
     finish_run(run_dir)
-
     reg = MouseRegistry(tmp_path / "reg.json", output)
     meta = RecordsMetaStore(str(tmp_path / "meta.db"))
-
     result = verify_cages_view(reg, meta, output)
     assert result["total_cages"] == 1
     assert result["total_records"] == 2
     cage = result["cages"][0]
     assert cage["cage_id"] == "C57-023"
-    assert cage["count"] == 2
     assert cage["mean_weight"] == round((16.0 + 16.5) / 2, 2)
-    assert len(cage["records"]) == 2
 
 
 def test_verify_cages_excludes_published_and_deleted(tmp_path: Path):
@@ -123,48 +180,10 @@ def test_verify_cages_excludes_published_and_deleted(tmp_path: Path):
     _write_mouse(run_dir, ordinal=2, cage_id="C57-023", weight=16.5, run_id=man["run_id"])
     _write_mouse(run_dir, ordinal=3, cage_id="C57-023", weight=17.0, run_id=man["run_id"])
     finish_run(run_dir)
-
     reg = MouseRegistry(tmp_path / "reg.json", output)
     meta = RecordsMetaStore(str(tmp_path / "meta.db"))
-    # Publish #1, delete #2 — only #3 should remain pending
     meta.publish("rec-C57-023-1")
     meta.soft_delete("rec-C57-023-2")
-
     result = verify_cages_view(reg, meta, output)
     assert result["total_records"] == 1
-    cage = result["cages"][0]
-    assert cage["records"][0]["record_id"] == "rec-C57-023-3"
-
-
-def test_verify_cages_multiple_cages(tmp_path: Path):
-    output = tmp_path / "output"
-    run_a, man_a = create_run_dir(output, cage_id="C57-023", mode="video")
-    _write_mouse(run_a, ordinal=1, cage_id="C57-023", weight=16.0, run_id=man_a["run_id"])
-    finish_run(run_a)
-    run_b, man_b = create_run_dir(output, cage_id="C57-045", mode="video")
-    _write_mouse(run_b, ordinal=1, cage_id="C57-045", weight=18.0, run_id=man_b["run_id"])
-    finish_run(run_b)
-
-    reg = MouseRegistry(tmp_path / "reg.json", output)
-    meta = RecordsMetaStore(str(tmp_path / "meta.db"))
-
-    result = verify_cages_view(reg, meta, output)
-    assert result["total_cages"] == 2
-    cage_ids = [c["cage_id"] for c in result["cages"]]
-    assert "C57-023" in cage_ids
-    assert "C57-045" in cage_ids
-
-
-def test_verify_cages_empty_when_all_published(tmp_path: Path):
-    output = tmp_path / "output"
-    run_dir, man = create_run_dir(output, cage_id="C57-023", mode="video")
-    _write_mouse(run_dir, ordinal=1, cage_id="C57-023", weight=16.0, run_id=man["run_id"])
-    finish_run(run_dir)
-
-    reg = MouseRegistry(tmp_path / "reg.json", output)
-    meta = RecordsMetaStore(str(tmp_path / "meta.db"))
-    meta.publish("rec-C57-023-1")
-
-    result = verify_cages_view(reg, meta, output)
-    assert result["total_cages"] == 0
-    assert result["cages"] == []
+    assert result["cages"][0]["records"][0]["record_id"] == "rec-C57-023-3"

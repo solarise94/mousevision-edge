@@ -14,6 +14,7 @@
     pageSize: 20,
     total: 0,
     filters: { strain: "", cage_id: "", q: "", date_from: "", date_to: "" },
+    ovFilters: { strain: "", cage_id: "", date_from: "", date_to: "", status: "" },
     boxes: [],
     overview: null,
     logs: [],
@@ -158,7 +159,7 @@
         }
         await loadRecords();
       }
-      if (state.route === "overview") state.overview = await api("/api/overview");
+      if (state.route === "overview") await loadOverview();
       if (state.route === "boxes") {
         const r = await api("/api/boxes?limit=200");
         state.boxes = r.items || [];
@@ -211,25 +212,64 @@
     }
   }
 
-  function drawChart(canvas, points, key) {
+  // Daily counts bar chart with real date axis (gaps filled as 0 by backend).
+  function drawDailyChart(canvas, points) {
     if (!canvas || !points?.length) return;
     const ctx = canvas.getContext("2d");
-    const w = canvas.width = canvas.clientWidth * 2;
-    const h = canvas.height = canvas.clientHeight * 2;
+    const W = canvas.width = canvas.clientWidth * 2;
+    const H = canvas.height = canvas.clientHeight * 2;
     ctx.scale(2, 2);
-    const cw = w / 2, ch = h / 2;
+    const cw = W / 2, ch = H / 2;
     ctx.clearRect(0, 0, cw, ch);
-    const vals = points.map((p) => p[key] ?? p.count ?? 0);
+    const padL = 28, padR = 12, padT = 10, padB = 32;
+    const plotW = cw - padL - padR;
+    const plotH = ch - padT - padB;
+    const vals = points.map((p) => p.count ?? 0);
     const max = Math.max(...vals, 1);
-    const barW = Math.max(4, (cw - 20) / vals.length - 4);
+    const barSlot = plotW / vals.length;
+    const barW = Math.max(3, barSlot - 3);
+
+    // Y-axis gridlines + labels
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
+    ctx.fillStyle = "#9aa3af";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "right";
+    const ySteps = Math.min(max, 4);
+    for (let s = 0; s <= ySteps; s++) {
+      const v = (max / ySteps) * s;
+      const y = padT + plotH - (v / max) * plotH;
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(padL + plotW, y);
+      ctx.stroke();
+      if (s > 0) ctx.fillText(String(Math.round(v)), padL - 4, y + 3);
+    }
+
+    // Bars
     vals.forEach((v, i) => {
-      const bh = (v / max) * (ch - 30);
-      ctx.fillStyle = "#3ddc84";
-      ctx.fillRect(10 + i * (barW + 4), ch - bh - 10, barW, bh);
+      const bh = (v / max) * plotH;
+      const bx = padL + i * barSlot + 1.5;
+      ctx.fillStyle = v > 0 ? "#3ddc84" : "rgba(61,220,132,0.15)";
+      ctx.fillRect(bx, padT + plotH - bh, barW, bh);
+    });
+
+    // X-axis date labels — show first, middle, last to avoid crowding
+    ctx.textAlign = "center";
+    const labelIdx = points.length <= 1
+      ? [0]
+      : [0, Math.floor(points.length / 2), points.length - 1];
+    [...new Set(labelIdx)].forEach((i) => {
+      const p = points[i];
+      if (!p || !p.date) return;
+      const x = padL + i * barSlot + barSlot / 2;
+      // MM-DD format
+      const label = p.date.length >= 10 ? p.date.slice(5) : p.date;
+      ctx.fillText(label, x, ch - 12);
     });
   }
 
-  // Weight distribution: histogram bars + normal fit curve + ±2g threshold lines.
+  // Weight distribution: histogram bars (width from bin edges) + optional
+  // normal fit curve (only when backend says show_fit, i.e. n>=30).
   function drawDistChart(canvas, ws) {
     if (!canvas || !ws || ws.n === 0) return;
     const ctx = canvas.getContext("2d");
@@ -238,35 +278,51 @@
     ctx.scale(2, 2);
     const cw = W / 2, ch = H / 2;
     ctx.clearRect(0, 0, cw, ch);
-    const padL = 32, padR = 12, padT = 12, padB = 28;
+    const padL = 36, padR = 14, padT = 12, padB = 30;
     const plotW = cw - padL - padR;
     const plotH = ch - padT - padB;
 
     const bins = ws.hist_bins;
     const counts = ws.hist_counts;
-    const fitX = ws.fit_x;
-    const fitY = ws.fit_y;
-    const wmin = ws.min, wmax = ws.max;
-    // x-axis domain spans histogram bins (or fit range if wider)
-    const xLo = Math.min(bins[0], fitX[0] || wmin);
-    const xHi = Math.max(bins[bins.length - 1], fitX[fitX.length - 1] || wmax);
+    const fitX = ws.fit_x || [];
+    const fitY = ws.fit_y || [];
+    // x-axis domain = histogram bin range (fit curve, if shown, stays within)
+    const xLo = bins[0];
+    const xHi = bins[bins.length - 1];
     const xRange = xHi - xLo || 1;
     const yMax = Math.max(...counts, ...(fitY.length ? [Math.max(...fitY)] : []), 1);
 
     const xPx = (v) => padL + ((v - xLo) / xRange) * plotW;
     const yPx = (v) => padT + plotH - (v / yMax) * plotH;
 
-    // Histogram bars
-    const barW = Math.max(2, (plotW / counts.length) - 3);
-    ctx.fillStyle = "rgba(61,220,132,0.35)";
+    // Y-axis gridlines
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
+    ctx.fillStyle = "#9aa3af";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "right";
+    const ySteps = Math.min(Math.ceil(yMax), 4);
+    for (let s = 0; s <= ySteps; s++) {
+      const v = (yMax / ySteps) * s;
+      const y = yPx(v);
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(padL + plotW, y);
+      ctx.stroke();
+      if (s > 0) ctx.fillText(String(Math.round(v)), padL - 4, y + 3);
+    }
+
+    // Histogram bars — width from consecutive bin edges (fixes P1 overlap)
+    ctx.fillStyle = "rgba(61,220,132,0.4)";
     counts.forEach((c, i) => {
-      const bx = xPx(bins[i]);
+      const bx0 = xPx(bins[i]);
+      const bx1 = xPx(bins[i + 1]);
+      const bw = Math.max(1, bx1 - bx0 - 1);
       const bh = (c / yMax) * plotH;
-      ctx.fillRect(bx, padT + plotH - bh, barW, bh);
+      ctx.fillRect(bx0, padT + plotH - bh, bw, bh);
     });
 
-    // Normal fit curve
-    if (fitX.length > 1) {
+    // Normal fit curve — only when show_fit (n >= 30)
+    if (ws.show_fit && fitX.length > 1) {
       ctx.strokeStyle = "#f2f4f7";
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -277,20 +333,7 @@
       ctx.stroke();
     }
 
-    // ±2g threshold lines (red dashed)
-    [ws.threshold_low, ws.threshold_high].forEach((tv) => {
-      if (tv == null || tv < xLo || tv > xHi) return;
-      ctx.strokeStyle = "rgba(255,77,79,0.6)";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 3]);
-      ctx.beginPath();
-      ctx.moveTo(xPx(tv), padT);
-      ctx.lineTo(xPx(tv), padT + plotH);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    });
-
-    // Mean line (subtle)
+    // Mean line (amber)
     if (ws.mean != null) {
       ctx.strokeStyle = "rgba(245,166,35,0.7)";
       ctx.lineWidth = 1;
@@ -300,17 +343,88 @@
       ctx.stroke();
     }
 
-    // Axis labels
+    // X-axis labels
+    ctx.fillStyle = "#9aa3af";
+    ctx.textAlign = "center";
+    const xLabelIdx = bins.length <= 1 ? [0] : [0, Math.floor(bins.length / 2), bins.length - 1];
+    xLabelIdx.forEach((i) => {
+      ctx.fillText(`${bins[i].toFixed(1)}`, xPx(bins[i]), ch - 10);
+    });
+  }
+
+  // Per-cage strip plot: each mouse = a dot, grouped by cage column, with
+  // cage median line. Outliers (cage median ±2g) drawn red.
+  function drawStripPlot(canvas, cw_data) {
+    if (!canvas || !cw_data || !cw_data.cages?.length) return;
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width = canvas.clientWidth * 2;
+    const H = canvas.height = canvas.clientHeight * 2;
+    ctx.scale(2, 2);
+    const cw = W / 2, ch = H / 2;
+    ctx.clearRect(0, 0, cw, ch);
+    const padL = 36, padR = 14, padT = 14, padB = 34;
+    const plotW = cw - padL - padR;
+    const plotH = ch - padT - padB;
+    const cages = cw_data.cages;
+
+    // Y-axis domain: union of all weights with padding
+    const allW = cages.flatMap((c) => c.points.map((p) => p.weight));
+    if (!allW.length) return;
+    const yLo = Math.floor(Math.min(...allW) - 0.5);
+    const yHi = Math.ceil(Math.max(...allW) + 0.5);
+    const yRange = yHi - yLo || 1;
+    const yPx = (v) => padT + plotH - ((v - yLo) / yRange) * plotH;
+
+    // Y-axis gridlines + labels
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
     ctx.fillStyle = "#9aa3af";
     ctx.font = "10px sans-serif";
-    ctx.textAlign = "center";
-    [xLo, ws.mean, xHi].forEach((v) => {
-      if (v == null) return;
-      ctx.fillText(`${v.toFixed(1)}`, xPx(v), ch - 10);
-    });
     ctx.textAlign = "right";
-    ctx.fillText(`${yMax.toFixed(0)}`, padL - 4, padT + 8);
-    ctx.fillText("0", padL - 4, padT + plotH);
+    const ySteps = Math.min(yRange, 5);
+    for (let s = 0; s <= ySteps; s++) {
+      const v = yLo + (yRange / ySteps) * s;
+      const y = yPx(v);
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(padL + plotW, y);
+      ctx.stroke();
+      ctx.fillText(v.toFixed(1), padL - 4, y + 3);
+    }
+
+    // Each cage = a vertical column
+    const colW = plotW / cages.length;
+    cages.forEach((cage, ci) => {
+      const colCx = padL + colW * (ci + 0.5);
+      // Median line (amber, spans column width)
+      if (cage.median != null) {
+        ctx.strokeStyle = "rgba(245,166,35,0.8)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(colCx - colW * 0.3, yPx(cage.median));
+        ctx.lineTo(colCx + colW * 0.3, yPx(cage.median));
+        ctx.stroke();
+      }
+      // Dots — jitter horizontally within column
+      const dotR = 4;
+      const spread = colW * 0.28;
+      cage.points.forEach((p, pi) => {
+        // Deterministic jitter based on index
+        const jitter = ((pi % 3) - 1) * (spread / 2.5);
+        const px = colCx + jitter;
+        const py = yPx(p.weight);
+        ctx.beginPath();
+        ctx.arc(px, py, dotR, 0, Math.PI * 2);
+        ctx.fillStyle = p.outlier ? "#ff4d4f" : "#3ddc84";
+        ctx.fill();
+      });
+      // Cage label below
+      ctx.fillStyle = "#9aa3af";
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "center";
+      const label = cage.cage_id.length > 8 ? cage.cage_id.slice(0, 7) + "…" : cage.cage_id;
+      ctx.fillText(label, colCx, ch - 16);
+      ctx.fillText(`n=${cage.n}`, colCx, ch - 4);
+    });
   }
 
   function shell(nodes) {
@@ -609,54 +723,110 @@
     ];
   }
 
+  async function loadOverview() {
+    const p = new URLSearchParams();
+    ["strain", "cage_id", "date_from", "date_to", "status"].forEach((k) => {
+      if (state.ovFilters[k]) p.set(k, state.ovFilters[k]);
+    });
+    state.overview = await api(`/api/overview?${p}`);
+    render();
+  }
+
   function viewOverview() {
     const o = state.overview || {};
     const ws = o.weight_stats || { n: 0 };
+    const cw = o.cage_weights || { cages: [], total_n: 0, total_outliers: 0 };
+    const n = (o.filters && o.filters.n != null) ? o.filters.n : ws.n;
+
     const dailyCanvas = h("canvas");
-    const weightCanvas = h("canvas");
+    const stripCanvas = h("canvas");
+    const distCanvas = h("canvas");
     setTimeout(() => {
-      drawChart(dailyCanvas, o.daily_counts || [], "count");
-      drawDistChart(weightCanvas, ws);
+      drawDailyChart(dailyCanvas, o.daily_counts || []);
+      drawStripPlot(stripCanvas, cw);
+      drawDistChart(distCanvas, ws);
     }, 50);
 
-    // Mean ± SEM card + range card + ±2g compliance card.
-    const meanSem = ws.mean != null ? `${ws.mean} ± ${ws.sem} g` : "--";
+    // --- Filter bar (cohort selection for QC) ---
+    const fbar = h("div", { class: "filters" });
+    const ff = [
+      ["date_from", "开始日期", "date"],
+      ["date_to", "结束日期", "date"],
+      ["strain", "品系", "text"],
+      ["cage_id", "箱号", "text"],
+    ];
+    ff.forEach(([key, label, type]) => {
+      const inp = h("input", { type, value: state.ovFilters[key] || "", placeholder: label });
+      inp.addEventListener("input", (e) => (state.ovFilters[key] = e.target.value));
+      fbar.appendChild(h("label", { class: "field" }, h("span", null, label), inp));
+    });
+    const statusSel = h("select", null,
+      h("option", { value: "" }, "全部状态"),
+      h("option", { value: "pending" }, "待核对"),
+      h("option", { value: "published" }, "已发布"),
+    );
+    statusSel.value = state.ovFilters.status || "";
+    statusSel.addEventListener("change", (e) => (state.ovFilters.status = e.target.value));
+    fbar.appendChild(h("label", { class: "field" }, h("span", null, "状态"), statusSel));
+    fbar.appendChild(h("button", { class: "btn primary", onClick: () => loadOverview() }, "筛选"));
+    fbar.appendChild(h("button", {
+      class: "btn",
+      onClick: () => {
+        state.ovFilters = { strain: "", cage_id: "", date_from: "", date_to: "", status: "" };
+        loadOverview();
+      },
+    }, "重置"));
+
+    // --- KPI cards ---
+    const meanSd = ws.mean != null ? `${ws.mean} ± ${ws.sd} g` : "--";
     const rangeStr = ws.min != null ? `${ws.min}–${ws.max} g` : "--";
-    const oor = ws.out_of_range || 0;
-    const total = ws.n || 0;
-    const compliant = total - oor;
-    const compliantStr = total > 0 ? `${compliant}/${total}` : "--";
-    const compliantWarn = oor > 0;
+    const outlierWarn = cw.total_outliers > 0;
 
     return [
-      kpiRow({
-        total_records: o.total_records,
-        pending_count: o.pending_count,
-        published_count: o.published_count,
-        deleted_count: o.deleted_count,
-        average_weight: meanSem,
-      }),
+      fbar,
       h("div", { class: "kpi-row" },
         h("div", { class: "kpi" },
+          h("div", { class: "label" }, "总记录 (n)"),
+          h("div", { class: "value" }, String(n)),
+          h("div", { class: "delta" }, `待核对 ${o.pending_count ?? 0} · 已发布 ${o.published_count ?? 0}`)
+        ),
+        h("div", { class: "kpi" },
+          h("div", { class: "label" }, "Mean ± SD"),
+          h("div", { class: "value green" }, meanSd),
+          h("div", { class: "delta" }, ws.median != null ? `中位数 ${ws.median} g` : "")
+        ),
+        h("div", { class: "kpi" },
           h("div", { class: "label" }, "体重范围"),
-          h("div", { class: "value green" }, rangeStr),
+          h("div", { class: "value" }, rangeStr),
           ws.range != null ? h("div", { class: "delta" }, `Δ ${ws.range} g`) : null
         ),
         h("div", { class: "kpi" },
-          h("div", { class: "label" }, "±2g 合规"),
-          h("div", { class: `value ${compliantWarn ? "warn" : "green"}` }, compliantStr),
-          h("div", { class: "delta" }, compliantWarn ? `${oor} 只超限` : "全部合规")
-        ),
-        h("div", { class: "kpi" },
-          h("div", { class: "label" }, "中位数 / 标准差"),
-          h("div", { class: "value" }, ws.median != null ? `${ws.median} / ${ws.std} g` : "--"),
-          h("div", { class: "delta" }, `n = ${total}`)
+          h("div", { class: "label" }, "异常候选"),
+          h("div", { class: `value ${outlierWarn ? "warn" : "green"}` }, String(cw.total_outliers)),
+          h("div", { class: "delta" }, outlierWarn ? "箱内中位数 ±2g 外" : "无异常")
         )
       ),
-      h("div", { class: "chart-box" }, h("div", { class: "muted", style: "margin-bottom:8px" }, "每日记录数"), dailyCanvas),
       h("div", { class: "chart-box" },
-        h("div", { class: "muted", style: "margin-bottom:8px" }, "体重分布 (直方图 + 正态拟合)"),
-        weightCanvas
+        h("div", { class: "muted", style: "margin-bottom:8px" }, "每日记录数"),
+        dailyCanvas
+      ),
+      h("div", { class: "chart-box" },
+        h("div", { class: "chart-title" },
+          h("span", { class: "muted" }, "按笼体重 (strip plot)"),
+          h("span", { class: "chart-legend" },
+            h("span", { class: "dot green" }), "正常",
+            h("span", { class: "dot red" }), "异常",
+            h("span", { class: "line amber" }), "笼内中位数"
+          )
+        ),
+        stripCanvas
+      ),
+      h("div", { class: "chart-box" },
+        h("div", { class: "chart-title" },
+          h("span", { class: "muted" }, ws.show_fit ? "体重分布 (直方图 + 正态拟合)" : "体重分布 (直方图)"),
+          ws.show_fit ? null : h("span", { class: "chart-note" }, `n=${ws.n} < 30, 拟合已隐藏`)
+        ),
+        distCanvas
       ),
     ];
   }

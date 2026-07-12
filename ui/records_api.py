@@ -126,61 +126,117 @@ def collect_records(
 
 
 def _compute_weight_stats(weights: list[float]) -> dict[str, Any]:
-    """Normal-distribution stats for continuous weight data.
+    """Descriptive stats for continuous weight data (QC overview).
 
-    Returns mean/SEM/min/max/range, a ±2g compliance check, a 0.5g histogram,
-    and a normal PDF fit curve for the overview chart. Uses numpy only (no
-    scipy): weights are continuous, so a Gaussian fit is the mathematically
-    correct model (Poisson is for integer counts).
+    Returns Mean±SD (not SEM — SD describes individual spread, which is what
+    QC needs), min/max/range/median, a histogram with adaptive binning, and a
+    normal PDF fit curve. The fit is only provided when n >= 30; below that a
+    Gaussian overlay has no statistical support and would mislead. Uses numpy
+    only (no scipy).
     """
     n = len(weights)
     if n == 0:
         return {
-            "mean": None, "sem": None, "std": None, "min": None, "max": None,
+            "mean": None, "sd": None, "sem": None, "min": None, "max": None,
             "range": None, "median": None, "n": 0,
-            "threshold_low": None, "threshold_high": None, "out_of_range": 0,
-            "hist_bins": [], "hist_counts": [], "fit_x": [], "fit_y": [],
+            "hist_bins": [], "hist_counts": [],
+            "fit_x": [], "fit_y": [], "show_fit": False,
         }
     w = np.array(weights, dtype=float)
     mean = float(w.mean())
-    std = float(w.std(ddof=1)) if n > 1 else 0.0
-    sem = std / float(np.sqrt(n)) if n > 1 else 0.0
+    sd = float(w.std(ddof=1)) if n > 1 else 0.0
+    sem = sd / float(np.sqrt(n)) if n > 1 else 0.0
     wmin, wmax = float(w.min()), float(w.max())
-    # ±2g compliance window around the mean
-    thr_lo, thr_hi = mean - 2.0, mean + 2.0
-    out_of_range = int(np.sum((w < thr_lo) | (w > thr_hi)))
-    # 0.5g histogram bins spanning the data range
-    lo = np.floor(wmin * 2) / 2  # snap down to 0.5g
-    hi = np.ceil(wmax * 2) / 2   # snap up to 0.5g
+
+    # Adaptive histogram: Sturges rule with 0.2g floor on bin width,
+    # clamped to [4, 20] bins. Avoids the fixed-0.5g sparseness on small n.
+    n_bins = max(4, min(20, int(np.ceil(np.log2(n) + 1))))
+    raw_width = (wmax - wmin) / n_bins if wmax > wmin else 0.5
+    bin_width = max(0.2, raw_width)
+    lo = np.floor(wmin / bin_width) * bin_width
+    hi = np.ceil(wmax / bin_width) * bin_width
     if hi <= lo:
-        hi = lo + 0.5
-    bin_edges = np.arange(lo, hi + 0.5, 0.5)
+        hi = lo + bin_width
+    bin_edges = np.arange(lo, hi + bin_width / 2, bin_width)
     counts, _ = np.histogram(w, bins=bin_edges)
-    # Normal PDF fit curve over μ±3σ, 40 sample points
-    sigma = std if std > 1e-9 else 1.0
-    fit_x = np.linspace(mean - 3 * sigma, mean + 3 * sigma, 40)
-    fit_y = (1.0 / (sigma * np.sqrt(2 * np.pi))) * np.exp(
-        -0.5 * ((fit_x - mean) / sigma) ** 2
-    )
-    # Scale fit curve to histogram counts so they share an axis
-    bin_width = 0.5
-    fit_y_scaled = fit_y * n * bin_width
+
+    # Normal PDF fit — only when n >= 30 (CLT threshold for meaningful fit).
+    show_fit = n >= 30 and sd > 1e-9
+    if show_fit:
+        sigma = sd
+        fit_x = np.linspace(mean - 3 * sigma, mean + 3 * sigma, 40)
+        fit_y_pdf = (1.0 / (sigma * np.sqrt(2 * np.pi))) * np.exp(
+            -0.5 * ((fit_x - mean) / sigma) ** 2
+        )
+        fit_y_scaled = fit_y_pdf * n * bin_width  # scale to histogram counts
+    else:
+        fit_x, fit_y_scaled = np.array([]), np.array([])
+
     return {
         "mean": round(mean, 2),
+        "sd": round(sd, 2),
         "sem": round(sem, 2),
-        "std": round(std, 2),
         "min": round(wmin, 2),
         "max": round(wmax, 2),
         "range": round(wmax - wmin, 2),
         "median": round(float(np.median(w)), 2),
         "n": n,
-        "threshold_low": round(thr_lo, 2),
-        "threshold_high": round(thr_hi, 2),
-        "out_of_range": out_of_range,
         "hist_bins": [round(float(b), 2) for b in bin_edges],
         "hist_counts": [int(c) for c in counts],
         "fit_x": [round(float(x), 2) for x in fit_x],
         "fit_y": [round(float(y), 2) for y in fit_y_scaled],
+        "show_fit": bool(show_fit),
+    }
+
+
+def _compute_cage_weight_view(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-cage weight view for strip plot + robust outlier screening.
+
+    Groups records by cage_id. Within each cage, outliers are flagged by the
+    cage's own median ±2g (robust to extreme values pulling the mean). This
+    replaces the old global-mean ±2g "compliance" which was a logical loop.
+    """
+    by_cage: dict[str, list[dict[str, Any]]] = {}
+    for rec in records:
+        if rec.get("weight") is None:
+            continue
+        by_cage.setdefault(rec["cage_id"], []).append(rec)
+
+    cages_out = []
+    total_outliers = 0
+    total_n = 0
+    for cage_id in sorted(by_cage.keys()):
+        recs = by_cage[cage_id]
+        weights = [float(r["weight"]) for r in recs]
+        median = float(np.median(weights))
+        thr_lo, thr_hi = median - 2.0, median + 2.0
+        points = []
+        for r in recs:
+            w = float(r["weight"])
+            is_outlier = w < thr_lo or w > thr_hi
+            points.append({
+                "record_id": r.get("record_id"),
+                "ordinal": r.get("ordinal"),
+                "weight": round(w, 2),
+                "outlier": is_outlier,
+            })
+        n_out = sum(1 for p in points if p["outlier"])
+        total_outliers += n_out
+        total_n += len(points)
+        cages_out.append({
+            "cage_id": cage_id,
+            "strain": strain_from_cage(cage_id),
+            "n": len(points),
+            "median": round(median, 2),
+            "threshold_low": round(thr_lo, 2),
+            "threshold_high": round(thr_hi, 2),
+            "outlier_count": n_out,
+            "points": points,
+        })
+    return {
+        "cages": cages_out,
+        "total_n": total_n,
+        "total_outliers": total_outliers,
     }
 
 
@@ -188,27 +244,44 @@ def overview_stats(
     registry: MouseRegistry,
     meta_store: RecordsMetaStore,
     output_root: Path,
+    *,
+    strain: str | None = None,
+    cage_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    status: str | None = None,
 ) -> dict[str, Any]:
+    # status filter: tab semantics — None means all non-deleted.
+    tab = status if status and status != "all" else None
     records = collect_records(
-        registry, meta_store, output_root, include_deleted=True
+        registry, meta_store, output_root,
+        tab=tab,
+        strain=strain,
+        cage_id=cage_id,
+        date_from=date_from,
+        date_to=date_to,
+        include_deleted=True,
     )
+    active = [r for r in records if r.get("status") != "deleted"]
     weights = [
         float(r["weight"])
-        for r in records
-        if r.get("weight") is not None and r.get("status") != "deleted"
+        for r in active
+        if r.get("weight") is not None
     ]
     status_counts = {"pending": 0, "published": 0, "deleted": 0}
-    daily: dict[str, int] = {}
     for rec in records:
         status_counts[rec.get("status", "pending")] = (
             status_counts.get(rec.get("status", "pending"), 0) + 1
         )
-        if rec.get("status") == "deleted":
-            continue
+    # Daily counts — fill gaps so consecutive days are equidistant on the axis.
+    daily: dict[str, int] = {}
+    for rec in active:
         ts = rec.get("timestamp")
         if ts:
             day = ts[:10]
             daily[day] = daily.get(day, 0) + 1
+    daily_filled = _fill_daily_counts(daily, date_from, date_to)
+
     avg_weight = round(sum(weights) / len(weights), 2) if weights else None
     meta_counts = meta_store.counts()
     return {
@@ -218,12 +291,46 @@ def overview_stats(
         "deleted_count": status_counts.get("deleted", 0),
         "average_weight": avg_weight,
         "meta_overlay": meta_counts,
-        "daily_counts": [
-            {"date": k, "count": daily[k]} for k in sorted(daily.keys())
-        ],
-        "weight_samples": weights[:200],
+        "daily_counts": daily_filled,
         "weight_stats": _compute_weight_stats(weights),
+        "cage_weights": _compute_cage_weight_view(active),
+        "filters": {
+            "strain": strain, "cage_id": cage_id,
+            "date_from": date_from, "date_to": date_to, "status": status,
+            "n": len(active),
+        },
     }
+
+
+def _fill_daily_counts(
+    daily: dict[str, int],
+    date_from: str | None,
+    date_to: str | None,
+) -> list[dict[str, Any]]:
+    """Return daily counts with gaps filled as 0 over a contiguous date range.
+
+    Range is [min(earliest data, date_from), max(latest data, date_to)] so the
+    chart axis shows real time spacing. If no data and no bounds, returns [].
+    """
+    if not daily and not date_from and not date_to:
+        return []
+    days_present = sorted(daily.keys())
+    start = date_from or days_present[0] if days_present else date_from
+    end = date_to or days_present[-1] if days_present else date_to
+    if not start or not end:
+        return [{"date": k, "count": daily[k]} for k in days_present]
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        cur = _dt.fromisoformat(start)
+        last = _dt.fromisoformat(end)
+    except ValueError:
+        return [{"date": k, "count": daily[k]} for k in days_present]
+    out = []
+    while cur <= last:
+        key = cur.strftime("%Y-%m-%d")
+        out.append({"date": key, "count": daily.get(key, 0)})
+        cur += _td(days=1)
+    return out
 
 
 def mice_admin_view(

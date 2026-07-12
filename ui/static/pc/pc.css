@@ -266,6 +266,44 @@ th { color: var(--mv-muted); font-weight: 600; background: rgba(255,255,255,0.02
   margin-bottom: 16px;
 }
 .chart-box canvas { width: 100%; height: 220px; display: block; }
+.chart-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.chart-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--mv-muted);
+}
+.chart-legend .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 2px;
+  vertical-align: middle;
+}
+.chart-legend .dot.green { background: var(--mv-green); }
+.chart-legend .dot.red { background: var(--mv-danger); }
+.chart-legend .line {
+  display: inline-block;
+  width: 16px;
+  height: 2px;
+  margin-right: 2px;
+  vertical-align: middle;
+}
+.chart-legend .line.amber { background: var(--mv-amber); }
+.chart-note {
+  font-size: 11px;
+  color: var(--mv-amber);
+  font-style: italic;
+}
 
 .pager { display: flex; gap: 8px; align-items: center; justify-content: center; margin-top: 16px; }
 

@@ -1549,8 +1549,19 @@ def api_records(
 
 
 @app.get("/api/overview")
-def api_overview(user: dict[str, Any] = Depends(require_active_user)) -> dict[str, Any]:
-    return overview_stats(registry, records_meta, DEFAULT_OUTPUT)
+def api_overview(
+    strain: str | None = Query(None),
+    cage_id: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    status: str | None = Query(None),
+    user: dict[str, Any] = Depends(require_active_user),
+) -> dict[str, Any]:
+    return overview_stats(
+        registry, records_meta, DEFAULT_OUTPUT,
+        strain=strain, cage_id=cage_id,
+        date_from=date_from, date_to=date_to, status=status,
+    )
 
 
 @app.get("/api/mice-admin")
