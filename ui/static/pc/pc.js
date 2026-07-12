@@ -216,7 +216,7 @@
     });
   }
 
-  function shell(children) {
+  function shell(nodes) {
     const sections = {};
     ROUTES.forEach((r) => {
       if (r.roles && state.user && !r.roles.includes(state.user.role) && state.user.role !== "admin")
@@ -292,7 +292,7 @@
             }, "退出")
           )
         ),
-        h("div", { class: "content" }, children)
+        h("div", { class: "content" }, ...nodes)
       )
     );
   }
@@ -834,7 +834,7 @@
     const fn = views[state.route] || viewData;
     const content = fn();
     const nodes = Array.isArray(content) ? content : [content];
-    $app.appendChild(shell(...nodes));
+    $app.appendChild(shell(nodes));
   }
 
   window.addEventListener("popstate", () => {
