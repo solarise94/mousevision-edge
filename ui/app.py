@@ -33,7 +33,7 @@ from mousevision.detector import WeighingState
 from mousevision.driver import SessionDriver, SessionSavedEvent
 from mousevision.jobs import AnalysisJobManager, JobStore
 from mousevision.pipeline import load_config
-from mousevision.run import create_run_dir, finish_run, load_manifest, write_manifest
+from mousevision.run import create_run_dir, finish_run, load_manifest, restore_renumber_temps, write_manifest
 from mousevision.source.video import VideoFileSource
 from mousevision.upload_queue import UploadQueue
 from ui.auth import api_token, require_api_token
@@ -683,7 +683,16 @@ box_registry = BoxRegistry(BOX_DB)
 
 
 def _reserve_ordinals(cage_id: str, count: int, project_id: str) -> int:
-    return box_registry.reserve_ordinal(cage_id, count=count, project_id=project_id)
+    return box_registry.reserve_ordinal(
+        cage_id,
+        count=count,
+        project_id=project_id,
+        baseline_records=DEFAULT_OUTPUT,
+    )
+
+
+def _release_ordinals(cage_id: str, ordinal: int) -> None:
+    box_registry.release_ordinal(cage_id, ordinal)
 
 
 job_manager = AnalysisJobManager(
@@ -692,11 +701,17 @@ job_manager = AnalysisJobManager(
     config_path=DEFAULT_CONFIG,
     templates_dir=DEFAULT_TEMPLATES,
     reserve_ordinals=_reserve_ordinals,
+    release_ordinals=_release_ordinals,
+    upload_queue=upload_queue,
 )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Repair any half-applied renumber from a crash, then seed box ordinals.
+    for run in registry.list_runs():
+        restore_renumber_temps(Path(run["path"]))
+    box_registry.sync_from_records(DEFAULT_OUTPUT)
     job_manager.start()
     try:
         yield
@@ -1015,15 +1030,19 @@ class BoxUpdate(BaseModel):
 
 def _box_stats(cage_id: str) -> dict[str, Any]:
     jobs = job_store.list_by_cage(cage_id)
-    completed_records = sum(
-        int(j.get("record_count") or 0) for j in jobs if j["status"] == "completed"
-    )
     pending = sum(
         1 for j in jobs if j["status"] in {"uploading", "queued", "processing"}
     )
     last_at = max((j.get("created_at") for j in jobs), default=None) if jobs else None
+    # Count records actually on disk for this cage (deletes are reflected
+    # immediately; job.record_count is only a snapshot at completion time).
+    on_disk = 0
+    for run in registry.list_runs():
+        if (run.get("cage_id") or "-") != cage_id:
+            continue
+        on_disk += len(registry._mice_in_dir(Path(run["path"]), run_id=run["run_id"]))
     return {
-        "record_count": completed_records,
+        "record_count": on_disk,
         "pending_count": pending,
         "last_activity_at": last_at,
     }
@@ -1229,6 +1248,8 @@ def api_delete_record(record_id: str) -> dict[str, Any]:
     remaining = len(list(run_dir.glob("mouse_*/record.json")))
     manifest["record_count"] = remaining
     write_manifest(run_dir, manifest)
+    # Remove from upload queue so WiFi sync does not POST a deleted record.
+    upload_queue.delete_by_record_id(record_id)
     return {"ok": True, "record_id": record_id, "remaining": remaining}
 
 

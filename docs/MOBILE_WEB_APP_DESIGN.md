@@ -130,10 +130,10 @@ uploading → queued → processing → completed
 2. **pipeline 接受入参**：`run_video(...)` / `SessionDriver` 增加 `start_ordinal`（或 `requested_ordinal`），`ordinal = start_ordinal + session_index`，替代当前恒为 1 的行为。
 3. **单只结果**（`expected_single=true`，UI 默认）：唯一记录直接使用 `requested_ordinal`。
 4. **多只结果**（同一 job 检出 >1 只）：`requested_ordinal` 用于第一只，其余顺延占用后续预留号段；job 标记 `warning: multi_detected`，UI 展开为多条列表项（见 §8.1）。
-5. **零结果**（检出 0 只）：不生成 record，`requested_ordinal` **释放回收**或标记为空号（二选一，需在 Phase 1 明确，推荐释放回收避免断号）；job 标记 `warning: no_detection`。
-6. **失败任务**：不占用最终号，但 UI 需用 `requested_ordinal` 占位展示（见 §8.1）。
+5. **零结果**（检出 0 只）：不生成 record，`requested_ordinal` 尝试释放回收（仅当它仍是当前尾号时成功）；job 标记 `warning: no_detection`。
+6. **失败任务**：尝试释放 `requested_ordinal`（同样仅尾号回收）；UI 用 `requested_ordinal` 占位展示（见 §8.1）。
 
-> 号段预留策略（推荐）：创建 job 时预留 1 个号（`expected_single`），完成后按实际检出数回填 / 释放；这样即便并发也不会重号。
+> **空号策略（Phase 1 定稿）**：释放回收是 **tail-only best-effort**——只有当被释放的号仍是箱子当前 `next_ordinal - 1`（即尾号）时才回收。连续上传场景下（job A 预留 1、job B 预留 2、A 零检出），编号 1 无法回收，会形成**永久空号**。这是**有意的设计选择**，换取实现简单与永不重号的核心保证：空号在审计中可见（`requested_ordinal` 仍记录在 job），不会导致数据错乱。若未来要求零空号，需引入 reservation/free-list 表支持任意号段回收。多检出重编号失败时，额外预留的号段同样尝试 tail-only 释放，可能留下空段。
 
 #### 3.5.3 `project_id` 定稿：选定「任务标签」
 

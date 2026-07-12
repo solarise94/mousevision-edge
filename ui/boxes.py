@@ -199,11 +199,18 @@ class BoxRegistry:
             return existing
 
     def reserve_ordinal(
-        self, cage_id: str, *, count: int = 1, project_id: str = "default"
+        self,
+        cage_id: str,
+        *,
+        count: int = 1,
+        project_id: str = "default",
+        baseline_records: str | Path | None = None,
     ) -> int:
         """Atomically reserve `count` ordinals; return the first reserved number.
 
-        Auto-creates the box when missing so manually typed cage ids work.
+        Auto-creates the box when missing so manually typed cage ids work. When
+        ``baseline_records`` points at the output root, a missing/stale box is
+        seeded from existing run records so ordinals never collide with history.
         """
         count = max(1, int(count))
         with self.lock:
@@ -216,6 +223,13 @@ class BoxRegistry:
                 if row is None:
                     now = _now()
                     start = 1
+                    # Seed from existing records when available so a freshly-
+                    # created box never hands out ordinals already on disk.
+                    if baseline_records is not None:
+                        maxima = self._collect_record_maxima(Path(baseline_records))
+                        existing = maxima.get(cage_id, 0)
+                        if existing >= start:
+                            start = existing + 1
                     conn.execute(
                         """
                         INSERT INTO boxes (
@@ -248,6 +262,89 @@ class BoxRegistry:
                 raise
             finally:
                 conn.close()
+
+    def sync_from_records(self, output_root: str | Path) -> dict[str, int]:
+        """One-time upgrade: bump each box's next_ordinal past existing records.
+
+        Scans ``run_*/mouse_*/record.json`` under ``output_root`` and, for each
+        ``cage_id``, ensures ``next_ordinal >= max(actual_ordinal) + 1``. Boxes
+        are auto-created when records exist for an unregistered cage. Idempotent
+        and monotonic — never lowers an existing ``next_ordinal``.
+        """
+        output_root = Path(output_root)
+        maxima = self._collect_record_maxima(output_root)
+        bumped: dict[str, int] = {}
+        for cage_id, max_ord in maxima.items():
+            required = max_ord + 1
+            with self.lock:
+                conn = self._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT next_ordinal FROM boxes WHERE cage_id = ?",
+                        (cage_id,),
+                    ).fetchone()
+                    if row is None:
+                        now = _now()
+                        conn.execute(
+                            """
+                            INSERT INTO boxes (
+                                cage_id, project_id, strain, notes,
+                                mouse_no_start, mouse_no_pad, next_ordinal,
+                                created_at, updated_at
+                            ) VALUES (?, 'default', ?, '', ?, 2, ?, ?, ?)
+                            """,
+                            (
+                                cage_id,
+                                strain_from_cage(cage_id),
+                                max(1, max_ord),
+                                required,
+                                now,
+                                now,
+                            ),
+                        )
+                        bumped[cage_id] = required
+                    else:
+                        current = int(row["next_ordinal"])
+                        if current < required:
+                            conn.execute(
+                                "UPDATE boxes SET next_ordinal = ?, updated_at = ? WHERE cage_id = ?",
+                                (required, _now(), cage_id),
+                            )
+                            bumped[cage_id] = required
+                    conn.commit()
+                finally:
+                    conn.close()
+        return bumped
+
+    @staticmethod
+    def _collect_record_maxima(output_root: Path) -> dict[str, int]:
+        """Map cage_id → max ordinal across all run directories.
+
+        Scans ``run_*/**/record.json`` so both the current ``mouse_NNN/`` layout
+        and the legacy ``<stamp>_<box>/`` nested layout are covered. The ordinal
+        fallback chain mirrors ``MouseRegistry._mice_in_dir``:
+        actual_ordinal → ordinal → session_index → 0.
+        """
+        maxima: dict[str, int] = {}
+        if not output_root.exists():
+            return maxima
+        for rec_path in output_root.glob("run_*/**/record.json"):
+            try:
+                rec = json.loads(rec_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            cage = rec.get("cage_id") or rec.get("box_id")
+            if not cage:
+                continue
+            ordinal = int(
+                rec.get("actual_ordinal")
+                or rec.get("ordinal")
+                or rec.get("session_index")
+                or 0
+            )
+            if ordinal > maxima.get(str(cage), 0):
+                maxima[str(cage)] = ordinal
+        return maxima
 
     def release_ordinal(self, cage_id: str, ordinal: int) -> None:
         """Best-effort rollback of a reserved ordinal (only if still the tail).
