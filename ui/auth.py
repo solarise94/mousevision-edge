@@ -118,6 +118,19 @@ def require_write_access(
     return user
 
 
+def require_admin_session(
+    mv_session: str | None = Cookie(None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    """System-level ops (reset, users, settings): admin session only.
+
+    Machine tokens and operator sessions are explicitly rejected.
+    """
+    user = require_active_user(mv_session)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+
 def require_token_or_operator(
     x_mousevision_token: str | None = Header(None, alias="X-MouseVision-Token"),
     mv_session: str | None = Cookie(None, alias=SESSION_COOKIE),

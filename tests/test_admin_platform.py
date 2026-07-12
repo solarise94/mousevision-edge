@@ -257,10 +257,6 @@ def test_require_token_or_operator_accepts_session(tmp_path, monkeypatch):
 
     importlib.reload(app_mod)
     set_user_store(app_mod.user_store)
-    token = app_mod.user_store.create_session(
-        app_mod.user_store.get_by_username("admin")["id"]
-    )
-    # Force must_change off for this principal check.
     admin = app_mod.user_store.get_by_username("admin")
     app_mod.user_store.update_user(admin["id"], password="test-admin-ok")
     token = app_mod.user_store.create_session(admin["id"])
@@ -276,6 +272,53 @@ def test_require_token_or_operator_accepts_session(tmp_path, monkeypatch):
     )
     assert machine["auth"] == "token"
     assert machine["role"] == "machine"
+
+
+def test_reset_requires_admin_session(client, monkeypatch):
+    """Reset must reject machine token and require admin session."""
+    c, app_mod = client
+    monkeypatch.setenv("MOUSEVISION_API_TOKEN", "edge-secret")
+    import importlib
+
+    importlib.reload(app_mod)
+    with TestClient(app_mod.app) as fresh:
+        # Machine token cannot wipe data.
+        by_token = fresh.post(
+            "/api/reset", headers={"X-MouseVision-Token": "edge-secret"}
+        )
+        assert by_token.status_code == 401
+
+        # Unauthenticated cannot wipe data.
+        assert fresh.post("/api/reset").status_code == 401
+
+        # Create an operator and confirm they cannot reset.
+        _login(fresh)
+        op = fresh.post(
+            "/api/users",
+            json={
+                "username": "op1",
+                "password": "operator-ok",
+                "role": "operator",
+            },
+        )
+        assert op.status_code == 201
+        fresh.post("/api/logout")
+
+        op_client = TestClient(app_mod.app)
+        assert op_client.post(
+            "/api/login", json={"username": "op1", "password": "operator-ok"}
+        ).status_code == 200
+        denied = op_client.post("/api/reset")
+        assert denied.status_code == 403
+
+        # Admin session can reset.
+        admin = TestClient(app_mod.app)
+        assert admin.post(
+            "/api/login", json={"username": "admin", "password": "test-admin-ok"}
+        ).status_code == 200
+        ok = admin.post("/api/reset")
+        assert ok.status_code == 200
+        assert ok.json()["ok"] is True
 
 
 def test_password_change_revokes_old_sessions(client):

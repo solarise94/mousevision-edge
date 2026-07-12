@@ -421,8 +421,17 @@ $("btnBatchStop").addEventListener("click", async () => {
 });
 
 $("btnReset").addEventListener("click", async () => {
-  if (!confirm("清空全部批次与鼠只记录？")) return;
-  await apiFetch("/api/reset", { method: "POST" });
+  if (!confirm("清空全部批次与鼠只记录？\n需要先在 /pc 以管理员身份登录。")) return;
+  const res = await apiFetch("/api/reset", { method: "POST" });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch (_) {}
+    alert(`清空失败（${res.status}）：${detail}\n请打开 /pc 使用管理员账号登录后再试。`);
+    return;
+  }
   currentRunId = null;
   loadRuns().then(loadMice);
 });

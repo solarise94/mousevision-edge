@@ -173,7 +173,9 @@ http://mousevision:8766
 
 ### 共享 Token 的能力与边界
 
-部署时设置环境变量 `MOUSEVISION_API_TOKEN`，所有写操作（`POST /api/jobs`、`POST /api/reset`、`POST /api/start` 等）须在请求头携带 `X-MouseVision-Token`；页面 `/` 与 `/mobile` 会自动注入 meta 供前端附带。未设置 token 时写端点保持开放（仅适合本地开发）。
+部署时设置环境变量 `MOUSEVISION_API_TOKEN`，手机上传等写操作（`POST /api/jobs`、`POST /api/start` 等）须在请求头携带 `X-MouseVision-Token`，或由已登录的 admin/operator 会话调用；页面 `/mobile` 与 `/legacy` 会自动注入 meta 供前端附带。未设置 token 时这些端点对会话/开放模式仍可用（仅适合本地开发）。
+
+**清空数据** `POST /api/reset` 不接受 machine token，必须使用 **admin 会话**（在 `/pc` 登录）。
 
 **重要边界：这个 token 不构成用户访问控制。** 它能提供的是：
 
