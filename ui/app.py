@@ -760,7 +760,24 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="MouseVision Edge UI", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that always sends Cache-Control: no-cache.
+
+    Browsers otherwise heuristic-cache JS/CSS (no Cache-Control header by
+    default) and serve stale code after a deploy, so the UI renders against
+    a mismatched backend. no-cache still allows conditional GETs (ETag /
+    Last-Modified), so unchanged files cost only a 304 round-trip.
+    """
+
+    async def get_response(self, path: str, scope) -> Response:
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/static", _NoCacheStaticFiles(directory=str(STATIC)), name="static")
 
 
 def _entry_redirect(to: str | None) -> RedirectResponse | None:
@@ -780,28 +797,39 @@ def index(to: str | None = Query(None)) -> HTMLResponse | RedirectResponse:
     if redirect is not None:
         return redirect
     # Entry page must NOT inject shared API token (PC login bypass risk).
-    return HTMLResponse((STATIC / "entry.html").read_text(encoding="utf-8"))
+    return _html((STATIC / "entry.html").read_text(encoding="utf-8"))
+
+
+def _html(content: str) -> HTMLResponse:
+    """HTML response with no-cache so deployed HTML/JS never go stale.
+
+    Without this browsers heuristic-cache the HTML, which then references the
+    unversioned /static/*.js and serves stale code after a deploy.
+    """
+    resp = HTMLResponse(content)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @app.get("/legacy", response_class=HTMLResponse)
 def legacy_index() -> HTMLResponse:
-    return HTMLResponse(_inject_api_token((STATIC / "index.html").read_text(encoding="utf-8")))
+    return _html(_inject_api_token((STATIC / "index.html").read_text(encoding="utf-8")))
 
 
 @app.get("/pc", response_class=HTMLResponse)
 def pc_index() -> HTMLResponse:
     # PC admin uses session cookies only — never inject shared token into HTML.
-    return HTMLResponse((STATIC / "pc" / "index.html").read_text(encoding="utf-8"))
+    return _html((STATIC / "pc" / "index.html").read_text(encoding="utf-8"))
 
 
 @app.get("/pc/{path:path}", response_class=HTMLResponse)
 def pc_spa(path: str) -> HTMLResponse:
-    return HTMLResponse((STATIC / "pc" / "index.html").read_text(encoding="utf-8"))
+    return _html((STATIC / "pc" / "index.html").read_text(encoding="utf-8"))
 
 
 @app.get("/mobile", response_class=HTMLResponse)
 def mobile_index() -> HTMLResponse:
-    return HTMLResponse(_inject_api_token((STATIC / "mobile.html").read_text(encoding="utf-8")))
+    return _html(_inject_api_token((STATIC / "mobile.html").read_text(encoding="utf-8")))
 
 
 @app.get("/mobile/{path:path}", response_class=HTMLResponse)
@@ -810,7 +838,7 @@ def mobile_spa(path: str) -> HTMLResponse:
 
     `/api/*` and `/static/*` are separate routes and are not affected.
     """
-    return HTMLResponse(_inject_api_token((STATIC / "mobile.html").read_text(encoding="utf-8")))
+    return _html(_inject_api_token((STATIC / "mobile.html").read_text(encoding="utf-8")))
 
 
 @app.get("/api/health")
