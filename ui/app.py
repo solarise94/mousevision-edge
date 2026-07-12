@@ -47,6 +47,7 @@ from ui.auth import (
     record_login_failure,
     require_active_user,
     require_api_token,
+    require_admin_session,
     require_role,
     require_token_or_operator,
     require_user,
@@ -1863,9 +1864,12 @@ def api_start(body: StartPlaybackRequest | None = Body(default=None)) -> Any:
     return result
 
 
-@app.post("/api/reset", dependencies=[Depends(require_token_or_operator)])
-def api_reset() -> Any:
-    """Clear registry and old weighing outputs (keeps debug folders)."""
+@app.post("/api/reset", dependencies=[Depends(require_admin_session)])
+def api_reset(actor: dict[str, Any] = Depends(require_admin_session)) -> Any:
+    """Clear registry and old weighing outputs (keeps debug folders).
+
+    Admin session only — machine tokens and operator accounts cannot wipe data.
+    """
     if job_store.active_count():
         return JSONResponse(
             {"ok": False, "error": "active_jobs", "message": "仍有上传或分析任务运行中"},
@@ -1908,6 +1912,12 @@ def api_reset() -> Any:
     upload_queue = UploadQueue(QUEUE_DB)
     engine.registry = registry
     engine.upload_queue = upload_queue
+    _audit(
+        actor.get("username", "admin"),
+        "system.reset",
+        target_type="system",
+        detail={"removed": removed},
+    )
     return {
         "ok": True,
         "removed": removed,
