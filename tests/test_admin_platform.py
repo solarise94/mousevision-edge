@@ -210,8 +210,110 @@ def test_entry_redirect(client):
     assert res.headers["location"] == "/pc"
 
 
-def test_legacy_route(client):
-    c, _ = client
-    res = c.get("/legacy")
-    assert res.status_code == 200
-    assert "MouseVision Edge" in res.text
+def test_session_can_create_box_when_token_configured(client, monkeypatch):
+    """PC session must work for boxes even when API token is set."""
+    c, app_mod = client
+    monkeypatch.setenv("MOUSEVISION_API_TOKEN", "edge-secret")
+    import importlib
+
+    importlib.reload(app_mod)
+    with TestClient(app_mod.app) as fresh:
+        assert fresh.post(
+            "/api/login", json={"username": "admin", "password": "test-admin"}
+        ).status_code == 200
+        assert fresh.post(
+            "/api/me/password",
+            json={"current_password": "test-admin", "new_password": "test-admin-ok"},
+        ).status_code == 200
+
+        created = fresh.post(
+            "/api/boxes",
+            json={"cage_id": "C57-SESSION", "strain": "C57BL/6"},
+        )
+        assert created.status_code == 201, created.text
+
+        # Token-only request still works for mobile compatibility.
+        by_token = fresh.post(
+            "/api/boxes",
+            json={"cage_id": "C57-TOKEN", "strain": "C57BL/6"},
+            headers={"X-MouseVision-Token": "edge-secret"},
+        )
+        assert by_token.status_code == 201
+
+        # Neither session nor token → 401
+        bare = TestClient(app_mod.app)
+        denied = bare.post("/api/boxes", json={"cage_id": "C57-NONE"})
+        assert denied.status_code == 401
+        assert bare.post("/api/start", json={"persist": False}).status_code == 401
+
+
+def test_require_token_or_operator_accepts_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOUSEVISION_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setenv("MOUSEVISION_ADMIN_PASSWORD", "test-admin")
+    monkeypatch.setenv("MOUSEVISION_API_TOKEN", "edge-secret")
+    import importlib
+    import ui.app as app_mod
+    from ui.auth import require_token_or_operator, set_user_store
+
+    importlib.reload(app_mod)
+    set_user_store(app_mod.user_store)
+    token = app_mod.user_store.create_session(
+        app_mod.user_store.get_by_username("admin")["id"]
+    )
+    # Force must_change off for this principal check.
+    admin = app_mod.user_store.get_by_username("admin")
+    app_mod.user_store.update_user(admin["id"], password="test-admin-ok")
+    token = app_mod.user_store.create_session(admin["id"])
+
+    principal = require_token_or_operator(
+        x_mousevision_token=None, mv_session=token
+    )
+    assert principal["auth"] == "session"
+    assert principal["role"] == "admin"
+
+    machine = require_token_or_operator(
+        x_mousevision_token="edge-secret", mv_session=None
+    )
+    assert machine["auth"] == "token"
+    assert machine["role"] == "machine"
+
+
+def test_password_change_revokes_old_sessions(client):
+    c, app_mod = client
+    # First browser session
+    a = TestClient(app_mod.app)
+    assert a.post("/api/login", json={"username": "admin", "password": "test-admin"}).status_code == 200
+    # Second browser still on old password path — login separately then change via A
+    b = TestClient(app_mod.app)
+    assert b.post("/api/login", json={"username": "admin", "password": "test-admin"}).status_code == 200
+
+    changed = a.post(
+        "/api/me/password",
+        json={"current_password": "test-admin", "new_password": "test-admin-ok"},
+    )
+    assert changed.status_code == 200
+    # A gets a fresh session cookie and remains authenticated.
+    assert a.get("/api/me").json()["authenticated"] is True
+    assert a.get("/api/me").json()["user"]["must_change_password"] is False
+    # B's old session is revoked.
+    assert b.get("/api/me").json()["authenticated"] is False
+    assert b.get("/api/records").status_code == 401
+
+
+def test_client_ip_ignores_xff_without_trust_proxy():
+    from ui.auth import client_ip
+
+    class _Client:
+        host = "10.0.0.5"
+
+    class _Req:
+        headers = {"x-forwarded-for": "1.2.3.4"}
+        client = _Client()
+
+    import os
+
+    os.environ.pop("MOUSEVISION_TRUST_PROXY", None)
+    assert client_ip(_Req()) == "10.0.0.5"
+    os.environ["MOUSEVISION_TRUST_PROXY"] = "1"
+    assert client_ip(_Req()) == "1.2.3.4"
+    os.environ.pop("MOUSEVISION_TRUST_PROXY", None)

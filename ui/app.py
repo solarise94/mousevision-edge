@@ -48,6 +48,7 @@ from ui.auth import (
     require_active_user,
     require_api_token,
     require_role,
+    require_token_or_operator,
     require_user,
     require_write_access,
     set_user_store,
@@ -1143,7 +1144,7 @@ def api_boxes_recent(limit: int = Query(5, ge=1, le=50)) -> dict[str, Any]:
     return {"items": enriched[:limit]}
 
 
-@app.post("/api/boxes", dependencies=[Depends(require_api_token)])
+@app.post("/api/boxes", dependencies=[Depends(require_token_or_operator)])
 def api_create_box(body: BoxCreate) -> JSONResponse:
     cage = _clean_id(body.cage_id, field_name="箱号")
     project = _clean_id(body.project_id or "default", field_name="项目号")
@@ -1171,7 +1172,7 @@ def api_box(cage_id: str) -> dict[str, Any]:
     return box
 
 
-@app.patch("/api/boxes/{cage_id}", dependencies=[Depends(require_api_token)])
+@app.patch("/api/boxes/{cage_id}", dependencies=[Depends(require_token_or_operator)])
 def api_update_box(cage_id: str, body: BoxUpdate) -> dict[str, Any]:
     changes = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
@@ -1627,10 +1628,15 @@ class ChangePasswordRequest(BaseModel):
 
 @app.post("/api/me/password")
 def api_change_own_password(
+    request: Request,
     body: ChangePasswordRequest,
     user: dict[str, Any] = Depends(require_user),
-) -> dict[str, Any]:
-    """Change own password; allowed even when must_change_password is set."""
+) -> JSONResponse:
+    """Change own password; allowed even when must_change_password is set.
+
+    Updates the hash, revokes all existing sessions, then issues a fresh session
+    cookie so the caller stays logged in.
+    """
     if user.get("id") == "token":
         raise HTTPException(status_code=400, detail="API token 账号不能改密")
     full = user_store.get_by_username(user["username"])
@@ -1641,8 +1647,18 @@ def api_change_own_password(
     if not verify_password(body.current_password, full["_password_hash"], full["_salt"]):
         raise HTTPException(status_code=401, detail="当前密码不正确")
     updated = user_store.update_user(user["id"], password=body.new_password)
+    token = user_store.create_session(user["id"])
     _audit(user["username"], "auth.change_password", target_type="user", target_id=user["id"])
-    return {"ok": True, "user": updated}
+    resp = JSONResponse({"ok": True, "user": updated})
+    resp.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        secure=cookie_secure(request),
+        max_age=7 * 24 * 3600,
+    )
+    return resp
 
 
 class UserCreate(BaseModel):
@@ -1762,7 +1778,7 @@ def api_runs() -> dict[str, Any]:
     }
 
 
-@app.post("/api/runs/active", dependencies=[Depends(require_api_token)])
+@app.post("/api/runs/active", dependencies=[Depends(require_token_or_operator)])
 def api_set_active_run(run_id: str = Query(...)) -> dict[str, Any]:
     runs = registry.list_runs()
     match = next((r for r in runs if r["run_id"] == run_id), None)
@@ -1829,7 +1845,7 @@ class StartPlaybackRequest(BaseModel):
     ordinal: int | None = None
 
 
-@app.post("/api/start", dependencies=[Depends(require_api_token)])
+@app.post("/api/start", dependencies=[Depends(require_token_or_operator)])
 def api_start(body: StartPlaybackRequest | None = Body(default=None)) -> Any:
     req = body or StartPlaybackRequest()
     result = engine.start(
@@ -1847,7 +1863,7 @@ def api_start(body: StartPlaybackRequest | None = Body(default=None)) -> Any:
     return result
 
 
-@app.post("/api/reset", dependencies=[Depends(require_api_token)])
+@app.post("/api/reset", dependencies=[Depends(require_token_or_operator)])
 def api_reset() -> Any:
     """Clear registry and old weighing outputs (keeps debug folders)."""
     if job_store.active_count():
@@ -1900,7 +1916,7 @@ def api_reset() -> Any:
     }
 
 
-@app.post("/api/stop", dependencies=[Depends(require_api_token)])
+@app.post("/api/stop", dependencies=[Depends(require_token_or_operator)])
 def api_stop() -> dict[str, Any]:
     return engine.stop()
 

@@ -48,7 +48,9 @@ API：`GET /api/records`、`POST /api/records/{id}/publish` 等，见 [ui/app.py
 - **角色**：`admin` / `operator` / `viewer`
 - **强制改密**：首次 seed 的 admin 必须调用 `POST /api/me/password` 后才能访问管理 API
 - **共享 token**：仅注入到 `/mobile` 与 `/legacy`，供上传/回放写接口使用；**不注入** `/`、`/pc`，且 **永不** 映射为 admin 会话
-- **登录限流**：同一 IP 5 分钟内失败 5 次返回 429
+- **双通道写接口**：`POST/PATCH /api/boxes`、`/api/start|/stop|/reset` 等接受「有效 token **或** 已改密的 admin/operator 会话」
+- **登录限流**：同一 IP 5 分钟内失败 5 次返回 429；仅当设置 `MOUSEVISION_TRUST_PROXY=1` 时才信任 `X-Forwarded-For`
+- **改密撤会话**：修改密码后撤销该用户全部旧会话，并给当前请求重新签发 Cookie
 
 ## 软删除语义
 

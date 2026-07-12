@@ -34,15 +34,24 @@ def api_token() -> str:
     return os.getenv("MOUSEVISION_API_TOKEN", "").strip()
 
 
+def trust_proxy() -> bool:
+    return os.getenv("MOUSEVISION_TRUST_PROXY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def cookie_secure(request: Request | None = None) -> bool:
-    """Use Secure cookies under HTTPS (env flag or forwarded proto)."""
+    """Use Secure cookies under HTTPS (env flag or trusted forwarded proto)."""
     if os.getenv("MOUSEVISION_HTTPS", "").strip().lower() in {"1", "true", "yes"}:
         return True
     if request is None:
         return False
-    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
-    if proto == "https":
-        return True
+    if trust_proxy():
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if proto == "https":
+            return True
     return request.url.scheme == "https"
 
 
@@ -109,10 +118,47 @@ def require_write_access(
     return user
 
 
+def require_token_or_operator(
+    x_mousevision_token: str | None = Header(None, alias="X-MouseVision-Token"),
+    mv_session: str | None = Cookie(None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    """Allow mobile/legacy API token OR an active admin/operator session.
+
+    Token authentication is a machine gate only — it is never treated as an
+    admin user/session. Prefer session when both are present.
+    """
+    user = user_store().resolve_session(mv_session)
+    if user is not None:
+        if user.get("must_change_password"):
+            raise HTTPException(
+                status_code=403,
+                detail="必须先修改密码",
+                headers={"X-Must-Change-Password": "1"},
+            )
+        if user["role"] not in {"admin", "operator"}:
+            raise HTTPException(status_code=403, detail="只读账号无写权限")
+        return {"auth": "session", **user}
+
+    expected = api_token()
+    if not expected:
+        # Open mode (no token configured): allow for mobile/legacy compatibility.
+        return {"auth": "open", "username": "anonymous", "role": "machine"}
+    if x_mousevision_token == expected:
+        return {"auth": "token", "username": "api-token", "role": "machine"}
+    raise HTTPException(status_code=401, detail="请先登录或提供有效 API token")
+
+
 def client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    if forwarded:
-        return forwarded
+    """Client IP for rate limiting.
+
+    ``X-Forwarded-For`` is only trusted when ``MOUSEVISION_TRUST_PROXY`` is set
+    (request is behind a reverse proxy that overwrites/strips client-supplied
+    forwarding headers). Otherwise use the socket peer address.
+    """
+    if trust_proxy():
+        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
     if request.client:
         return request.client.host
     return "unknown"
