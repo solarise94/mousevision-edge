@@ -10,6 +10,7 @@ from typing import Any, Callable
 from mousevision.analyzer import CurveAnalyzerConfig, WeightCurveAnalyzer
 from mousevision.buffer import RingFrameBuffer
 from mousevision.clip import clip_bounds_from_history
+from mousevision.detect import detect_mouse_box
 from mousevision.detector import StateMachineConfig, WeighingState, WeighingStateMachine
 from mousevision.reader.template import TemplateReader
 from mousevision.recorder import Recorder
@@ -135,6 +136,38 @@ class SessionDriver:
 
         return event
 
+    def _select_photo_with_mouse(self, analysis: "AnalysisResult") -> tuple[Any, bool, str]:
+        """Choose a photo frame preferring mouse-on-scale, overriding the
+        analyzer's curve-only pick when a better frame is found.
+
+        Returns (frame, mouse_detected, selection_label).
+        """
+        from mousevision.types import AnalysisResult as _AR  # noqa: avoid cycle
+
+        analyzer_idx = analysis.photo_frame_index
+        items = list(self.buffer.items())
+        if not items:
+            frame = self.buffer.nearest_frame(analyzer_idx)
+            return frame, False, "platform_midpoint"
+
+        # Detect mouse on each buffered frame. Cache LCD boxes to avoid re-detect.
+        mouse_flags: dict[int, bool] = {}
+        for item in items:
+            idx = item.frame.index
+            lcd = self.reader.lcd_box(item.frame.image)
+            mouse_flags[idx] = detect_mouse_box(item.frame.image, lcd) is not None
+
+        mouse_indices = [idx for idx, has in mouse_flags.items() if has]
+        if not mouse_indices:
+            # No mouse detected anywhere — keep analyzer's midpoint pick.
+            frame = self.buffer.nearest_frame(analyzer_idx)
+            return frame, False, "platform_midpoint"
+
+        # Prefer a mouse frame near the analyzer's platform midpoint index.
+        best_idx = min(mouse_indices, key=lambda idx: abs(idx - analyzer_idx))
+        frame = self.buffer.frame_by_index(best_idx) or self.buffer.nearest_frame(best_idx)
+        return frame, True, "mouse_on_scale"
+
     def _handle_analyze(self) -> None:
         analysis = self.analyzer.analyze(self.sm.session.curve)
         if analysis is None:
@@ -144,7 +177,10 @@ class SessionDriver:
             self.buffer.clear()
             return
 
-        photo_frame = self.buffer.nearest_frame(analysis.photo_frame_index)
+        photo_frame, mouse_detected, selection_label = self._select_photo_with_mouse(analysis)
+        analysis.photo_mouse_detected = mouse_detected
+        analysis.photo_selection = selection_label
+        analysis.photo_verified = mouse_detected  # verified = mouse was seen
         history = [
             {
                 "previous": t.previous.value,

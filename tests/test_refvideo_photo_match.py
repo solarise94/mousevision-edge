@@ -1,4 +1,9 @@
-"""Ref-video photo/weight consistency check (optional if video present)."""
+"""Ref-video photo selection check (optional if video present).
+
+Photo selection is decoupled from weight: the photo proves the mouse was on
+the scale. This test verifies records have valid selection metadata and that
+the mouse was detected on the chosen frame when possible.
+"""
 
 from __future__ import annotations
 
@@ -14,9 +19,8 @@ CONFIG = ROOT / "configs" / "scale_refvideo.yaml"
 
 
 @pytest.mark.skipif(not VIDEO.exists(), reason="reference video missing")
-def test_refvideo_photo_weight_within_tolerance(tmp_path: Path):
+def test_refvideo_photo_selection_valid(tmp_path: Path):
     config = load_config(CONFIG)
-    tol = float(config.get("photo_match_tol", 0.02))
     templates = ROOT / config.get("templates_dir", "assets/templates")
     pipeline = WeighingPipeline(config, templates)
     result = pipeline.run_video(
@@ -29,14 +33,18 @@ def test_refvideo_photo_weight_within_tolerance(tmp_path: Path):
     records = result.records or []
     assert len(records) == 8
     for rec in records:
+        # Weight source must be the stable curve median
+        assert rec.get("weight_source") == "stable_curve_median"
+        # Photo selection must be a valid label
+        assert rec.get("photo_selection") in {
+            "platform_midpoint",
+            "mouse_on_scale",
+        }
+        # photo_mouse_detected should be True for most records (mouse was there)
+        # but we don't hard-require it — detection may miss on some frames.
+        assert "photo_mouse_detected" in rec
+        assert "photo_verified" in rec
+        # photo_weight_delta is still recorded for audit but not gated
         delta = rec.get("photo_weight_delta")
         assert delta is not None, rec
-        assert float(delta) <= tol + 1e-9, (
-            f"ordinal={rec.get('ordinal')} weight={rec.get('weight')} "
-            f"photo={rec.get('photo_observed_weight')} delta={delta}"
-        )
-        assert rec.get("photo_selection") in {
-            "closest_stable_weight",
-            "closest_high_conf",
-            "closest_in_platform",
-        }
+

@@ -40,7 +40,10 @@ class AnalysisResult:
     photo_frame_index: int
     photo_observed_weight: float | None = None
     photo_weight_delta: float | None = None
-    photo_selection: str = "closest_stable_weight"
+    photo_selection: str = "platform_midpoint"
+    weight_source: str = "stable_curve_median"
+    photo_mouse_detected: bool = False
+    photo_verified: bool = True
 
 
 @dataclass

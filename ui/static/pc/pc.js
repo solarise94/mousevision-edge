@@ -636,6 +636,9 @@
       h("h3", null, "记录详情"),
       h("div", { class: "media" }, h("img", { src: photo, alt: "" })),
       dl,
+      h("p", { class: "muted", style: "font-size:11px;line-height:1.5" },
+        "体重为稳定称重曲线算法计算;照片用于确认小鼠在秤状态,数字可能略有差异。如需核验完整称重过程,请点击「回放复核」。"
+      ),
       rec.notes ? h("p", { class: "muted", style: "font-size:12px" }, `备注: ${rec.notes}`) : null,
       actions
     );
