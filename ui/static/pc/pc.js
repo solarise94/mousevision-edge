@@ -36,6 +36,11 @@
 
   const TITLES = Object.fromEntries(ROUTES.map((r) => [r.id, r.label]));
 
+  // Routes that pin the data tab. verify => pending, publish => published.
+  // Must be applied BEFORE loadRecords() fetches, otherwise the grid shows the
+  // previous tab's data (race between loadRoute() and render()).
+  const ROUTE_TAB = { verify: "pending", publish: "published" };
+
   function h(tag, props, ...children) {
     const el = document.createElement(tag);
     if (props) {
@@ -133,7 +138,15 @@
   async function loadRoute() {
     if (!state.user) return;
     try {
-      if (["data", "verify", "publish"].includes(state.route)) await loadRecords();
+      if (["data", "verify", "publish"].includes(state.route)) {
+        // Pin tab from route before fetching; "data" keeps whatever tab the
+        // user last selected. Reset to page 1 so filters don't strand the view.
+        if (state.route in ROUTE_TAB) {
+          state.tab = ROUTE_TAB[state.route];
+          state.page = 1;
+        }
+        await loadRecords();
+      }
       if (state.route === "overview") state.overview = await api("/api/overview");
       if (state.route === "boxes") {
         const r = await api("/api/boxes?limit=200");
@@ -516,12 +529,12 @@
   }
 
   function viewVerify() {
-    state.tab = "pending";
+    // tab is pinned by loadRoute() via ROUTE_TAB; don't mutate here to avoid
+    // clobbering the user's tab selection when they return to "数据管理".
     return viewData();
   }
 
   function viewPublish() {
-    state.tab = "published";
     return viewData();
   }
 
