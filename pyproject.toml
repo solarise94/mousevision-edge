@@ -16,10 +16,11 @@ dependencies = [
   "uvicorn>=0.30",
   "python-multipart>=0.0.9",
   "segno>=1.6",
+  "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
 
 [project.scripts]
 mousevision-poc = "tools.run_poc:main"

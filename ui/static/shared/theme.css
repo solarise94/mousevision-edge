@@ -1,0 +1,23 @@
+/* MouseVision Edge — shared design tokens (PC dark admin theme) */
+:root {
+  --mv-bg: #0d1117;
+  --mv-bg-elevated: #12151a;
+  --mv-sidebar: #0f1419;
+  --mv-sidebar-active: rgba(61, 220, 132, 0.12);
+  --mv-panel: rgba(22, 26, 32, 0.92);
+  --mv-panel-solid: #1a1f27;
+  --mv-card: #1e2430;
+  --mv-line: rgba(255, 255, 255, 0.08);
+  --mv-text: #f2f4f7;
+  --mv-muted: #9aa3af;
+  --mv-green: #3ddc84;
+  --mv-green-dim: #1f8f55;
+  --mv-amber: #f5a623;
+  --mv-danger: #ff4d4f;
+  --mv-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  --mv-radius: 14px;
+  --mv-radius-sm: 10px;
+  --mv-sidebar-w: 240px;
+  --mv-detail-w: 380px;
+  font-family: "SF Pro Display", "PingFang SC", "Segoe UI", sans-serif;
+}

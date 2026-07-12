@@ -17,11 +17,12 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
@@ -36,9 +37,28 @@ from mousevision.pipeline import load_config
 from mousevision.run import create_run_dir, finish_run, load_manifest, restore_renumber_temps, write_manifest
 from mousevision.source.video import VideoFileSource
 from mousevision.upload_queue import UploadQueue
-from ui.auth import api_token, require_api_token
+from ui.audit import AuditStore
+from ui.auth import (
+    api_token,
+    current_user,
+    require_api_token,
+    require_role,
+    require_user,
+    require_write_access,
+    set_user_store,
+)
 from ui.boxes import BoxRegistry, qr_payload, strain_from_cage
+from ui.records_api import (
+    collect_records,
+    export_csv,
+    export_xlsx,
+    mice_admin_view,
+    overview_stats,
+)
+from ui.records_meta import RecordsMetaStore
 from ui.registry import MouseRegistry
+from ui.settings import SettingsStore
+from ui.users import SESSION_COOKIE, UserStore
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).resolve().parent / "static"
@@ -50,6 +70,10 @@ REGISTRY_PATH = DEFAULT_OUTPUT / "mice_registry.json"
 QUEUE_DB = DEFAULT_OUTPUT / "upload_queue.db"
 JOB_DB = DEFAULT_OUTPUT / "jobs.db"
 BOX_DB = DEFAULT_OUTPUT / "boxes.db"
+META_DB = DEFAULT_OUTPUT / "records_meta.db"
+USERS_DB = DEFAULT_OUTPUT / "users.db"
+AUDIT_DB = DEFAULT_OUTPUT / "audit.db"
+SETTINGS_PATH = DEFAULT_OUTPUT / "settings.json"
 JOB_UPLOAD_ROOT = DEFAULT_OUTPUT / "job_uploads"
 MAX_UPLOAD_BYTES = int(os.getenv("MOUSEVISION_MAX_UPLOAD_MB", "250")) * 1024 * 1024
 
@@ -680,6 +704,11 @@ upload_queue = UploadQueue(QUEUE_DB)
 engine = PlaybackEngine(registry, upload_queue)
 job_store = JobStore(JOB_DB)
 box_registry = BoxRegistry(BOX_DB)
+records_meta = RecordsMetaStore(str(META_DB))
+user_store = UserStore(str(USERS_DB))
+audit_store = AuditStore(str(AUDIT_DB))
+settings_store = SettingsStore(SETTINGS_PATH)
+set_user_store(user_store)
 
 
 def _reserve_ordinals(cage_id: str, count: int, project_id: str) -> int:
@@ -706,6 +735,10 @@ job_manager = AnalysisJobManager(
 )
 
 
+def _audit(actor: str, action: str, **kwargs: Any) -> None:
+    audit_store.log(actor=actor, action=action, **kwargs)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Repair any half-applied renumber from a crash, then seed box ordinals.
@@ -723,9 +756,38 @@ app = FastAPI(title="MouseVision Edge UI", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
+def _entry_redirect(to: str | None) -> RedirectResponse | None:
+    mapping = {
+        "mobile": "/mobile",
+        "pc": "/pc",
+        "manage": "/mobile/manage",
+    }
+    if to and to in mapping:
+        return RedirectResponse(mapping[to], status_code=302)
+    return None
+
+
+@app.get("/", response_class=HTMLResponse, response_model=None)
+def index(to: str | None = Query(None)) -> HTMLResponse | RedirectResponse:
+    redirect = _entry_redirect((to or "").lower())
+    if redirect is not None:
+        return redirect
+    return HTMLResponse(_inject_api_token((STATIC / "entry.html").read_text(encoding="utf-8")))
+
+
+@app.get("/legacy", response_class=HTMLResponse)
+def legacy_index() -> HTMLResponse:
     return HTMLResponse(_inject_api_token((STATIC / "index.html").read_text(encoding="utf-8")))
+
+
+@app.get("/pc", response_class=HTMLResponse)
+def pc_index() -> HTMLResponse:
+    return HTMLResponse(_inject_api_token((STATIC / "pc" / "index.html").read_text(encoding="utf-8")))
+
+
+@app.get("/pc/{path:path}", response_class=HTMLResponse)
+def pc_spa(path: str) -> HTMLResponse:
+    return HTMLResponse(_inject_api_token((STATIC / "pc" / "index.html").read_text(encoding="utf-8")))
 
 
 @app.get("/mobile", response_class=HTMLResponse)
@@ -1221,6 +1283,24 @@ def api_record(record_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="记录不存在")
     mouse["photo_url"] = f"/api/records/{record_id}/photo"
     mouse["label"] = f"第 {int(mouse.get('actual_ordinal', mouse['ordinal'])):02d} 只"
+    raw_path = DEFAULT_OUTPUT / mouse["dir"] / "record.json"
+    if raw_path.exists():
+        try:
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            mouse["duration_sec"] = (
+                round(max(0.0, float(raw["clip_end_ms"]) - float(raw["clip_start_ms"])) / 1000.0, 1)
+                if raw.get("clip_start_ms") is not None and raw.get("clip_end_ms") is not None
+                else None
+            )
+            mouse["clip_start_ms"] = raw.get("clip_start_ms")
+            mouse["clip_end_ms"] = raw.get("clip_end_ms")
+        except Exception:
+            pass
+    meta = records_meta.ensure(record_id)
+    mouse["status"] = meta["status"]
+    mouse["verified"] = bool(meta.get("verified"))
+    mouse["notes"] = meta.get("notes") or ""
+    mouse["strain"] = strain_from_cage(str(mouse.get("cage_id") or "-"))
     return mouse
 
 
@@ -1235,22 +1315,361 @@ def api_record_photo(record_id: str):
     return FileResponse(path)
 
 
-@app.delete("/api/records/{record_id}", dependencies=[Depends(require_api_token)])
-def api_delete_record(record_id: str) -> dict[str, Any]:
+@app.delete("/api/records/{record_id}", dependencies=[Depends(require_write_access)])
+def api_delete_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
     mouse = registry.get_by_record_id(record_id)
     if mouse is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    record_dir = DEFAULT_OUTPUT / mouse["dir"]
-    run_dir = record_dir.parent
-    if record_dir.exists():
-        shutil.rmtree(record_dir, ignore_errors=True)
-    manifest = load_manifest(run_dir) or {}
-    remaining = len(list(run_dir.glob("mouse_*/record.json")))
-    manifest["record_count"] = remaining
-    write_manifest(run_dir, manifest)
-    # Remove from upload queue so WiFi sync does not POST a deleted record.
+    actor = user.get("username", "unknown")
+    records_meta.soft_delete(record_id, operator=actor)
     upload_queue.delete_by_record_id(record_id)
-    return {"ok": True, "record_id": record_id, "remaining": remaining}
+    _audit(
+        actor,
+        "record.delete",
+        target_type="record",
+        target_id=record_id,
+        detail={"soft": True},
+    )
+    return {"ok": True, "record_id": record_id, "status": "deleted"}
+
+
+@app.post("/api/records/{record_id}/restore", dependencies=[Depends(require_write_access)])
+def api_restore_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
+    if registry.get_by_record_id(record_id) is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    actor = user.get("username", "unknown")
+    meta = records_meta.restore(record_id, operator=actor)
+    _audit(actor, "record.restore", target_type="record", target_id=record_id)
+    return {"ok": True, "meta": meta}
+
+
+class RecordMetaUpdate(BaseModel):
+    notes: str | None = None
+    tags: str | None = None
+
+
+@app.patch("/api/records/{record_id}", dependencies=[Depends(require_write_access)])
+def api_update_record_meta(
+    record_id: str,
+    body: RecordMetaUpdate,
+    user: dict[str, Any] = Depends(require_write_access),
+) -> dict[str, Any]:
+    if registry.get_by_record_id(record_id) is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    changes = {k: v for k, v in body.model_dump().items() if v is not None}
+    actor = user.get("username", "unknown")
+    meta = records_meta.update(record_id, operator=actor, **changes)
+    _audit(actor, "record.update", target_type="record", target_id=record_id, detail=changes)
+    return meta
+
+
+@app.post("/api/records/{record_id}/publish", dependencies=[Depends(require_write_access)])
+def api_publish_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
+    if registry.get_by_record_id(record_id) is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    actor = user.get("username", "unknown")
+    meta = records_meta.publish(record_id, operator=actor)
+    _audit(actor, "record.publish", target_type="record", target_id=record_id)
+    return {"ok": True, "meta": meta}
+
+
+@app.post("/api/records/{record_id}/unpublish", dependencies=[Depends(require_write_access)])
+def api_unpublish_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
+    if registry.get_by_record_id(record_id) is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    actor = user.get("username", "unknown")
+    meta = records_meta.unpublish(record_id, operator=actor)
+    _audit(actor, "record.unpublish", target_type="record", target_id=record_id)
+    return {"ok": True, "meta": meta}
+
+
+@app.post("/api/records/{record_id}/verify", dependencies=[Depends(require_write_access)])
+def api_verify_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
+    if registry.get_by_record_id(record_id) is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    actor = user.get("username", "unknown")
+    meta = records_meta.verify(record_id, operator=actor)
+    _audit(actor, "record.verify", target_type="record", target_id=record_id)
+    return {"ok": True, "meta": meta}
+
+
+@app.post("/api/records/{record_id}/reject", dependencies=[Depends(require_write_access)])
+def api_reject_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
+    if registry.get_by_record_id(record_id) is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    actor = user.get("username", "unknown")
+    meta = records_meta.reject(record_id, operator=actor)
+    _audit(actor, "record.reject", target_type="record", target_id=record_id)
+    return {"ok": True, "meta": meta}
+
+
+class BatchRecordAction(BaseModel):
+    record_ids: list[str]
+    action: str = Field(..., pattern="^(publish|unpublish|delete|restore|verify|reject)$")
+
+
+@app.post("/api/records/batch", dependencies=[Depends(require_write_access)])
+def api_batch_records(
+    body: BatchRecordAction,
+    user: dict[str, Any] = Depends(require_write_access),
+) -> dict[str, Any]:
+    actor = user.get("username", "unknown")
+    handlers = {
+        "publish": records_meta.publish,
+        "unpublish": records_meta.unpublish,
+        "delete": records_meta.soft_delete,
+        "restore": records_meta.restore,
+        "verify": records_meta.verify,
+        "reject": records_meta.reject,
+    }
+    handler = handlers[body.action]
+    results = []
+    for rid in body.record_ids:
+        if registry.get_by_record_id(rid) is None:
+            results.append({"record_id": rid, "ok": False, "error": "not_found"})
+            continue
+        meta = handler(rid, operator=actor)
+        if body.action == "delete":
+            upload_queue.delete_by_record_id(rid)
+        results.append({"record_id": rid, "ok": True, "meta": meta})
+    _audit(
+        actor,
+        f"record.batch.{body.action}",
+        target_type="record",
+        target_id=",".join(body.record_ids[:5]),
+        detail={"count": len(body.record_ids)},
+    )
+    return {"results": results}
+
+
+@app.get("/api/records")
+def api_records(
+    tab: str = Query("all"),
+    strain: str | None = Query(None),
+    cage_id: str | None = Query(None),
+    q: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+) -> dict[str, Any]:
+    items = collect_records(
+        registry,
+        records_meta,
+        DEFAULT_OUTPUT,
+        tab=tab if tab != "all" else None,
+        strain=strain,
+        cage_id=cage_id,
+        q=q,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    total = len(items)
+    start = (page - 1) * page_size
+    page_items = items[start : start + page_size]
+    overview = overview_stats(registry, records_meta, DEFAULT_OUTPUT)
+    return {
+        "items": page_items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "stats": {
+            "total_records": overview["total_records"],
+            "pending_count": overview["pending_count"],
+            "published_count": overview["published_count"],
+            "deleted_count": overview["deleted_count"],
+            "average_weight": overview["average_weight"],
+        },
+    }
+
+
+@app.get("/api/overview")
+def api_overview() -> dict[str, Any]:
+    return overview_stats(registry, records_meta, DEFAULT_OUTPUT)
+
+
+@app.get("/api/mice-admin")
+def api_mice_admin() -> dict[str, Any]:
+    return {"items": mice_admin_view(registry, records_meta, DEFAULT_OUTPUT)}
+
+
+@app.get("/api/export")
+def api_export(
+    format: str = Query("csv", pattern="^(csv|xlsx)$"),
+    tab: str = Query("all"),
+    strain: str | None = Query(None),
+    cage_id: str | None = Query(None),
+    q: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    user: dict[str, Any] = Depends(require_user),
+) -> Response:
+    items = collect_records(
+        registry,
+        records_meta,
+        DEFAULT_OUTPUT,
+        tab=tab if tab != "all" else None,
+        strain=strain,
+        cage_id=cage_id,
+        q=q,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if format == "xlsx":
+        content = export_xlsx(items)
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        filename = f"mousevision_export_{stamp}.xlsx"
+    else:
+        content = export_csv(items)
+        media = "text/csv; charset=utf-8"
+        filename = f"mousevision_export_{stamp}.csv"
+    _audit(
+        user.get("username", "unknown"),
+        "export.download",
+        target_type="export",
+        target_id=format,
+        detail={"count": len(items)},
+    )
+    return Response(
+        content=content,
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+def api_login(body: LoginRequest) -> JSONResponse:
+    user = user_store.authenticate(body.username, body.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    token = user_store.create_session(user["id"])
+    _audit(user["username"], "auth.login", target_type="user", target_id=user["id"])
+    resp = JSONResponse({"ok": True, "user": user})
+    resp.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        max_age=7 * 24 * 3600,
+    )
+    return resp
+
+
+@app.post("/api/logout")
+def api_logout(mv_session: str | None = Cookie(None, alias=SESSION_COOKIE)) -> JSONResponse:
+    if mv_session:
+        user_store.delete_session(mv_session)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+
+@app.get("/api/me")
+def api_me(user: dict[str, Any] | None = Depends(current_user)) -> dict[str, Any]:
+    if user is None:
+        return {"authenticated": False}
+    return {"authenticated": True, "user": user}
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "operator"
+    display_name: str = ""
+
+
+class UserUpdate(BaseModel):
+    role: str | None = None
+    display_name: str | None = None
+    disabled: bool | None = None
+    password: str | None = None
+
+
+@app.get("/api/users", dependencies=[Depends(require_role("admin"))])
+def api_list_users() -> dict[str, Any]:
+    return {"items": user_store.list_users()}
+
+
+@app.post("/api/users", dependencies=[Depends(require_role("admin"))])
+def api_create_user(
+    body: UserCreate,
+    actor: dict[str, Any] = Depends(require_role("admin")),
+) -> JSONResponse:
+    try:
+        user = user_store.create_user(
+            username=body.username,
+            password=body.password,
+            role=body.role,
+            display_name=body.display_name,
+        )
+    except KeyError:
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    _audit(actor["username"], "user.create", target_type="user", target_id=user["id"])
+    return JSONResponse(user, status_code=201)
+
+
+@app.patch("/api/users/{user_id}", dependencies=[Depends(require_role("admin"))])
+def api_update_user(
+    user_id: str,
+    body: UserUpdate,
+    actor: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    changes = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        user = user_store.update_user(user_id, **changes)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    _audit(actor["username"], "user.update", target_type="user", target_id=user_id, detail=changes)
+    return user
+
+
+@app.delete("/api/users/{user_id}", dependencies=[Depends(require_role("admin"))])
+def api_delete_user(
+    user_id: str,
+    actor: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    if actor["id"] == user_id:
+        raise HTTPException(status_code=400, detail="不能删除当前登录用户")
+    try:
+        user_store.delete_user(user_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    _audit(actor["username"], "user.delete", target_type="user", target_id=user_id)
+    return {"ok": True}
+
+
+@app.get("/api/logs", dependencies=[Depends(require_role("admin", "operator"))])
+def api_logs(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    action: str | None = Query(None),
+) -> dict[str, Any]:
+    return audit_store.list(limit=limit, offset=offset, action=action)
+
+
+@app.get("/api/settings")
+def api_get_settings(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    return settings_store.get()
+
+
+@app.put("/api/settings", dependencies=[Depends(require_role("admin"))])
+def api_put_settings(
+    body: dict[str, Any] = Body(...),
+    actor: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    try:
+        updated = settings_store.update(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _audit(actor["username"], "settings.update", target_type="settings", detail=body)
+    return updated
+
 
 
 @app.get("/api/status")
