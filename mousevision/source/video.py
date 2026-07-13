@@ -10,6 +10,17 @@ import cv2
 from mousevision.types import Frame
 
 
+class VideoFormatError(RuntimeError):
+    """The video file exists but cannot be decoded into a usable stream.
+
+    Raised by the video source when OpenCV cannot open the file at all, or by
+    the job worker when the file opens but decodes zero frames (e.g. multiple
+    fragmented-MP4 shards concatenated by MediaRecorder timeslice recording).
+    Surfaced to the user as "录像可能损坏，请重录" rather than a generic
+    analysis failure or a misleading "no mouse detected".
+    """
+
+
 class VideoFileSource:
     def __init__(
         self,
@@ -29,10 +40,48 @@ class VideoFileSource:
         self.end_ms = end_ms
         self._cap: cv2.VideoCapture | None = None
 
+    def probe(self) -> dict[str, float]:
+        """Read container-level metadata without decoding frames.
+
+        Returns fps, declared frame count, width, height and a nominal
+        duration. Note that for a concatenated fragmented-MP4 the declared
+        frame count/duration may reflect only the first shard (or be 0) — the
+        authoritative readability signal is the decoded frame count from
+        ``frames()``, not these container headers.
+        """
+        cap = cv2.VideoCapture(str(self.path))
+        try:
+            if not cap.isOpened():
+                return {
+                    "frame_count": 0.0,
+                    "width": 0.0,
+                    "height": 0.0,
+                    "fps": 0.0,
+                    "duration_sec": 0.0,
+                }
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            width = float(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
+            height = float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
+            duration_sec = (frame_count / fps) if fps > 1e-3 else 0.0
+            return {
+                "frame_count": frame_count,
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "duration_sec": duration_sec,
+            }
+        finally:
+            cap.release()
+
     def frames(self) -> Iterator[Frame]:
         self._cap = cv2.VideoCapture(str(self.path))
         if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {self.path}")
+            # Completely unopenable / unsupported / zero-byte file. This is the
+            # same class of problem as a zero-decode clip, so it shares the
+            # user-facing "录像可能损坏" message rather than being reported as a
+            # generic analysis failure.
+            raise VideoFormatError(f"无法打开视频文件：{self.path}")
 
         fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 30.0)
         if fps <= 1e-3:

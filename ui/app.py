@@ -864,6 +864,7 @@ async def api_create_job(
     project_id: str = Form("default"),
     requested_ordinal: int | None = Form(None),
     expected_single: bool = Form(True),
+    recorded_duration_sec: int | None = Form(None),
     video: UploadFile = File(...),
 ) -> JSONResponse:
     """Upload one video and enqueue a run-scoped analysis job."""
@@ -874,6 +875,12 @@ async def api_create_job(
         content_type.startswith("video/") or content_type == "application/octet-stream"
     ):
         raise HTTPException(status_code=415, detail="仅支持视频文件")
+
+    # Client-declared recording length (seconds), used by the worker to detect a
+    # truncated/corrupt upload whose decoded length is far shorter than what was
+    # recorded. Clamp negatives to absent; the field is advisory only.
+    if recorded_duration_sec is not None and recorded_duration_sec < 0:
+        recorded_duration_sec = None
 
     # Server owns ordinal allocation; ignore any client-provided value except
     # as an idempotency hint. `expected_single` reserves exactly one slot.
@@ -909,14 +916,16 @@ async def api_create_job(
                 handle.write(chunk)
         if size == 0:
             raise HTTPException(status_code=422, detail="视频文件为空")
-        job_store.update(
-            job_id,
-            video_path=str(target.resolve()),
-            size_bytes=size,
-            stage="uploaded",
-            progress=0.04,
-            message="上传完成",
-        )
+        upload_updates: dict[str, Any] = {
+            "video_path": str(target.resolve()),
+            "size_bytes": size,
+            "stage": "uploaded",
+            "progress": 0.04,
+            "message": "上传完成",
+        }
+        if recorded_duration_sec is not None:
+            upload_updates["recorded_duration_sec"] = int(recorded_duration_sec)
+        job_store.update(job_id, **upload_updates)
         queued = job_manager.submit(job_id)
         return JSONResponse(_job_payload(queued), status_code=202)
     except HTTPException as exc:
@@ -1279,7 +1288,17 @@ def api_box_records(cage_id: str) -> dict[str, Any]:
                     item["warning"] = "multi_detected"
                 items.append(item)
         else:
-            items.append(_placeholder_from_job(job))
+            placeholder = _placeholder_from_job(job)
+            # Distinguish a corrupt/truncated upload (video format error) and a
+            # generic analysis failure from a pending/in-flight job, so the cage
+            # list can tell the user to re-record vs. wait.
+            if job["status"] == "failed":
+                msg = str(job.get("message") or "")
+                if "视频格式异常" in msg:
+                    placeholder["warning"] = "format_error"
+                else:
+                    placeholder["warning"] = "analysis_failed"
+            items.append(placeholder)
 
     def sort_key(item: dict[str, Any]) -> tuple[int, int]:
         ordinal = item.get("actual_ordinal") or item.get("requested_ordinal") or 0

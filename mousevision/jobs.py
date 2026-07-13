@@ -4,24 +4,39 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
 from mousevision.pipeline import WeighingPipeline, load_config
 from mousevision.run import renumber_records
+from mousevision.source.video import VideoFileSource, VideoFormatError
 
 
 JOB_STATUSES = frozenset(
     {"uploading", "queued", "processing", "completed", "failed", "canceled"}
 )
 
+# Keep every uploaded source video this long after its job reaches a terminal
+# state, so the clip can be re-inspected later (e.g. a 0-detect or failed run).
+# The worker prunes expired clips opportunistically; expired == completed_at
+# older than this many days.
+VIDEO_RETENTION_DAYS = 14
+
+# Terminal statuses whose source video is eligible for retention-based prune.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
+
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _now_dt() -> datetime:
+    return datetime.now()
 
 
 def _cleanup_upload(video_path: str | Path | None) -> None:
@@ -54,6 +69,8 @@ class JobStore:
             "size_bytes",
             "run_id",
             "record_count",
+            "decoded_frames",
+            "recorded_duration_sec",
             "message",
             "error",
             "requested_ordinal",
@@ -94,6 +111,8 @@ class JobStore:
                         video_path TEXT,
                         run_id TEXT,
                         record_count INTEGER NOT NULL DEFAULT 0,
+                        decoded_frames INTEGER NOT NULL DEFAULT 0,
+                        recorded_duration_sec INTEGER NOT NULL DEFAULT 0,
                         requested_ordinal INTEGER,
                         message TEXT,
                         error TEXT,
@@ -124,6 +143,8 @@ class JobStore:
             "queued_at": "TEXT",
             "processing_started_at": "TEXT",
             "completed_at": "TEXT",
+            "decoded_frames": "INTEGER NOT NULL DEFAULT 0",
+            "recorded_duration_sec": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, coltype in additions.items():
             if column not in existing:
@@ -215,6 +236,31 @@ class JobStore:
             finally:
                 conn.close()
 
+    def list_prunable(self, before_dt: datetime) -> list[dict[str, Any]]:
+        """Terminal jobs whose source video should be pruned: completed_at is
+        set and strictly older than ``before_dt``. Only terminal jobs are
+        candidates so an in-flight upload is never deleted out from under the
+        worker.
+        """
+        cutoff = before_dt.isoformat(timespec="seconds")
+        placeholders = ",".join("?" for _ in _TERMINAL_STATUSES)
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM analysis_jobs
+                    WHERE status IN ({placeholders})
+                      AND completed_at IS NOT NULL
+                      AND completed_at != ''
+                      AND completed_at < ?
+                    """,
+                    (*_TERMINAL_STATUSES, cutoff),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                conn.close()
+
     def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
         unknown = set(changes) - self._UPDATE_FIELDS
         if unknown:
@@ -257,10 +303,11 @@ class JobStore:
                     """
                     UPDATE analysis_jobs
                     SET status = 'failed', stage = 'interrupted', progress = 0,
-                        error = '服务重启导致任务中断，请重新提交', updated_at = ?
+                        error = '服务重启导致任务中断，请重新提交',
+                        completed_at = ?, updated_at = ?
                     WHERE status IN ('uploading', 'processing')
                     """,
-                    (now,),
+                    (now, now),
                 )
                 conn.commit()
             finally:
@@ -388,12 +435,21 @@ class AnalysisJobManager:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        # Opportunistic-prune throttle: only sweep the jobs table every N jobs
+        # processed, instead of on every single completion.
+        self._prune_interval = 8
+        self._jobs_since_prune = 0
 
     def start(self) -> None:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
             self.store.fail_interrupted()
+            # Drop source clips that aged out during downtime.
+            try:
+                self.prune_uploads()
+            except Exception:
+                pass
             self._stop.clear()
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
@@ -460,6 +516,7 @@ class AnalysisJobManager:
                 )
                 result = self.analysis_fn(job)
                 count = int(result.get("record_count") or 0)
+                decoded_frames = int(result.get("decoded_frames") or 0)
                 # Zero-detect: the reserved slot detected nothing. Release it
                 # (best-effort, tail-only) so a run of empty videos does not
                 # permanently consume ordinals (design §3.5.2 rule 3).
@@ -476,8 +533,28 @@ class AnalysisJobManager:
                     progress=1.0,
                     run_id=result.get("run_id"),
                     record_count=count,
+                    decoded_frames=decoded_frames,
                     message=("未检出鼠只" if count == 0 else f"分析完成，共检出 {count} 只"),
                     error=None,
+                    completed_at=_now(),
+                )
+            except VideoFormatError as exc:
+                # Corrupt/truncated upload. Ordinal release is handled entirely
+                # inside _run_pipeline: the zero-decode path releases the
+                # requested ordinal directly (nothing was persisted), and the
+                # truncation path rolls back persisted records and releases
+                # ordinals only when the rollback is confirmed clean. Releasing
+                # here too would either double-release (harmless) or, worse,
+                # release against a rollback shortfall (leaving orphan records
+                # that could collide with a reused ordinal). So this branch does
+                # NOT release — it only records the failure.
+                self.store.update(
+                    job_id,
+                    status="failed",
+                    stage="failed",
+                    progress=1.0,
+                    message="视频格式异常",
+                    error=str(exc),
                     completed_at=_now(),
                 )
             except Exception as exc:
@@ -501,7 +578,11 @@ class AnalysisJobManager:
                     completed_at=_now(),
                 )
             finally:
-                _cleanup_upload(video_path)
+                # Source videos are retained for VIDEO_RETENTION_DAYS so a
+                # 0-detect or failed run can be re-inspected. Prune
+                # opportunistically but not on every single job (avoid scanning
+                # the whole table each time).
+                self._maybe_prune_uploads()
 
     def _run_pipeline(self, job: dict[str, Any]) -> dict[str, Any]:
         raw_path = job.get("video_path")
@@ -516,19 +597,53 @@ class AnalysisJobManager:
         start_ordinal = int(requested) if requested else 1
         cage_id = str(job["cage_id"])
         project_id = str(job.get("project_id") or "default")
-        result = self._pipeline.run_video(
-            str(video_path),
-            cage_id=cage_id,
-            output_root=self.output_root,
-            stop_after_first=False,
-            create_run=True,
-            start_ordinal=start_ordinal,
-            project_id=project_id,
-            upload_queue=self.upload_queue,
-        )
+        # run_video can raise VideoFormatError itself when the video is
+        # completely unopenable (VideoFileSource.frames() raises on
+        # isOpened()==False). At that point no records, queue entries, or extra
+        # ordinals have been created, so there is nothing to roll back — but the
+        # requested ordinal MUST be released or the cage permanently skips a
+        # number. Catch, release, re-raise.
+        #
+        # Note: run_video creates the run directory BEFORE opening the video,
+        # so an unopenable clip leaves an empty run_<...>/ dir on disk (marked
+        # status="empty" by its finally). The job is not linked to this run_id
+        # (we never reach the return), so it is an orphan directory. It is tiny
+        # and can be swept by a future orphan-run-dir cleaner; it is not cleaned
+        # here to keep the format-error path simple and focused on the ordinal.
+        try:
+            result = self._pipeline.run_video(
+                str(video_path),
+                cage_id=cage_id,
+                output_root=self.output_root,
+                stop_after_first=False,
+                create_run=True,
+                start_ordinal=start_ordinal,
+                project_id=project_id,
+                upload_queue=self.upload_queue,
+            )
+        except VideoFormatError:
+            self._release_ordinals(cage_id, [start_ordinal] if requested else [])
+            raise
+        decoded_frames = int(result.samples or 0)
+        # Zero-decode guard: OpenCV opened the file but decoded zero frames.
+        # This is the fingerprint of a completely unopenable/empty container
+        # (distinct from truncation, which decodes SOME frames). No records
+        # were persisted (the driver saved nothing), so there is nothing to
+        # roll back — just release the requested ordinal and fail. This check
+        # lives here (not in the worker) so ALL VideoFormatError paths own
+        # their own ordinal release and the worker's except branch never
+        # double-releases or releases against a shortfall.
+        if decoded_frames == 0:
+            self._release_ordinals(cage_id, [start_ordinal] if requested else [])
+            raise VideoFormatError(
+                "视频格式异常：无法解码任何帧（疑似录制分片损坏，请重录）"
+            )
         records = result.records or []
         count = len(records)
-        # Multi-detect: a job that reserved 1 slot produced N>1 records. Reserve
+        # Track ordinals reserved for a multi-detect so a later truncation
+        # failure can release them as part of the rollback.
+        extra_ordinals: list[int] = []
+        # Multi-detect: a job reserved 1 slot produced N>1 records. Reserve
         # the extra N-1 ordinals now and renumber the trailing records so they
         # never overlap another cage's numbers (design §3.5.2 rule 4).
         # A renumber failure is NOT swallowed — it must fail the job so the
@@ -539,20 +654,14 @@ class AnalysisJobManager:
         # another reservation advanced next_ordinal — see design §3.5.2).
         if count > 1 and self.reserve_ordinals is not None and result.run_dir is not None:
             extra_base = int(self.reserve_ordinals(cage_id, count - 1, project_id))
-            new_ordinals = [start_ordinal] + list(
-                range(extra_base, extra_base + count - 1)
-            )
+            extra_ordinals = list(range(extra_base, extra_base + count - 1))
+            new_ordinals = [start_ordinal] + list(extra_ordinals)
             try:
                 renumber_records(result.run_dir, new_ordinals)
             except Exception:
                 # Renumber failed (rolled back by renumber_records). Release the
                 # extra reserved range so it is not permanently leaked.
-                if self.release_ordinals is not None:
-                    for extra_ord in range(extra_base, extra_base + count - 1):
-                        try:
-                            self.release_ordinals(cage_id, extra_ord)
-                        except Exception:
-                            pass
+                self._release_ordinals(cage_id, extra_ordinals)
                 raise
             # Renumber moved mouse_NNN dirs and rewrote record.json; refresh the
             # upload queue so sync sees the final paths and ordinals, not the
@@ -560,10 +669,164 @@ class AnalysisJobManager:
             self._refresh_queue_after_renumber(result.run_dir)
             # records dicts are stale post-renumber; re-read for the return path.
             records = self._read_records(result.run_dir)
+        # Truncation guard: a MediaRecorder-timeslice clip often opens and
+        # decodes the FIRST fragmented-MP4 shard (~2 s), so decoded_frames > 0
+        # and the zero-frame guard above does not catch it. If the client
+        # declared a recording length, compare the decoded duration against it;
+        # a clip that decodes far less than recorded is corrupt/truncated.
+        #
+        # By this point run_video may have persisted records, written to the
+        # upload queue, and reserved extra ordinals. If the clip is truncated we
+        # must roll ALL of that back so a failed job leaves no orphan records
+        # that sync could later push. The rollback returns a diagnostic if any
+        # cleanup step fell short (e.g. run_dir could not be deleted) — in that
+        # case ordinals are deliberately NOT released, and the diagnostic is
+        # folded into the error so an operator can clean up manually.
+        try:
+            self._check_truncation(video_path, decoded_frames, job)
+        except VideoFormatError as exc:
+            shortfall = self._rollback_persisted_run(
+                result, cage_id, extra_ordinals, start_ordinal
+            )
+            if shortfall:
+                # Augment the error so the worker's error field records the
+                # rollback shortfall alongside the format-error cause.
+                exc.args = (f"{exc} | 回滚不完整: {shortfall}",)
+            raise
         return {
             "run_id": result.run_id,
             "record_count": count,
+            "decoded_frames": decoded_frames,
         }
+
+    def _check_truncation(
+        self, video_path: Path, decoded_frames: int, job: dict[str, Any]
+    ) -> None:
+        """Raise VideoFormatError if the clip decodes far less than recorded.
+
+        Only consulted when the client sent ``recorded_duration_sec``. The
+        decoded duration is reconstructed as ``decoded_frames * stride / fps``
+        (samples are post-stride). A clip is truncated when its decoded
+        duration is under half the recorded length — the original fragmented
+        MP4 bug typically exposes only the first ~2 s shard, so a 10–15 s
+        recording decoding to ~2 s trips this cleanly.
+        """
+        recorded = int(job.get("recorded_duration_sec") or 0)
+        if recorded <= 0 or decoded_frames <= 0:
+            return
+        stride = int(self._pipeline.config.get("frame_stride", 1)) if self._pipeline else 1
+        stride = max(1, stride)
+        try:
+            fps = float(VideoFileSource(video_path).probe().get("fps") or 0.0)
+        except Exception:
+            fps = 0.0
+        if fps <= 1e-3:
+            fps = 15.0  # mobile capture targets 15 fps (mobile.js openBackCamera)
+        decoded_duration = decoded_frames * stride / fps
+        # Allow generous slack (variable fps, early stop), but flag a clip that
+        # decodes to under half its recorded length.
+        if decoded_duration < recorded * 0.5:
+            raise VideoFormatError(
+                f"视频格式异常：可解码时长约 {decoded_duration:.1f}s，"
+                f"远短于录制时长 {recorded}s（疑似录制分片损坏，请重录）"
+            )
+
+    def _release_ordinals(self, cage_id: str, ordinals: list[int]) -> None:
+        """Best-effort release of a set of reserved ordinals (used by rollback
+        and the renumber-failure path).
+
+        ``release_ordinal`` is tail-only: it reclaims ``ordinal`` only when
+        ``ordinal == next_ordinal - 1``. To reclaim a contiguous reserved
+        range ``[1,2,3,4]`` with ``next_ordinal=5`` the ordinals MUST be
+        released in DESCENDING order (4 first, then 3, 2, 1) so each release
+        exposes the next tail. Releasing in ascending order leaves every
+        non-tail ordinal as a permanent gap. Duplicates are de-duplicated
+        before sorting.
+        """
+        if not ordinals or self.release_ordinals is None:
+            return
+        # De-duplicate, then release highest-first so tail-only reclaim can
+        # cascade back through the whole contiguous range.
+        for ord_val in sorted(set(int(o) for o in ordinals), reverse=True):
+            try:
+                self.release_ordinals(cage_id, ord_val)
+            except Exception:
+                pass
+
+    def _rollback_persisted_run(
+        self,
+        result: Any,
+        cage_id: str,
+        extra_ordinals: list[int],
+        requested_ordinal: int | None,
+    ) -> str | None:
+        """Undo the side effects of run_video when a post-run guard (e.g.
+        truncation) fails after records were already persisted.
+
+        Removes, in order:
+          1. upload-queue entries for each record_id (so sync never pushes
+             orphan records from a failed job),
+          2. the on-disk run directory (record.json / photo.jpg / mouse_NNN),
+          3. reserved ordinals (extra multi-detect + the requested slot) —
+             ONLY if the run directory is confirmed gone and every queue entry
+             was confirmed deleted. Releasing ordinals while orphan records
+             still exist on disk would let a new job reuse the same ordinal and
+             collide with the stale data.
+
+        Returns a diagnostic string describing any rollback shortfall (queue
+        delete failures / run_dir still present), or ``None`` if the rollback
+        fully succeeded. The caller folds the diagnostic into the job error so
+        the original VideoFormatError still propagates but the shortfall is
+        visible for manual cleanup. Rollback never raises.
+        """
+        records = list(result.records or []) if result is not None else []
+        shortfalls: list[str] = []
+
+        # 1. upload queue: delete by record_id. Track any that failed.
+        queue_ok = True
+        if self.upload_queue is not None:
+            for rec in records:
+                rid = str(rec.get("record_id") or "")
+                if not rid:
+                    continue
+                try:
+                    self.upload_queue.delete_by_record_id(rid)
+                except Exception as exc:
+                    queue_ok = False
+                    shortfalls.append(f"queue delete failed for {rid}: {exc}")
+        # If there were records but no queue to clean, that's fine (test paths).
+
+        # 2. run directory on disk. Confirm removal rather than fire-and-forget.
+        run_dir = getattr(result, "run_dir", None)
+        dir_removed = True
+        if run_dir:
+            rd = Path(run_dir)
+            try:
+                shutil.rmtree(rd)
+            except FileNotFoundError:
+                pass  # already gone — counts as removed
+            except Exception as exc:
+                shortfalls.append(f"rmtree failed for {rd}: {exc}")
+            if rd.exists():
+                dir_removed = False
+                shortfalls.append(f"run_dir still exists: {rd}")
+
+        # 3. reserved ordinals — ONLY when the persisted data is confirmed gone.
+        # Releasing ordinals while records remain would let a new job reuse the
+        # same ordinal and collide with stale data. Skip release on shortfall
+        # and surface it so an operator can clean up + release manually.
+        to_release = list(extra_ordinals)
+        if requested_ordinal is not None:
+            to_release.append(int(requested_ordinal))
+        if dir_removed and queue_ok:
+            self._release_ordinals(cage_id, to_release)
+        else:
+            shortfalls.append(
+                "ordinals NOT released (orphan data may remain); "
+                f"cage={cage_id} ordinals={sorted(set(int(o) for o in to_release))}"
+            )
+
+        return "; ".join(shortfalls) if shortfalls else None
 
     @staticmethod
     def _read_records(run_dir: Path) -> list[dict[str, Any]]:
@@ -609,3 +872,34 @@ class AnalysisJobManager:
             raise RuntimeError(
                 f"upload queue refresh failed for record_ids: {missing}"
             )
+
+    # -- source-video retention ------------------------------------------------
+    def prune_uploads(self, retention_days: int = VIDEO_RETENTION_DAYS) -> int:
+        """Delete source videos for terminal jobs older than ``retention_days``.
+
+        Safe to call from the worker thread or at startup. Returns the number
+        of clips removed. Only the on-disk upload file is deleted (plus its
+        directory if empty); the job row stays in analysis_jobs for history.
+        """
+        cutoff = _now_dt() - timedelta(days=int(retention_days))
+        removed = 0
+        for job in self.store.list_prunable(cutoff):
+            _cleanup_upload(job.get("video_path"))
+            removed += 1
+        return removed
+
+    def _maybe_prune_uploads(self) -> None:
+        """Throttled prune called from the worker after each job completes.
+
+        Runs at most once every ``self._prune_interval`` jobs so the table is
+        not scanned on every single completion.
+        """
+        self._jobs_since_prune += 1
+        if self._jobs_since_prune < self._prune_interval:
+            return
+        self._jobs_since_prune = 0
+        try:
+            self.prune_uploads()
+        except Exception:
+            # Prune is best-effort housekeeping; never fail a job because of it.
+            pass

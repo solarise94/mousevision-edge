@@ -269,12 +269,15 @@
   /* ------------------------------------------------------------------ *
    * 上传
    * ------------------------------------------------------------------ */
-  function uploadVideo(blob, filename, box, onProgress) {
+  function uploadVideo(blob, filename, box, onProgress, durationSec) {
     return new Promise((resolve, reject) => {
       const fd = new FormData();
       fd.append("cage_id", box.cageId);
       fd.append("project_id", state.projectId);
       fd.append("expected_single", "true");
+      if (durationSec != null && durationSec > 0) {
+        fd.append("recorded_duration_sec", String(durationSec));
+      }
       fd.append("video", blob, filename);
       const xhr = new XMLHttpRequest();
       xhr.open("POST", "/api/jobs");
@@ -588,9 +591,18 @@
         const type = recorder.mimeType || mime || "video/webm";
         const ext = type.includes("mp4") ? "mp4" : "webm";
         const blob = new Blob(chunks, { type });
-        doUpload(blob, `mv-${Date.now()}.${ext}`);
+        // Pass the actual recording length so the server can sanity-check it
+        // against the decoded frame count and flag a truncated upload.
+        const durationSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+        doUpload(blob, `mv-${Date.now()}.${ext}`, durationSec);
       });
-      recorder.start(2000);
+      // No timeslice: emit ONE complete container on stop(). A timeslice arg
+      // (e.g. 2000) makes Android MediaRecorder produce fragmented MP4 shards
+      // that `new Blob(chunks)` merely concatenates — OpenCV then decodes only
+      // the first shard and the mouse-on-scale portion is never read, so every
+      // job silently reports 0 detections. Recording the whole clip as a single
+      // valid container fixes that at the source.
+      recorder.start();
       recording = true;
       startedAt = Date.now();
       tick();
@@ -610,9 +622,9 @@
 
     shutter.addEventListener("click", () => (recording ? stopRec() : startRec()));
 
-    async function doUpload(blob, filename) {
+    async function doUpload(blob, filename, durationSec) {
       stopStream(stream);
-      renderUploading(box, blob, filename);
+      renderUploading(box, blob, filename, durationSec);
     }
 
     return () => {
@@ -625,7 +637,7 @@
   /* ================================================================== *
    * 视图：上传 + 完成 / 排队 (屏 4)
    * ================================================================== */
-  function renderUploading(box, blob, filename) {
+  function renderUploading(box, blob, filename, durationSec) {
     const screen = h("div", { class: "screen" });
     screen.appendChild(appbar("上传视频", {}));
     const bar = h("span");
@@ -651,7 +663,7 @@
       bar.style.width = v + "%";
       pct.textContent = v + "%";
       if (v >= 100) text.textContent = "上传完成，正在入队…";
-    })
+    }, durationSec)
       .then((job) => {
         state.activeJobId = job.job_id;
         go("/done");
@@ -665,7 +677,7 @@
               h("strong", {}, "上传失败"),
               h("p", { class: "li-sub" }, err.message),
             ]),
-            h("button", { class: "btn primary", onClick: () => renderUploading(box, blob, filename) }, "重试上传"),
+            h("button", { class: "btn primary", onClick: () => renderUploading(box, blob, filename, durationSec) }, "重试上传"),
             h("button", { class: "btn ghost", onClick: () => go("/record") }, "重新录制"),
           ])
         );
@@ -709,15 +721,22 @@
       try {
         const job = await api.job(jobId);
         if (job.status === "completed") {
+          const n = job.record_count || 0;
           statusIcon.replaceWith(h("div", { class: "check-circle" }, "✓"));
-          statusTitle.textContent = `分析完成，共检出 ${job.record_count || 0} 只`;
+          statusTitle.textContent = n > 0
+            ? `分析完成，共检出 ${n} 只`
+            : "未检出小鼠";
+          statusSub.textContent = n > 0 ? box.cageId : `${box.cageId} · 可重新录制`;
           queueBox.hidden = true;
           return;
         }
         if (job.status === "failed") {
+          const isFormatErr = !!(job.message || "").includes("视频格式异常");
           statusIcon.replaceWith(h("div", { class: "check-circle", style: "background:#dc3545" }, "!"));
-          statusTitle.textContent = "分析失败";
-          statusSub.textContent = job.error || "";
+          statusTitle.textContent = isFormatErr ? "录像可能损坏" : "分析失败";
+          statusSub.textContent = isFormatErr
+            ? "录像可能损坏，请用本页重录一次"
+            : (job.error || "");
           queueBox.hidden = true;
           return;
         }
@@ -815,6 +834,10 @@
         ? h("div", { class: "warn-note" }, "未检出小鼠，可重录")
         : it.warning === "multi_detected"
         ? h("div", { class: "warn-note" }, "同段检出多只")
+        : it.warning === "format_error"
+        ? h("div", { class: "warn-note" }, "录像可能损坏，请重录")
+        : it.warning === "analysis_failed"
+        ? h("div", { class: "warn-note" }, "分析失败，可重试")
         : null,
     ]);
     return h(
