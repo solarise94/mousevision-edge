@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cv2
 import yaml
 
 from mousevision.driver import SessionDriver
@@ -54,6 +55,7 @@ class WeighingPipeline:
         start_ordinal: int = 1,
         project_id: str = "default",
         crop: dict[str, float] | None = None,
+        normalize_to_reference: bool = False,
     ) -> PipelineResult:
         stride = (
             frame_stride
@@ -101,22 +103,38 @@ class WeighingPipeline:
             project_id=project_id,
         )
 
-        # When a preview crop is applied (mobile uploads), resize the cropped
-        # frame back to the config's reference geometry so the fixed-pixel
-        # detector thresholds (lcd_detect.min_area, mouse_detect.min_area, ...)
-        # stay meaningful. frame_width/frame_height describe the reference
-        # video the thresholds were tuned against.
+        # When a preview crop is applied (mobile CSS-crop uploads), or when the
+        # client already recorded a canvas stream near the reference size,
+        # resize frames to the config reference geometry so fixed-pixel
+        # detector thresholds stay meaningful.
         target_size = None
-        if crop is not None:
-            fw = int(self.config.get("frame_width") or 0)
-            fh = int(self.config.get("frame_height") or 0)
-            if fw > 0 and fh > 0:
-                target_size = (fw, fh)
+        fw = int(self.config.get("frame_width") or 0)
+        fh = int(self.config.get("frame_height") or 0)
+        if (crop is not None or normalize_to_reference) and fw > 0 and fh > 0:
+            target_size = (fw, fh)
         source = VideoFileSource(
             video_path, frame_stride=stride, crop=crop, target_size=target_size
         )
+        preview_saved = False
         try:
             for frame in source.frames():
+                # Persist the first analysed frame so operators can verify the
+                # backend saw the same region the phone framed.
+                if (
+                    not preview_saved
+                    and create_run
+                    and persist
+                    and active_run is not None
+                ):
+                    try:
+                        cv2.imwrite(
+                            str(Path(active_run) / "analysis_preview.jpg"),
+                            frame.image,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+                        )
+                        preview_saved = True
+                    except Exception:
+                        preview_saved = True  # do not retry forever
                 event = driver.process_frame(frame)
                 samples += 1
                 if event.weight is not None:

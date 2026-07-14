@@ -51,13 +51,10 @@ class VideoFileSource:
         # pixel bounds on the first decoded frame.
         self.crop = crop
         self._crop_px: tuple[int, int, int, int] | None = None
-        # Optional (width, height) to resize each frame to *after* cropping.
-        # The LCD/mouse detectors use fixed pixel thresholds (lcd_detect.min_area,
-        # mouse_detect.min_area, ...) tuned for the reference 720x1280 frame; a
-        # center crop shrinks the frame and would drop LCD area below those
-        # thresholds. Resizing the cropped frame back to the reference geometry
-        # keeps the thresholds meaningful. Only applied when a crop is set;
-        # ``None`` leaves the (already-cropped) frame at native resolution.
+        # Optional (width, height) to resize each frame after optional crop.
+        # Detector thresholds are tuned for the reference 720x1280 frame.
+        # Applied whenever set — after crop for CSS-crop uploads, or alone for
+        # canvas captures that need a light normalize to reference size.
         self.target_size = target_size
 
     def probe(self) -> dict[str, float]:
@@ -138,14 +135,13 @@ class VideoFileSource:
             if self._crop_px is not None:
                 cx, cy, cw, ch = self._crop_px
                 image = image[cy:cy + ch, cx:cx + cw]
-                # Restore the reference geometry so the fixed-pixel detector
-                # thresholds (tuned for 720x1280) remain valid after the crop
-                # shrank the frame. Uses INTER_LINEAR for speed; analysis does
-                # not need sub-pixel fidelity here.
-                if self.target_size is not None:
-                    tw, th = self.target_size
-                    if image.shape[1] != tw or image.shape[0] != th:
-                        image = cv2.resize(image, (tw, th), interpolation=cv2.INTER_LINEAR)
+            # Resize after optional crop. Used for CSS-crop mobile uploads
+            # (restore 720x1280 after shrinking) and for canvas captures whose
+            # encoder may emit a near-but-not-exact reference size.
+            if self.target_size is not None:
+                tw, th = self.target_size
+                if image.shape[1] != tw or image.shape[0] != th:
+                    image = cv2.resize(image, (tw, th), interpolation=cv2.INTER_LINEAR)
             timestamp_ms = (index / fps) * 1000.0
             if self.end_ms is not None and timestamp_ms > self.end_ms:
                 break

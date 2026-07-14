@@ -832,7 +832,30 @@ def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
     job_id = str(job["job_id"])
     public["status_url"] = f"/api/jobs/{job_id}"
     public["report_url"] = f"/api/jobs/{job_id}/report"
+    # Expose preview URL once a run exists so operators can audit what the
+    # backend analysed (especially zero-detect outcomes).
+    if job.get("run_id"):
+        public["analysis_preview_url"] = f"/api/jobs/{job_id}/analysis-preview"
     return public
+
+
+def _resolve_job_run_dir(job: dict[str, Any]) -> Path | None:
+    """Locate the on-disk run directory for a completed job's run_id."""
+    run_id = str(job.get("run_id") or "").strip()
+    if not run_id:
+        return None
+    for run in registry.list_runs():
+        if str(run.get("run_id")) == run_id:
+            path = Path(str(run.get("path") or ""))
+            return path if path.is_dir() else None
+    # Fallback: scan output root for matching manifest short id / full id.
+    for run_dir in DEFAULT_OUTPUT.glob("run_*"):
+        if not run_dir.is_dir():
+            continue
+        manifest = load_manifest(run_dir) or {}
+        if str(manifest.get("run_id") or "") == run_id:
+            return run_dir
+    return None
 
 
 def _clean_id(value: str, *, field_name: str) -> str:
@@ -866,6 +889,8 @@ async def api_create_job(
     expected_single: bool = Form(True),
     recorded_duration_sec: int | None = Form(None),
     preview_crop: str | None = Form(None),
+    capture_mode: str | None = Form(None),
+    capture_meta: str | None = Form(None),
     video: UploadFile = File(...),
 ) -> JSONResponse:
     """Upload one video and enqueue a run-scoped analysis job."""
@@ -927,11 +952,20 @@ async def api_create_job(
         if recorded_duration_sec is not None:
             upload_updates["recorded_duration_sec"] = int(recorded_duration_sec)
         # Visible region the operator framed on screen, as normalized
-        # {x,y,w,h}. Advisory only: invalid/missing falls back to full-frame
-        # analysis. Persist the raw blob so the worker can re-parse it.
+        # {x,y,w,h}. Used only for legacy css_crop clients; canvas mode
+        # ignores it. Advisory: invalid/missing falls back to full-frame.
         crop_obj = _parse_preview_crop(preview_crop)
         if crop_obj is not None:
             upload_updates["preview_crop"] = json.dumps(crop_obj)
+        mode = (capture_mode or "").strip().lower() or None
+        if mode in ("canvas", "css_crop", "system"):
+            upload_updates["capture_mode"] = mode
+        if capture_meta:
+            # Cap size so a runaway client cannot bloat the jobs DB.
+            meta_text = capture_meta.strip()
+            if len(meta_text) > 4000:
+                meta_text = meta_text[:4000]
+            upload_updates["capture_meta"] = meta_text
         job_store.update(job_id, **upload_updates)
         queued = job_manager.submit(job_id)
         return JSONResponse(_job_payload(queued), status_code=202)
@@ -1061,6 +1095,25 @@ def api_job(job_id: str) -> dict[str, Any]:
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return _job_payload(job)
+
+
+@app.get("/api/jobs/{job_id}/analysis-preview", dependencies=[Depends(require_api_token)])
+def api_job_analysis_preview(job_id: str) -> FileResponse:
+    """Serve the first analysed frame so operators can verify backend framing."""
+    job = job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    run_dir = _resolve_job_run_dir(job)
+    if run_dir is None:
+        raise HTTPException(status_code=404, detail="分析预览尚不可用")
+    preview = run_dir / "analysis_preview.jpg"
+    if not preview.is_file():
+        raise HTTPException(status_code=404, detail="分析预览不存在")
+    return FileResponse(
+        preview,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/api/jobs/{job_id}/report")

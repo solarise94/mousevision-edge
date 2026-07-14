@@ -78,13 +78,13 @@ def test_target_size_resizes_after_crop(tmp_path: Path):
     assert (w, h) == (720, 1280)
 
 
-def test_target_size_ignored_without_crop(tmp_path: Path):
-    # target_size only applies alongside a crop; a full-frame source must not be
-    # resized (legacy behaviour for CLI / playback).
+def test_target_size_resizes_without_crop(tmp_path: Path):
+    # Canvas captures may need a light normalize to reference size without a
+    # crop rectangle. target_size alone must resize the full frame.
     video = _solid_video(tmp_path / "clip.mp4", w=80, h=40)
     src = VideoFileSource(video, target_size=(720, 1280))
     frames = list(src.frames())
-    assert frames[0].image.shape[:2] == (40, 80)
+    assert frames[0].image.shape[:2] == (1280, 720)
 
 
 

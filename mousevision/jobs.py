@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from mousevision.capture_geom import validate_canvas_video_geometry
 from mousevision.pipeline import WeighingPipeline, load_config
 from mousevision.run import renumber_records
 from mousevision.source.video import VideoFileSource, VideoFormatError
@@ -72,6 +73,8 @@ class JobStore:
             "decoded_frames",
             "recorded_duration_sec",
             "preview_crop",
+            "capture_mode",
+            "capture_meta",
             "message",
             "error",
             "requested_ordinal",
@@ -148,6 +151,8 @@ class JobStore:
             "decoded_frames": "INTEGER NOT NULL DEFAULT 0",
             "recorded_duration_sec": "INTEGER NOT NULL DEFAULT 0",
             "preview_crop": "TEXT",
+            "capture_mode": "TEXT",
+            "capture_meta": "TEXT",
         }
         for column, coltype in additions.items():
             if column not in existing:
@@ -634,12 +639,42 @@ class AnalysisJobManager:
         start_ordinal = int(requested) if requested else 1
         cage_id = str(job["cage_id"])
         project_id = str(job.get("project_id") or "default")
-        # Mobile records a landscape stream but previews a portrait center
-        # crop. The client sends the visible region as normalized {x,y,w,h};
-        # replay it here so OCR / mouse detection only analyse what the
-        # operator framed. Advisory: a missing/invalid crop analyses the full
-        # frame (legacy behaviour).
-        crop = _parse_preview_crop(job.get("preview_crop"))
+        # Mobile capture modes:
+        # - canvas: client already recorded a 720x1280 center-cropped canvas
+        #   stream — do NOT apply preview_crop; optionally normalize size.
+        # - css_crop / unset: legacy path using preview_crop coordinates.
+        # - system: file input / system camera; no crop; full-frame analysis.
+        capture_mode = str(job.get("capture_mode") or "").strip().lower()
+        if capture_mode == "canvas":
+            # Do not trust the client label alone: verify structured meta and
+            # a decoded first-frame aspect near 9:16 before skipping crop /
+            # stretching to 720x1280.
+            try:
+                first = next(
+                    iter(VideoFileSource(video_path, max_frames=1).frames()),
+                    None,
+                )
+            except VideoFormatError:
+                self._release_ordinals(cage_id, [start_ordinal] if requested else [])
+                raise
+            if first is None:
+                self._release_ordinals(cage_id, [start_ordinal] if requested else [])
+                raise VideoFormatError(
+                    "视频格式异常：无法解码任何帧（疑似录制分片损坏，请重录）"
+                )
+            fh, fw = first.image.shape[:2]
+            try:
+                validate_canvas_video_geometry(
+                    fw, fh, capture_meta=job.get("capture_meta")
+                )
+            except ValueError as exc:
+                self._release_ordinals(cage_id, [start_ordinal] if requested else [])
+                raise VideoFormatError(str(exc)) from exc
+            crop = None
+            normalize = True
+        else:
+            crop = _parse_preview_crop(job.get("preview_crop"))
+            normalize = False
         # run_video can raise VideoFormatError itself when the video is
         # completely unopenable (VideoFileSource.frames() raises on
         # isOpened()==False). At that point no records, queue entries, or extra
@@ -664,6 +699,7 @@ class AnalysisJobManager:
                 project_id=project_id,
                 upload_queue=self.upload_queue,
                 crop=crop,
+                normalize_to_reference=normalize,
             )
         except VideoFormatError:
             self._release_ordinals(cage_id, [start_ordinal] if requested else [])

@@ -235,35 +235,103 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 相机助手 (design §6.2/§6.3, §7.1)
+   * 相机助手 — Canvas 720×1280 所见即所得 (design §6.2/§6.3)
+   * 中心裁切算法与 mousevision/capture_geom.py 对齐。
    * ------------------------------------------------------------------ */
-  async function openBackCamera(videoEl) {
+  const CLIENT_VERSION = "2026.07.14-canvas";
+  const CANVAS_W = 720;
+  const CANVAS_H = 1280;
+
+  function supportsLiveCanvasCapture() {
+    const canvas = document.createElement("canvas");
+    return !!(
+      navigator.mediaDevices &&
+      navigator.mediaDevices.getUserMedia &&
+      window.MediaRecorder &&
+      canvas.captureStream
+    );
+  }
+
+  function centerCropSourceRect(srcW, srcH, dstW, dstH) {
+    // Mirror of mousevision.capture_geom.center_crop_source_rect
+    dstW = dstW || CANVAS_W;
+    dstH = dstH || CANVAS_H;
+    if (!srcW || !srcH || !dstW || !dstH) return null;
+    const srcAspect = srcW / srcH;
+    const dstAspect = dstW / dstH;
+    let sx, sy, sw, sh;
+    if (srcAspect > dstAspect) {
+      sh = srcH;
+      sw = srcH * dstAspect;
+      sx = (srcW - sw) / 2;
+      sy = 0;
+    } else {
+      sw = srcW;
+      sh = srcW / dstAspect;
+      sx = 0;
+      sy = (srcH - sh) / 2;
+    }
+    return { sx, sy, sw, sh };
+  }
+
+  function trackSettings(stream) {
+    try {
+      const track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+      return track && track.getSettings ? track.getSettings() : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function videoSourceSize(videoEl, stream) {
+    let w = videoEl && videoEl.videoWidth;
+    let h = videoEl && videoEl.videoHeight;
+    if (w && h) return { width: w, height: h };
+    const s = trackSettings(stream);
+    w = s.width || 0;
+    h = s.height || 0;
+    if (w && h) return { width: w, height: h };
+    return null;
+  }
+
+  async function openCameraStream(constraints) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error("insecure");
     }
-    const capture = (facingMode) => navigator.mediaDevices.getUserMedia({
+    return navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: {
-        facingMode,
-        width: { ideal: 720 },
-        height: { ideal: 1280 },
-        frameRate: { ideal: 15, max: 15 },
-      },
+      video: constraints,
     });
+  }
+
+  async function openBackCamera(videoEl, deviceId) {
+    // Prefer a moderate landscape capture; Canvas then center-crops to 720x1280.
+    const base = {
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 15, max: 30 },
+    };
     let stream;
-    try {
-      // `ideal` is only a preference and some phones select the selfie camera.
-      // Require the rear camera first; fall back only when the browser cannot
-      // satisfy or understand that constraint (desktop/older WebKit support).
-      stream = await capture({ exact: "environment" });
-    } catch (err) {
-      const constraintFailure = [
-        "OverconstrainedError",
-        "ConstraintNotSatisfiedError",
-        "NotFoundError",
-      ].includes(err && err.name);
-      if (!constraintFailure) throw err;
-      stream = await capture({ ideal: "environment" });
+    if (deviceId) {
+      stream = await openCameraStream({ ...base, deviceId: { exact: deviceId } });
+    } else {
+      try {
+        stream = await openCameraStream({
+          ...base,
+          facingMode: { exact: "environment" },
+        });
+      } catch (err) {
+        const constraintFailure = [
+          "OverconstrainedError",
+          "ConstraintNotSatisfiedError",
+          "NotFoundError",
+        ].includes(err && err.name);
+        if (!constraintFailure) throw err;
+        stream = await openCameraStream({
+          ...base,
+          facingMode: { ideal: "environment" },
+        });
+      }
     }
     videoEl.srcObject = stream;
     videoEl.muted = true;
@@ -271,31 +339,34 @@
     await videoEl.play();
     return stream;
   }
+
+  async function listVideoInputs() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      return [];
+    }
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((d) => d.kind === "videoinput");
+  }
+
   function stopStream(stream) {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   }
-  function computePreviewCrop(videoEl, stageEl) {
-    // The camera often returns a landscape stream while the page is portrait.
-    // CSS object-fit:cover; object-position:center shows only a centered slice
-    // of the full frame. Reproduce that visible region as normalized {x,y,w,h}
-    // so the backend analyses exactly what the operator framed (the off-screen
-    // left/right of the landscape clip is excluded), while the recording still
-    // stores the complete landscape stream. Returns null when geometry is
-    // unknown, in which case the server analyses the full frame.
-    const vw = videoEl.videoWidth;
-    const vh = videoEl.videoHeight;
+
+  function computePreviewCrop(videoEl, stageEl, stream) {
+    // Legacy CSS object-fit:cover crop (kept for debugging / old path).
+    const size = videoSourceSize(videoEl, stream);
     const sw = stageEl.clientWidth;
     const sh = stageEl.clientHeight;
-    if (!vw || !vh || !sw || !sh) return null;
+    if (!size || !sw || !sh) return null;
+    const vw = size.width;
+    const vh = size.height;
     const videoRatio = vw / vh;
     const stageRatio = sw / sh;
     let cropW, cropH;
     if (videoRatio > stageRatio) {
-      // Wider than the stage: cover crops the left/right, full height visible.
       cropH = 1;
       cropW = stageRatio / videoRatio;
     } else {
-      // Taller than the stage: cover crops top/bottom, full width visible.
       cropW = 1;
       cropH = videoRatio / stageRatio;
     }
@@ -304,6 +375,7 @@
     const r = (n) => Math.round(n * 10000) / 10000;
     return { x: r(x), y: r(y), w: r(cropW), h: r(cropH) };
   }
+
   function pickMime() {
     if (!window.MediaRecorder) return "";
     const list = [
@@ -318,7 +390,8 @@
   /* ------------------------------------------------------------------ *
    * 上传
    * ------------------------------------------------------------------ */
-  function uploadVideo(blob, filename, box, onProgress, durationSec, previewCrop) {
+  function uploadVideo(blob, filename, box, onProgress, durationSec, opts) {
+    opts = opts || {};
     return new Promise((resolve, reject) => {
       const fd = new FormData();
       fd.append("cage_id", box.cageId);
@@ -327,8 +400,19 @@
       if (durationSec != null && durationSec > 0) {
         fd.append("recorded_duration_sec", String(durationSec));
       }
-      if (previewCrop) {
-        fd.append("preview_crop", JSON.stringify(previewCrop));
+      if (opts.previewCrop) {
+        fd.append("preview_crop", JSON.stringify(opts.previewCrop));
+      }
+      if (opts.captureMode) {
+        fd.append("capture_mode", opts.captureMode);
+      }
+      if (opts.captureMeta) {
+        fd.append(
+          "capture_meta",
+          typeof opts.captureMeta === "string"
+            ? opts.captureMeta
+            : JSON.stringify(opts.captureMeta)
+        );
       }
       fd.append("video", blob, filename);
       const xhr = new XMLHttpRequest();
@@ -564,7 +648,7 @@
   }
 
   /* ================================================================== *
-   * 视图：录制中 (屏 3)
+   * 视图：录制中 (屏 3) — Canvas 720×1280 所见即所得
    * ================================================================== */
   async function viewRecord() {
     if (!state.currentBox) {
@@ -578,35 +662,63 @@
     screen.appendChild(
       appbar("", { back: "/", transparent: true, titleNode: titleEl })
     );
+
+    // Hidden source video (camera decode). Visible canvas is what the user
+    // sees and what MediaRecorder captures — same 720×1280 pixels.
     const video = h("video", {
+      class: "camera-source",
       autoplay: "",
       muted: "",
       playsinline: "",
       "webkit-playsinline": "",
       "x5-playsinline": "",
     });
+    const canvas = h("canvas", {
+      class: "camera-canvas",
+      width: String(CANVAS_W),
+      height: String(CANVAS_H),
+    });
+    const ctx = canvas.getContext("2d", { alpha: false });
     const timer = h("b", {}, "00:00:00");
     const recTimer = h("div", { class: "rec-timer", hidden: true }, [
       h("span", { class: "rec-dot" }),
       timer,
     ]);
     const shutter = h("button", { class: "shutter idle" });
+    const switchCamBtn = h(
+      "button",
+      { class: "cam-side switch-cam", hidden: true },
+      "切换摄像头"
+    );
     const hint = h("div", { class: "rec-hint" }, "绿框放完整小鼠和秤盘，黄框放体重显示屏");
     const guides = h("div", { class: "weighing-guides", "aria-hidden": "true" }, [
       h("div", { class: "capture-guide mouse-guide" }, [h("span", {}, "小鼠称重区（秤盘）")]),
       h("div", { class: "framing-hint" }, "两个区域都清晰后再开始录制"),
       h("div", { class: "capture-guide weight-guide" }, [h("span", {}, "体重读数区（显示屏）")]),
     ]);
-    const stage = h("div", { class: "camera-stage record-stage" }, [
+    // Canvas + guides share one 9:16 capture-viewport so display == recording pixels.
+    const viewport = h("div", { class: "capture-viewport" }, [
       video,
-      recTimer,
+      canvas,
       guides,
       hint,
-      h("div", { class: "shutter-bar" }, [shutter]),
+    ]);
+    const openSystemBtn = h(
+      "button",
+      { class: "btn primary", type: "button" },
+      "打开系统相机"
+    );
+    const systemCta = h("div", { class: "system-cam-cta", hidden: true }, [
+      openSystemBtn,
+    ]);
+    const stage = h("div", { class: "camera-stage record-stage" }, [
+      viewport,
+      recTimer,
+      systemCta,
+      h("div", { class: "shutter-bar" }, [switchCamBtn, shutter]),
     ]);
     screen.appendChild(stage);
 
-    // 兜底：系统相机/相册
     const fileInput = h("input", {
       type: "file",
       accept: "video/*",
@@ -615,53 +727,204 @@
     });
     fileInput.onchange = () => {
       const f = fileInput.files && fileInput.files[0];
-      if (f) doUpload(f, f.name || `mv-${Date.now()}.mp4`);
+      // Clear so the same file can be re-selected after cancel/retry.
+      fileInput.value = "";
+      if (f) confirmSystemClip(f, f.name || `mv-${Date.now()}.mp4`);
     };
     stage.appendChild(fileInput);
+    openSystemBtn.addEventListener("click", () => fileInput.click());
     mount(screen);
 
     let stream = null;
+    let canvasStream = null;
     let recorder = null;
     let chunks = [];
     let recording = false;
     let clockTimer = null;
     let startedAt = 0;
-    // The visible portrait region (what object-fit:cover shows of the
-    // landscape stream). Recomputed on viewport changes so it stays aligned
-    // with what the operator actually sees - iOS address-bar collapse, a
-    // permission banner, or rotation can shift the stage mid-recording. The
-    // value at upload time (after stop) is the final one actually shown.
-    let previewCrop = null;
+    let drawing = true;
+    let drawHandle = null;
+    let useCanvas = supportsLiveCanvasCapture();
+    let lastSourceSize = null;
+    let videoInputs = [];
+    let currentDeviceId = null;
+    let paintedReady = false;
+    let viewportObserver = null;
 
-    function refreshCrop() {
-      previewCrop = computePreviewCrop(video, stage);
+    // Pixel-exact 9:16 layout — reliable on WebViews without cqw/cqh support.
+    function layoutViewport() {
+      const sw = stage.clientWidth;
+      const sh = stage.clientHeight;
+      if (!sw || !sh) return;
+      const target = CANVAS_W / CANVAS_H;
+      let w;
+      let h;
+      if (sw / sh > target) {
+        h = sh;
+        w = sh * target;
+      } else {
+        w = sw;
+        h = sw / target;
+      }
+      viewport.style.width = Math.max(1, Math.floor(w)) + "px";
+      viewport.style.height = Math.max(1, Math.floor(h)) + "px";
     }
-    // Recompute whenever the stage geometry may have changed. visualViewport
-    // catches iOS address-bar/banner resizes that window.resize misses.
-    window.addEventListener("resize", refreshCrop);
-    if (window.visualViewport) {
-      window.visualViewport.addEventListener("resize", refreshCrop);
-      window.visualViewport.addEventListener("scroll", refreshCrop);
+    layoutViewport();
+    if (typeof ResizeObserver === "function") {
+      viewportObserver = new ResizeObserver(() => layoutViewport());
+      viewportObserver.observe(stage);
+    } else {
+      window.addEventListener("resize", layoutViewport);
     }
-    // Once the track dimensions are known, seed an initial value.
-    video.addEventListener("loadedmetadata", refreshCrop);
+
+    function setShutterArmed(armed) {
+      if (armed) {
+        shutter.disabled = false;
+        shutter.classList.remove("waiting");
+      } else {
+        shutter.disabled = true;
+        shutter.classList.add("waiting");
+      }
+    }
+    setShutterArmed(false);
+
+    function paintFrame() {
+      if (!ctx) return false;
+      try {
+        const size = videoSourceSize(video, stream);
+        if (!size) return false;
+        // HAVE_CURRENT_DATA — a decoded frame is available to draw.
+        if (video.readyState < 2) return false;
+        lastSourceSize = size;
+        const rect = centerCropSourceRect(size.width, size.height, CANVAS_W, CANVAS_H);
+        if (!rect) return false;
+        ctx.drawImage(
+          video,
+          rect.sx, rect.sy, rect.sw, rect.sh,
+          0, 0, CANVAS_W, CANVAS_H
+        );
+        if (!paintedReady) {
+          paintedReady = true;
+          setShutterArmed(true);
+        }
+        return true;
+      } catch (_) {
+        // Transient WebView draw failures: keep the loop alive, do not arm shutter.
+        return false;
+      }
+    }
+
+    function drawFrame() {
+      if (!drawing) return;
+      paintFrame();
+      scheduleDraw();
+    }
+
+    function scheduleDraw() {
+      if (!drawing) return;
+      if (typeof video.requestVideoFrameCallback === "function") {
+        drawHandle = video.requestVideoFrameCallback(() => drawFrame());
+      } else {
+        drawHandle = requestAnimationFrame(() => drawFrame());
+      }
+    }
+
+    function stopDraw() {
+      drawing = false;
+      if (drawHandle != null) {
+        if (typeof video.cancelVideoFrameCallback === "function") {
+          try { video.cancelVideoFrameCallback(drawHandle); } catch (_) {}
+        } else {
+          cancelAnimationFrame(drawHandle);
+        }
+        drawHandle = null;
+      }
+    }
+
+    function buildCaptureMeta(mode) {
+      const settings = trackSettings(stream);
+      return {
+        client_version: CLIENT_VERSION,
+        capture_mode: mode,
+        source_width: (lastSourceSize && lastSourceSize.width) || settings.width || null,
+        source_height: (lastSourceSize && lastSourceSize.height) || settings.height || null,
+        canvas_width: CANVAS_W,
+        canvas_height: CANVAS_H,
+        viewport_width: viewport.clientWidth || null,
+        viewport_height: viewport.clientHeight || null,
+        stage_width: stage.clientWidth || null,
+        stage_height: stage.clientHeight || null,
+        facing_mode: settings.facingMode || null,
+        frame_rate: settings.frameRate || null,
+        user_agent: (navigator.userAgent || "").slice(0, 240),
+      };
+    }
+
+    function fallbackToSystemCamera(reason) {
+      useCanvas = false;
+      paintedReady = false;
+      setShutterArmed(false);
+      hint.textContent = reason || "请用系统相机录制，拍完后确认小鼠和读数清晰";
+      shutter.classList.add("hidden");
+      switchCamBtn.hidden = true;
+      systemCta.hidden = false;
+      stopDraw();
+      stopStream(stream);
+      stream = null;
+      // Do NOT auto-click fileInput — mobile browsers require a user gesture.
+      // Keep the explicit button so cancel still leaves a retry path.
+    }
+
+    async function startCamera(deviceId) {
+      paintedReady = false;
+      setShutterArmed(false);
+      stopStream(stream);
+      stream = await openBackCamera(video, deviceId || undefined);
+      const settings = trackSettings(stream);
+      currentDeviceId = settings.deviceId || deviceId || null;
+      lastSourceSize = videoSourceSize(video, stream);
+      const facing = (settings.facingMode || "").toLowerCase();
+      if (facing && facing !== "environment") {
+        hint.textContent = "当前可能是前置摄像头，请点「切换摄像头」或改用系统相机";
+        switchCamBtn.hidden = false;
+        toast("未检测到后置摄像头，请切换");
+      } else {
+        hint.textContent = "绿框放完整小鼠和秤盘，黄框放体重显示屏";
+      }
+      try {
+        videoInputs = await listVideoInputs();
+        if (videoInputs.length > 1) switchCamBtn.hidden = false;
+      } catch (_) {}
+    }
+
+    switchCamBtn.addEventListener("click", async () => {
+      if (recording || !videoInputs.length) return;
+      const ids = videoInputs.map((d) => d.deviceId).filter(Boolean);
+      if (!ids.length) return;
+      let idx = ids.indexOf(currentDeviceId);
+      idx = (idx + 1) % ids.length;
+      try {
+        await startCamera(ids[idx]);
+        toast("已切换摄像头");
+      } catch (err) {
+        toast("切换摄像头失败");
+      }
+    });
 
     (async () => {
+      if (!useCanvas) {
+        fallbackToSystemCamera("浏览器不支持 Canvas 录像，改用系统相机");
+        return;
+      }
       try {
-        stream = await openBackCamera(video);
-        // Best-effort portrait lock so a mid-recording rotation does not change
-        // what object-fit:cover exposes. iOS Safari ignores this (no API); the
-        // live refreshCrop listener above still keeps the crop aligned if the
-        // viewport shifts. The promise rejects silently on unsupported browsers.
-        // NOTE: must use window.screen - the local `screen` DOM variable
-        // (the record stage) shadows the global Screen object here.
+        await startCamera();
+        drawing = true;
+        scheduleDraw();
         if (window.screen && window.screen.orientation && window.screen.orientation.lock) {
           window.screen.orientation.lock("portrait").catch(() => {});
         }
       } catch (err) {
-        hint.textContent = "实时相机需 HTTPS，改用系统相机录制";
-        shutter.classList.add("hidden");
-        fileInput.click();
+        fallbackToSystemCamera("实时相机需 HTTPS，改用系统相机录制");
       }
     })();
 
@@ -671,21 +934,36 @@
     }
 
     function startRec() {
-      if (!stream || !window.MediaRecorder) {
+      if (!useCanvas || !stream || !window.MediaRecorder || typeof canvas.captureStream !== "function") {
         toast("不支持网页录像，使用系统相机");
-        fileInput.click();
+        fallbackToSystemCamera();
         return;
       }
-      // Seed the crop from the current viewport (refreshCrop keeps it live
-      // during recording). The recording keeps the full landscape stream; this
-      // crop tells the backend which slice the operator saw.
-      refreshCrop();
+      // Require a successful paint — never record black/frozen frames.
+      if (!paintFrame() || !paintedReady) {
+        toast("画面未就绪，请稍候再录");
+        return;
+      }
       chunks = [];
+      try {
+        canvasStream = canvas.captureStream(15);
+      } catch (err) {
+        toast("无法录制 Canvas，改用系统相机");
+        fallbackToSystemCamera();
+        return;
+      }
       const mime = pickMime();
       const opts = { videoBitsPerSecond: 1500000 };
       if (mime) opts.mimeType = mime;
-      try { recorder = new MediaRecorder(stream, opts); }
-      catch (_) { recorder = new MediaRecorder(stream); }
+      try { recorder = new MediaRecorder(canvasStream, opts); }
+      catch (_) {
+        try { recorder = new MediaRecorder(canvasStream); }
+        catch (err2) {
+          toast("MediaRecorder 不可用，改用系统相机");
+          fallbackToSystemCamera();
+          return;
+        }
+      }
       recorder.addEventListener("dataavailable", (e) => {
         if (e.data && e.data.size) chunks.push(e.data);
       });
@@ -694,17 +972,22 @@
         const type = recorder.mimeType || mime || "video/webm";
         const ext = type.includes("mp4") ? "mp4" : "webm";
         const blob = new Blob(chunks, { type });
-        // Pass the actual recording length so the server can sanity-check it
-        // against the decoded frame count and flag a truncated upload.
         const durationSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-        doUpload(blob, `mv-${Date.now()}.${ext}`, durationSec);
+        // Freeze meta before stopping the camera track (hdjeldn: never refresh
+        // geometry after stopStream zeros videoWidth).
+        const meta = buildCaptureMeta("canvas");
+        stopStream(stream);
+        stream = null;
+        if (canvasStream) {
+          canvasStream.getTracks().forEach((t) => t.stop());
+          canvasStream = null;
+        }
+        doUpload(blob, `mv-${Date.now()}.${ext}`, durationSec, {
+          captureMode: "canvas",
+          captureMeta: meta,
+        });
       });
-      // No timeslice: emit ONE complete container on stop(). A timeslice arg
-      // (e.g. 2000) makes Android MediaRecorder produce fragmented MP4 shards
-      // that `new Blob(chunks)` merely concatenates - OpenCV then decodes only
-      // the first shard and the mouse-on-scale portion is never read, so every
-      // job silently reports 0 detections. Recording the whole clip as a single
-      // valid container fixes that at the source.
+      // No timeslice: one complete container on stop() (Android fMP4 pitfall).
       recorder.start();
       recording = true;
       startedAt = Date.now();
@@ -726,25 +1009,74 @@
 
     shutter.addEventListener("click", () => (recording ? stopRec() : startRec()));
 
-    async function doUpload(blob, filename, durationSec) {
+    function doUpload(blob, filename, durationSec, uploadOpts) {
+      stopDraw();
       stopStream(stream);
+      stream = null;
       setTitle("上传中");
-      // Use the final crop reflecting the viewport at the end of recording.
-      refreshCrop();
-      renderUploading(box, blob, filename, durationSec, previewCrop);
+      renderUploading(box, blob, filename, durationSec, uploadOpts || {});
+    }
+
+    function confirmSystemClip(file, filename) {
+      stopDraw();
+      stopStream(stream);
+      stream = null;
+      const url = URL.createObjectURL(file);
+      const screen2 = h("div", { class: "screen" });
+      screen2.appendChild(appbar("确认录像", { back: "/record" }));
+      const preview = h("video", {
+        class: "system-preview",
+        controls: "",
+        playsinline: "",
+        src: url,
+      });
+      const content = h("div", { class: "content" }, [
+        h("div", { class: "card" }, [
+          h("div", { class: "card-title" }, "请确认小鼠与 LCD 均清晰"),
+          preview,
+          h("p", { class: "li-sub" }, "系统相机无法显示绿黄框；确认画面可用后再上传。"),
+          h("button", {
+            class: "btn primary",
+            onClick: () => {
+              URL.revokeObjectURL(url);
+              doUpload(file, filename, null, {
+                captureMode: "system",
+                captureMeta: {
+                  client_version: CLIENT_VERSION,
+                  capture_mode: "system",
+                  user_agent: (navigator.userAgent || "").slice(0, 240),
+                },
+              });
+            },
+          }, "确认上传"),
+          h("button", {
+            class: "btn ghost",
+            onClick: () => {
+              URL.revokeObjectURL(url);
+              go("/record");
+            },
+          }, "重新录制"),
+        ]),
+      ]);
+      screen2.appendChild(content);
+      app.innerHTML = "";
+      mount(screen2);
     }
 
     return () => {
       clearInterval(clockTimer);
-      window.removeEventListener("resize", refreshCrop);
-      if (window.visualViewport) {
-        window.visualViewport.removeEventListener("resize", refreshCrop);
-        window.visualViewport.removeEventListener("scroll", refreshCrop);
+      stopDraw();
+      if (viewportObserver) {
+        try { viewportObserver.disconnect(); } catch (_) {}
+        viewportObserver = null;
+      } else {
+        window.removeEventListener("resize", layoutViewport);
       }
       if (window.screen && window.screen.orientation && window.screen.orientation.unlock) {
         try { window.screen.orientation.unlock(); } catch (_) {}
       }
       if (recorder && recording) try { recorder.stop(); } catch (_) {}
+      if (canvasStream) canvasStream.getTracks().forEach((t) => t.stop());
       stopStream(stream);
     };
   }
@@ -752,7 +1084,8 @@
   /* ================================================================== *
    * 视图：上传 + 完成 / 排队 (屏 4)
    * ================================================================== */
-  function renderUploading(box, blob, filename, durationSec, previewCrop) {
+  function renderUploading(box, blob, filename, durationSec, uploadOpts) {
+    uploadOpts = uploadOpts || {};
     const screen = h("div", { class: "screen" });
     screen.appendChild(appbar("上传视频", {}));
     const bar = h("span");
@@ -778,7 +1111,7 @@
       bar.style.width = v + "%";
       pct.textContent = v + "%";
       if (v >= 100) text.textContent = "上传完成，正在入队…";
-    }, durationSec, previewCrop)
+    }, durationSec, uploadOpts)
       .then((job) => {
         state.activeJobId = job.job_id;
         go("/done");
@@ -792,7 +1125,7 @@
               h("strong", {}, "上传失败"),
               h("p", { class: "li-sub" }, err.message),
             ]),
-            h("button", { class: "btn primary", onClick: () => renderUploading(box, blob, filename, durationSec, previewCrop) }, "重试上传"),
+            h("button", { class: "btn primary", onClick: () => renderUploading(box, blob, filename, durationSec, uploadOpts) }, "重试上传"),
             h("button", { class: "btn ghost", onClick: () => go("/record") }, "重新录制"),
           ])
         );
@@ -843,6 +1176,30 @@
             : "未检出小鼠";
           statusSub.textContent = n > 0 ? box.cageId : `${box.cageId} · 可重新录制`;
           queueBox.hidden = true;
+          // Zero-detect: show the backend analysis frame so the operator can
+          // verify framing (mice / LCD) against what was analysed.
+          if (n === 0 && job.analysis_preview_url) {
+            const img = h("img", {
+              class: "analysis-preview",
+              alt: "分析预览",
+            });
+            const previewWrap = h("div", {}, [
+              h("p", { class: "li-sub" }, "后端实际分析画面："),
+              img,
+            ]);
+            card.appendChild(previewWrap);
+            // Fetch with API token — <img src> cannot send the header.
+            apiFetch(job.analysis_preview_url)
+              .then((res) => (res.ok ? res.blob() : Promise.reject()))
+              .then((blob) => {
+                img.src = URL.createObjectURL(blob);
+              })
+              .catch(() => {
+                previewWrap.appendChild(
+                  h("p", { class: "li-sub" }, "分析预览加载失败")
+                );
+              });
+          }
           return;
         }
         if (job.status === "failed") {

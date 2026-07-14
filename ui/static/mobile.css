@@ -189,7 +189,58 @@ html, body {
   width: 100%;
   overflow: hidden; background: #000;
 }
-.camera-stage video {
+/* Record stage: center a strict 9:16 viewport so Canvas pixels == guides == upload. */
+.camera-stage.record-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.capture-viewport {
+  position: relative;
+  /* Fallback for WebViews without container query units (cqw/cqh).
+     Prefer height fill; width follows 9:16 and is clamped by max-width.
+     JS ResizeObserver sets explicit px sizes on top of this. */
+  aspect-ratio: 9 / 16;
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+  max-height: 100%;
+  background: #000;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+@supports (width: 1cqw) {
+  .camera-stage.record-stage {
+    container-type: size;
+  }
+  .capture-viewport {
+    width: min(100cqw, calc(100cqh * 9 / 16));
+    height: min(100cqh, calc(100cqw * 16 / 9));
+  }
+}
+.capture-viewport .camera-source {
+  /* Keep real layout size so the browser keeps decoding frames. */
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.capture-viewport .camera-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* Viewport is already 9:16 — stretch 1:1, no secondary crop. */
+  object-fit: fill;
+  background: #000;
+  z-index: 1;
+}
+.camera-stage video:not(.camera-source) {
   position: absolute;
   inset: 0;
   display: block;
@@ -200,14 +251,47 @@ html, body {
   object-fit: cover;
   object-position: center;
 }
+.system-preview {
+  display: block;
+  width: 100%;
+  max-height: 55vh;
+  margin: 12px 0;
+  background: #000;
+  border-radius: 12px;
+}
+.analysis-preview {
+  display: block;
+  width: 100%;
+  max-height: 40vh;
+  margin: 12px auto 0;
+  background: #000;
+  border-radius: 12px;
+  object-fit: contain;
+}
+.system-cam-cta {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: calc(120px + var(--safe-bottom));
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: stretch;
+}
+.system-cam-cta .btn { width: 100%; }
 .scan-frame {
   position: absolute; width: 62vw; height: 62vw; max-width: 280px; max-height: 280px;
   border: 3px solid var(--green); border-radius: 18px;
   box-shadow: 0 0 0 100vmax rgba(0,0,0,.45);
 }
 .scan-hint, .rec-hint {
-  position: absolute; bottom: 120px; left: 0; right: 0; text-align: center;
-  color: #fff; font-size: 14px; padding: 0 24px; text-shadow: 0 1px 3px rgba(0,0,0,.6);
+  position: absolute; bottom: 12%; left: 0; right: 0; text-align: center;
+  color: #fff; font-size: 14px; padding: 0 16px; text-shadow: 0 1px 3px rgba(0,0,0,.6);
+  z-index: 3;
+}
+.camera-stage > .scan-hint {
+  bottom: 120px;
 }
 .weighing-guides {
   position: absolute;
@@ -216,6 +300,7 @@ html, body {
   height: 100%;
   pointer-events: none;
   overflow: visible;
+  z-index: 2;
 }
 .capture-guide {
   position: absolute;
@@ -265,6 +350,7 @@ html, body {
 }
 .rec-timer {
   position: absolute; top: calc(14px + var(--safe-top)); left: 50%; transform: translateX(-50%);
+  z-index: 3;
 }
 .rec-timer:not([hidden]) { display: flex; align-items: center; gap: 7px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); animation: blink 1s infinite; }
@@ -272,6 +358,7 @@ html, body {
 .shutter-bar {
   position: absolute; bottom: calc(28px + var(--safe-bottom)); left: 0; right: 0;
   display: flex; align-items: center; justify-content: center; gap: 34px;
+  z-index: 3;
 }
 .shutter {
   width: 74px; height: 74px; border-radius: 50%; border: 4px solid #fff;
@@ -279,6 +366,7 @@ html, body {
 }
 .shutter.idle { background: #fff; }
 .shutter.idle::after { content: ""; width: 58px; height: 58px; border-radius: 50%; background: var(--red); }
+.shutter.waiting { opacity: .45; pointer-events: none; }
 .shutter.recording::after { content: ""; width: 28px; height: 28px; border-radius: 6px; background: #fff; }
 .cam-side { color: #fff; font-size: 13px; background: rgba(255,255,255,.15); padding: 10px 14px; border-radius: 10px; border: none; }
 
