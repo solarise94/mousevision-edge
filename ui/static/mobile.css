@@ -219,11 +219,53 @@ html.camera-mode #app {
   width: 100%;
   overflow: hidden; background: #000;
 }
-/* Record stage: center a strict 9:16 viewport so Canvas pixels == guides == upload. */
+/* Record stage: 9:16 viewport + chrome dock (shutter outside the video). */
+html.camera-mode.record-light,
+html.camera-mode.record-light body {
+  background: #f5f6f7;
+}
+.camera-screen.record-screen {
+  background: #f5f6f7;
+  color: var(--text);
+}
+.camera-screen.record-screen .appbar {
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+}
+.camera-screen.record-screen .appbar h1 {
+  font-size: 16px;
+}
+.camera-screen.record-screen .action-text.switch-cam {
+  color: var(--green);
+  font-size: 14px;
+  font-weight: 600;
+  background: none;
+  border: none;
+  padding: 6px 4px;
+  white-space: nowrap;
+}
+.camera-screen.record-screen .action-text.switch-cam:disabled {
+  opacity: 0.4;
+}
 .camera-stage.record-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  background: #eaf7ef;
+}
+.record-viewport-host {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
+  background:
+    linear-gradient(180deg, #eef8f1 0%, #e3f3e8 100%);
+  padding: 8px 10px;
 }
 .capture-viewport {
   position: relative;
@@ -238,9 +280,14 @@ html.camera-mode #app {
   background: #000;
   overflow: hidden;
   flex: 0 0 auto;
+  border: 3px solid var(--green);
+  border-radius: 14px;
+  box-shadow:
+    0 0 0 1px rgba(40, 167, 69, 0.18),
+    0 6px 18px rgba(30, 90, 50, 0.12);
 }
 @supports (width: 1cqw) {
-  .camera-stage.record-stage {
+  .record-viewport-host {
     container-type: size;
   }
   .capture-viewport {
@@ -290,12 +337,13 @@ html.camera-mode #app {
   border-radius: 12px;
   object-fit: contain;
 }
+/* Legacy full-screen scan frame (kept for any residual use) */
 .scan-frame {
   position: absolute; width: 62vw; height: 62vw; max-width: 280px; max-height: 280px;
   border: 3px solid var(--green); border-radius: 18px;
   box-shadow: 0 0 0 100vmax rgba(0,0,0,.45);
 }
-.scan-hint, .rec-hint {
+.scan-hint {
   position: absolute; bottom: 12%; left: 0; right: 0; text-align: center;
   color: #fff; font-size: 14px; padding: 0 16px; text-shadow: 0 1px 3px rgba(0,0,0,.6);
   z-index: 3;
@@ -303,6 +351,300 @@ html.camera-mode #app {
 .camera-stage > .scan-hint {
   bottom: 120px;
 }
+/* Record page hint lives in the bottom chrome, not over the video. */
+.rec-hint {
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  padding: 0 8px;
+  max-width: 420px;
+}
+.rec-hint.warn {
+  color: #9a6b00;
+}
+
+/* ---------- Scan page (light card layout) ---------- */
+.scan-screen {
+  background: var(--bg);
+  color: var(--text);
+}
+.scan-screen .appbar {
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+}
+.scan-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 16px 0;
+  min-height: 0;
+}
+.scan-guide {
+  text-align: center;
+  color: var(--green);
+  font-size: 14px;
+  font-weight: 500;
+  margin: 6px 0 14px;
+  line-height: 1.4;
+}
+.scan-card {
+  position: relative;
+  width: 100%;
+  max-width: 420px;
+  margin: 0 auto;
+  aspect-ratio: 1 / 1;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #111;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  flex: 0 0 auto;
+}
+.scan-card video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  background: #111;
+}
+.scan-corners {
+  position: absolute;
+  inset: 12px;
+  pointer-events: none;
+  z-index: 2;
+}
+.scan-corners span {
+  position: absolute;
+  inset: 0;
+}
+.scan-corners::before,
+.scan-corners::after,
+.scan-corners span::before,
+.scan-corners span::after {
+  content: "";
+  position: absolute;
+  width: 28px;
+  height: 28px;
+  border: 0 solid var(--green);
+}
+.scan-corners::before {
+  top: 0; left: 0;
+  border-top-width: 4px;
+  border-left-width: 4px;
+  border-top-left-radius: 6px;
+}
+.scan-corners::after {
+  top: 0; right: 0;
+  border-top-width: 4px;
+  border-right-width: 4px;
+  border-top-right-radius: 6px;
+}
+.scan-corners span::before {
+  bottom: 0; left: 0;
+  border-bottom-width: 4px;
+  border-left-width: 4px;
+  border-bottom-left-radius: 6px;
+}
+.scan-corners span::after {
+  bottom: 0; right: 0;
+  border-bottom-width: 4px;
+  border-right-width: 4px;
+  border-bottom-right-radius: 6px;
+}
+.scan-card-actions {
+  position: absolute;
+  left: 0; right: 0;
+  bottom: 14px;
+  display: flex;
+  justify-content: center;
+  gap: 48px;
+  z-index: 3;
+}
+.scan-fab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+.scan-fab .fab-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.42);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  line-height: 1;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.scan-fab:active .fab-icon { background: rgba(0, 0, 0, 0.58); }
+.scan-fab.on .fab-icon {
+  background: rgba(40, 167, 69, 0.88);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+.scan-fab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.scan-result-block {
+  max-width: 420px;
+  width: 100%;
+  margin: 18px auto 0;
+  flex: 0 0 auto;
+}
+.scan-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.scan-result-head .label {
+  font-size: 14px;
+  color: var(--text);
+  font-weight: 500;
+}
+.scan-result-head .rescan {
+  font-size: 13px;
+  color: var(--green);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 500;
+}
+.scan-result-head .rescan:active { opacity: 0.7; }
+.scan-result-value {
+  font-size: 28px;
+  font-weight: 600;
+  color: var(--green);
+  letter-spacing: 0.5px;
+  min-height: 36px;
+  word-break: break-all;
+  line-height: 1.25;
+}
+.scan-result-value.empty {
+  color: var(--muted);
+  font-size: 15px;
+  font-weight: 400;
+}
+.scan-footer {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding: 14px 8px calc(14px + var(--safe-bottom));
+  border-top: 1px solid var(--line);
+  background: var(--card);
+}
+.scan-footer-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 10px 16px;
+  min-height: var(--touch);
+}
+.scan-footer-btn:active { color: var(--text); }
+.scan-footer-btn .ico {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.scan-footer-btn .ico.kbd {
+  border-radius: 4px;
+  font-size: 10px;
+}
+.scan-manual-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+.scan-manual-panel {
+  width: 100%;
+  max-width: 480px;
+  background: var(--card);
+  border-radius: 16px 16px 0 0;
+  padding: 18px 16px calc(16px + var(--safe-bottom));
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.12);
+}
+.scan-manual-panel h3 {
+  margin: 0 0 14px;
+  font-size: 16px;
+  font-weight: 600;
+  text-align: center;
+}
+.scan-manual-panel .actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+.scan-manual-panel .actions .btn {
+  flex: 1;
+  margin-top: 0;
+}
+.scan-help-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.scan-help-panel {
+  width: 100%;
+  max-width: 340px;
+  background: var(--card);
+  border-radius: 14px;
+  padding: 20px 18px 16px;
+}
+.scan-help-panel h3 {
+  margin: 0 0 12px;
+  font-size: 16px;
+  font-weight: 600;
+}
+.scan-help-panel ol {
+  margin: 0 0 16px;
+  padding-left: 20px;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.scan-help-panel li { margin-bottom: 4px; }
+.scan-help-panel .btn { margin-top: 0; }
 .weighing-guides {
   position: absolute;
   inset: 0;
@@ -359,26 +701,71 @@ html.camera-mode #app {
   text-shadow: 0 1px 3px #000;
 }
 .rec-timer {
-  position: absolute; top: calc(14px + var(--safe-top)); left: 50%; transform: translateX(-50%);
-  z-index: 3;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-size: 15px;
+  min-height: 20px;
 }
-.rec-timer:not([hidden]) { display: flex; align-items: center; gap: 7px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); animation: blink 1s infinite; }
+.rec-timer:not([hidden]) { display: flex; }
+.rec-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .25; } }
+/* Bottom chrome: controls sit outside the 9:16 video so they never cover LCD. */
+.rec-dock {
+  flex: 0 0 auto;
+  width: 100%;
+  background: #fff;
+  border-top: 1px solid var(--line);
+  padding: 10px 16px calc(12px + var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  z-index: 4;
+}
+.rec-dock-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 56px;
+}
+/* Legacy absolute shutter-bar (scan no longer uses it; keep for safety) */
 .shutter-bar {
   position: absolute; bottom: calc(28px + var(--safe-bottom)); left: 0; right: 0;
   display: flex; align-items: center; justify-content: center; gap: 34px;
   z-index: 3;
 }
 .shutter {
-  width: 74px; height: 74px; border-radius: 50%; border: 4px solid #fff;
-  background: var(--red); cursor: pointer; display: flex; align-items: center; justify-content: center;
+  width: 56px; height: 56px; border-radius: 50%; border: 3px solid var(--green);
+  background: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 10px rgba(40, 167, 69, 0.18);
+  padding: 0;
 }
 .shutter.idle { background: #fff; }
-.shutter.idle::after { content: ""; width: 58px; height: 58px; border-radius: 50%; background: var(--red); }
+.shutter.idle::after {
+  content: "";
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--red);
+}
 .shutter.waiting { opacity: .45; pointer-events: none; }
-.shutter.recording::after { content: ""; width: 28px; height: 28px; border-radius: 6px; background: #fff; }
-.cam-side { color: #fff; font-size: 13px; background: rgba(255,255,255,.15); padding: 10px 14px; border-radius: 10px; border: none; }
+.shutter.recording {
+  border-color: var(--red);
+  background: var(--red);
+}
+.shutter.recording::after {
+  content: "";
+  width: 18px; height: 18px; border-radius: 4px;
+  background: #fff;
+}
+.shutter.hidden { display: none; }
+.cam-side {
+  color: #fff; font-size: 13px; background: rgba(255,255,255,.15);
+  padding: 10px 14px; border-radius: 10px; border: none;
+}
 
 /* ---------- Done / status ---------- */
 .center-status { text-align: center; padding: 24px 0; }

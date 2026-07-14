@@ -506,13 +506,13 @@
   }
 
   /* ================================================================== *
-   * 视图：扫码选箱 (屏 2)
+   * 视图：扫码选箱 (屏 2) — 浅色卡片布局
    * ================================================================== */
   async function viewScan() {
-    document.documentElement.classList.add("camera-mode");
-    const screen = h("div", { class: "screen camera-screen" });
-    screen.appendChild(
-      appbar("扫描箱号二维码", { back: "/", transparent: true })
+    const guideText = h(
+      "div",
+      { class: "scan-guide" },
+      "请将二维码放入框内，系统将自动识别"
     );
     const video = h("video", {
       autoplay: "",
@@ -521,55 +521,167 @@
       "webkit-playsinline": "",
       "x5-playsinline": "",
     });
-    const stage = h("div", { class: "camera-stage" }, [
+    const torchIcon = h("span", { class: "fab-icon" }, "💡");
+    const torchLabel = document.createTextNode("开灯");
+    const torchBtn = h(
+      "button",
+      { class: "scan-fab", type: "button", onClick: toggleTorch },
+      [torchIcon, torchLabel]
+    );
+    const albumBtn = h(
+      "button",
+      { class: "scan-fab", type: "button", onClick: pickFromAlbum },
+      [h("span", { class: "fab-icon" }, "🖼"), "相册"]
+    );
+    const resultValue = h("div", { class: "scan-result-value empty" }, "等待识别…");
+    const rescanBtn = h(
+      "button",
+      { class: "rescan", type: "button", onClick: restartScan },
+      "↻ 重新扫描"
+    );
+    const scanCard = h("div", { class: "scan-card" }, [
       video,
-      h("div", { class: "scan-frame" }),
-      h("div", { class: "scan-hint" }, "将二维码放入框内，即可自动识别"),
+      h("div", { class: "scan-corners" }, [h("span")]),
+      h("div", { class: "scan-card-actions" }, [torchBtn, albumBtn]),
     ]);
-    const dock = h("div", { class: "shutter-bar" }, [
-      h("button", { class: "cam-side", onClick: pickFromAlbum }, "🖼 相册选择"),
-      h("button", { class: "cam-side", onClick: manualInput }, "⌨️ 手动输入"),
+    const resultBlock = h("div", { class: "scan-result-block" }, [
+      h("div", { class: "scan-result-head" }, [
+        h("span", { class: "label" }, "识别结果"),
+        rescanBtn,
+      ]),
+      resultValue,
     ]);
-    stage.appendChild(dock);
-    screen.appendChild(stage);
+    const footer = h("div", { class: "scan-footer" }, [
+      h(
+        "button",
+        { class: "scan-footer-btn", type: "button", onClick: showHelp },
+        [h("span", { class: "ico" }, "?"), "使用帮助"]
+      ),
+      h(
+        "button",
+        { class: "scan-footer-btn", type: "button", onClick: manualInput },
+        [h("span", { class: "ico kbd" }, "⌨"), "手动输入"]
+      ),
+    ]);
+    const screen = h("div", { class: "screen scan-screen" }, [
+      appbar("扫描箱号二维码", { back: "/" }),
+      h("div", { class: "scan-body" }, [guideText, scanCard, resultBlock]),
+      footer,
+    ]);
     mount(screen);
 
     let stream = null;
     let scanning = true;
     let detector = null;
+    let torchOn = false;
+    let torchSupported = false;
+    let videoTrack = null;
+    let sheetEl = null;
+
+    function setResult(text, ok) {
+      if (ok) {
+        resultValue.classList.remove("empty");
+        resultValue.textContent = text;
+      } else {
+        resultValue.classList.add("empty");
+        resultValue.textContent = text || "等待识别…";
+      }
+    }
+
+    function closeSheet() {
+      if (sheetEl) {
+        sheetEl.remove();
+        sheetEl = null;
+      }
+    }
 
     function onDecoded(text) {
       if (!scanning) return;
       scanning = false;
       if (navigator.vibrate) navigator.vibrate(60);
-      selectCage(parseQr(text));
+      const parsed = parseQr(text);
+      setResult(parsed.cageId, true);
+      // Brief pause so the operator can read the result before navigating.
+      setTimeout(() => selectCage(parsed), 350);
     }
 
     async function loop() {
       if (!scanning || !detector) return;
       try {
-        const codes = await detector.detect(video);
-        if (codes && codes.length) {
-          onDecoded(codes[0].rawValue);
-          return;
+        if (video.readyState >= 2) {
+          const codes = await detector.detect(video);
+          if (codes && codes.length) {
+            onDecoded(codes[0].rawValue);
+            return;
+          }
         }
       } catch (_) {}
       if (scanning) requestAnimationFrame(loop);
     }
 
+    function restartScan() {
+      closeSheet();
+      scanning = true;
+      setResult("等待识别…", false);
+      if (detector) requestAnimationFrame(loop);
+    }
+
+    async function applyTorch(on) {
+      if (!videoTrack || !torchSupported) return false;
+      try {
+        await videoTrack.applyConstraints({ advanced: [{ torch: !!on }] });
+        torchOn = !!on;
+        torchBtn.classList.toggle("on", torchOn);
+        torchLabel.textContent = torchOn ? "关灯" : "开灯";
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    async function toggleTorch() {
+      if (!torchSupported) {
+        toast("当前设备不支持手电筒");
+        return;
+      }
+      const ok = await applyTorch(!torchOn);
+      if (!ok) toast("无法切换手电筒");
+    }
+
+    async function refreshTorchCapability() {
+      videoTrack = null;
+      torchSupported = false;
+      torchOn = false;
+      torchBtn.classList.remove("on");
+      torchLabel.textContent = "开灯";
+      try {
+        const track = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+        if (!track) return;
+        videoTrack = track;
+        const caps =
+          typeof track.getCapabilities === "function" ? track.getCapabilities() : null;
+        torchSupported = !!(caps && "torch" in caps);
+      } catch (_) {
+        torchSupported = false;
+      }
+      torchBtn.disabled = !torchSupported;
+    }
+
     (async () => {
       try {
         stream = await openBackCamera(video);
+        await refreshTorchCapability();
         if ("BarcodeDetector" in window) {
           detector = new window.BarcodeDetector({ formats: ["qr_code"] });
           requestAnimationFrame(loop);
         } else {
-          stage.querySelector(".scan-hint").textContent =
-            "此浏览器不支持自动扫码，请用相册选择或手动输入";
+          guideText.textContent = "此浏览器不支持自动扫码，请用相册选择或手动输入";
+          guideText.style.color = "var(--muted)";
         }
       } catch (err) {
-        stage.querySelector(".scan-hint").textContent =
-          "无法打开相机（需 HTTPS）。请用相册选择或手动输入";
+        guideText.textContent = "无法打开相机（需 HTTPS）。请用相册选择或手动输入";
+        guideText.style.color = "var(--muted)";
+        torchBtn.disabled = true;
       }
     })();
 
@@ -596,17 +708,91 @@
     }
 
     function manualInput() {
-      const value = window.prompt("请输入箱号");
-      if (value && value.trim()) {
+      closeSheet();
+      const input = h("input", {
+        type: "text",
+        inputmode: "text",
+        autocomplete: "off",
+        autocapitalize: "characters",
+        placeholder: "例如 C57-023",
+        value: "",
+      });
+      const cancelBtn = h(
+        "button",
+        { class: "btn ghost", type: "button", onClick: closeSheet },
+        "取消"
+      );
+      const okBtn = h("button", { class: "btn primary", type: "button" }, "确认");
+      const panel = h("div", { class: "scan-manual-panel" }, [
+        h("h3", {}, "手动输入箱号"),
+        h("div", { class: "field", style: "margin-bottom:0" }, [
+          h("label", {}, "箱号"),
+          input,
+        ]),
+        h("div", { class: "actions" }, [cancelBtn, okBtn]),
+      ]);
+      sheetEl = h(
+        "div",
+        {
+          class: "scan-manual-sheet",
+          onClick: (e) => {
+            if (e.target === sheetEl) closeSheet();
+          },
+        },
+        [panel]
+      );
+      okBtn.addEventListener("click", () => {
+        const value = (input.value || "").trim();
+        if (!value) {
+          toast("请输入箱号");
+          return;
+        }
+        closeSheet();
         scanning = false;
-        selectCage({ cageId: value.trim(), projectId: state.projectId });
-      }
+        setResult(value, true);
+        selectCage({ cageId: value, projectId: state.projectId });
+      });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") okBtn.click();
+      });
+      document.body.appendChild(sheetEl);
+      setTimeout(() => input.focus(), 50);
+    }
+
+    function showHelp() {
+      closeSheet();
+      const panel = h("div", { class: "scan-help-panel" }, [
+        h("h3", {}, "使用帮助"),
+        h("ol", {}, [
+          h("li", {}, "将箱号二维码对准绿色取景框"),
+          h("li", {}, "保持稳定，系统会自动识别"),
+          h("li", {}, "光线不足时可点「开灯」"),
+          h("li", {}, "也可从相册选择图片，或手动输入箱号"),
+        ]),
+        h(
+          "button",
+          { class: "btn primary", type: "button", onClick: closeSheet },
+          "知道了"
+        ),
+      ]);
+      sheetEl = h(
+        "div",
+        {
+          class: "scan-help-sheet",
+          onClick: (e) => {
+            if (e.target === sheetEl) closeSheet();
+          },
+        },
+        [panel]
+      );
+      document.body.appendChild(sheetEl);
     }
 
     async function selectCage(parsed) {
       const cage = parsed.cageId;
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(cage)) {
         toast("箱号格式不合法");
+        setResult("等待识别…", false);
         scanning = true;
         if (detector) requestAnimationFrame(loop);
         return;
@@ -624,6 +810,10 @@
           // 允许临时使用（上传时后端会自动建箱）
         } else {
           toast(err.message);
+          setResult("等待识别…", false);
+          scanning = true;
+          if (detector) requestAnimationFrame(loop);
+          return;
         }
       }
       setCurrentBox({
@@ -635,8 +825,9 @@
     }
 
     return () => {
-      document.documentElement.classList.remove("camera-mode");
       scanning = false;
+      closeSheet();
+      applyTorch(false).catch(() => {});
       stopStream(stream);
     };
   }
@@ -657,13 +848,19 @@
       go("/scan");
       return;
     }
-    document.documentElement.classList.add("camera-mode");
+    document.documentElement.classList.add("camera-mode", "record-light");
     const box = state.currentBox;
-    const screen = h("div", { class: "screen camera-screen" });
     const titleEl = h("h1", {}, `录制准备 · ${box.cageId}`);
     function setTitle(text) { titleEl.textContent = text; }
-    screen.appendChild(
-      appbar("", { back: "/", transparent: true, titleNode: titleEl })
+    const switchCamBtn = h(
+      "button",
+      {
+        class: "action-text switch-cam",
+        type: "button",
+        hidden: true,
+        title: "切换摄像头",
+      },
+      "切换"
     );
 
     // Hidden source video (camera decode). Visible canvas is what the user
@@ -687,12 +884,11 @@
       h("span", { class: "rec-dot" }),
       timer,
     ]);
-    const shutter = h("button", { class: "shutter idle" });
-    const switchCamBtn = h(
-      "button",
-      { class: "cam-side switch-cam", hidden: true },
-      "切换摄像头"
-    );
+    const shutter = h("button", {
+      class: "shutter idle",
+      type: "button",
+      "aria-label": "开始/结束录制",
+    });
     const hint = h("div", { class: "rec-hint" }, "绿框放完整小鼠和秤盘，黄框放体重显示屏");
     const guides = h("div", { class: "weighing-guides", "aria-hidden": "true" }, [
       h("div", { class: "capture-guide mouse-guide" }, [h("span", {}, "小鼠称重区（秤盘）")]),
@@ -700,18 +896,30 @@
       h("div", { class: "capture-guide weight-guide" }, [h("span", {}, "体重读数区（显示屏）")]),
     ]);
     // Canvas + guides share one 9:16 capture-viewport so display == recording pixels.
+    // Shutter / timer / hint live in rec-dock outside the video (no LCD overlap).
     const viewport = h("div", { class: "capture-viewport" }, [
       video,
       canvas,
       guides,
+    ]);
+    const viewportHost = h("div", { class: "record-viewport-host" }, [viewport]);
+    const dock = h("div", { class: "rec-dock" }, [
+      recTimer,
+      h("div", { class: "rec-dock-actions" }, [shutter]),
       hint,
     ]);
     const stage = h("div", { class: "camera-stage record-stage" }, [
-      viewport,
-      recTimer,
-      h("div", { class: "shutter-bar" }, [switchCamBtn, shutter]),
+      viewportHost,
+      dock,
     ]);
-    screen.appendChild(stage);
+    const screen = h("div", { class: "screen camera-screen record-screen" }, [
+      appbar("", {
+        back: "/",
+        titleNode: titleEl,
+        right: switchCamBtn,
+      }),
+      stage,
+    ]);
     mount(screen);
 
     let stream = null;
@@ -730,20 +938,25 @@
     let paintedReady = false;
     let viewportObserver = null;
 
-    // Pixel-exact 9:16 layout — reliable on WebViews without cqw/cqh support.
+    // Pixel-exact 9:16 layout within the host (excludes bottom dock chrome).
     function layoutViewport() {
-      const sw = stage.clientWidth;
-      const sh = stage.clientHeight;
+      const sw = viewportHost.clientWidth;
+      const sh = viewportHost.clientHeight;
       if (!sw || !sh) return;
+      // Host padding is already inside client box; keep a small safety inset.
+      const padX = 8;
+      const padY = 8;
+      const availW = Math.max(1, sw - padX * 2);
+      const availH = Math.max(1, sh - padY * 2);
       const target = CANVAS_W / CANVAS_H;
       let w;
       let h;
-      if (sw / sh > target) {
-        h = sh;
-        w = sh * target;
+      if (availW / availH > target) {
+        h = availH;
+        w = availH * target;
       } else {
-        w = sw;
-        h = sw / target;
+        w = availW;
+        h = availW / target;
       }
       viewport.style.width = Math.max(1, Math.floor(w)) + "px";
       viewport.style.height = Math.max(1, Math.floor(h)) + "px";
@@ -751,7 +964,7 @@
     layoutViewport();
     if (typeof ResizeObserver === "function") {
       viewportObserver = new ResizeObserver(() => layoutViewport());
-      viewportObserver.observe(stage);
+      viewportObserver.observe(viewportHost);
     } else {
       window.addEventListener("resize", layoutViewport);
     }
@@ -839,11 +1052,16 @@
       };
     }
 
+    function setHint(text, warn) {
+      hint.textContent = text || "";
+      hint.classList.toggle("warn", !!warn);
+    }
+
     function disableRecording(reason) {
       useCanvas = false;
       paintedReady = false;
       setShutterArmed(false);
-      hint.textContent = reason || "当前浏览器无法进行网页录像，请更换浏览器后重试";
+      setHint(reason || "当前浏览器无法进行网页录像，请更换浏览器后重试", true);
       shutter.classList.add("hidden");
       switchCamBtn.hidden = true;
       stopDraw();
@@ -865,11 +1083,11 @@
       lastSourceSize = videoSourceSize(video, stream);
       const facing = (settings.facingMode || "").toLowerCase();
       if (facing && facing !== "environment") {
-        hint.textContent = "当前可能是前置摄像头，请点「切换摄像头」";
+        setHint("当前可能是前置摄像头，请点右上角「切换」", true);
         switchCamBtn.hidden = false;
         toast("未检测到后置摄像头，请切换");
       } else {
-        hint.textContent = "绿框放完整小鼠和秤盘，黄框放体重显示屏";
+        setHint("绿框放完整小鼠和秤盘，黄框放体重显示屏", false);
       }
       try {
         videoInputs = await listVideoInputs();
@@ -878,9 +1096,15 @@
     }
 
     switchCamBtn.addEventListener("click", async () => {
-      if (recording || !videoInputs.length) return;
+      if (recording || switchCamBtn.disabled) return;
+      if (!videoInputs.length) {
+        try { videoInputs = await listVideoInputs(); } catch (_) {}
+      }
       const ids = videoInputs.map((d) => d.deviceId).filter(Boolean);
-      if (!ids.length) return;
+      if (!ids.length) {
+        toast("未找到可切换的摄像头");
+        return;
+      }
       let idx = ids.indexOf(currentDeviceId);
       idx = (idx + 1) % ids.length;
       try {
@@ -976,8 +1200,9 @@
       recTimer.hidden = false;
       shutter.classList.remove("idle");
       shutter.classList.add("recording");
+      switchCamBtn.disabled = true;
       setTitle(`录制中 · ${box.cageId}`);
-      hint.textContent = "录制中：保持小鼠在绿框、体重数字在黄框内";
+      setHint("录制中：保持小鼠在绿框、体重数字在黄框内", false);
     }
 
     function stopRec() {
@@ -998,7 +1223,7 @@
     }
 
     return () => {
-      document.documentElement.classList.remove("camera-mode");
+      document.documentElement.classList.remove("camera-mode", "record-light");
       clearInterval(clockTimer);
       stopDraw();
       if (viewportObserver) {
