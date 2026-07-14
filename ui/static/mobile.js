@@ -255,6 +255,41 @@
   function stopStream(stream) {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   }
+  function trackContainedVideo(videoEl, stageEl, overlayEl) {
+    // The camera often returns a landscape stream even while the page is in
+    // portrait. Keep the guides on the actual object-fit:contain picture,
+    // instead of positioning them against the surrounding black stage.
+    function sync() {
+      const stageW = stageEl.clientWidth;
+      const stageH = stageEl.clientHeight;
+      const videoW = videoEl.videoWidth;
+      const videoH = videoEl.videoHeight;
+      if (!stageW || !stageH) return;
+
+      const ratio = videoW && videoH ? videoW / videoH : 16 / 9;
+      let width = stageW;
+      let height = width / ratio;
+      if (height > stageH) {
+        height = stageH;
+        width = height * ratio;
+      }
+      overlayEl.style.left = `${(stageW - width) / 2}px`;
+      overlayEl.style.top = `${(stageH - height) / 2}px`;
+      overlayEl.style.width = `${width}px`;
+      overlayEl.style.height = `${height}px`;
+    }
+
+    videoEl.addEventListener("loadedmetadata", sync);
+    window.addEventListener("resize", sync);
+    const observer = window.ResizeObserver ? new ResizeObserver(sync) : null;
+    if (observer) observer.observe(stageEl);
+    sync();
+    return () => {
+      videoEl.removeEventListener("loadedmetadata", sync);
+      window.removeEventListener("resize", sync);
+      if (observer) observer.disconnect();
+    };
+  }
   function pickMime() {
     if (!window.MediaRecorder) return "";
     const list = [
@@ -525,11 +560,16 @@
       timer,
     ]);
     const shutter = h("button", { class: "shutter idle" });
-    const hint = h("div", { class: "rec-hint" }, "请保持手机稳定，确保显示屏清晰");
-    const stage = h("div", { class: "camera-stage" }, [
+    const hint = h("div", { class: "rec-hint" }, "绿框放完整小鼠和秤盘，黄框放体重显示屏");
+    const guides = h("div", { class: "weighing-guides", "aria-hidden": "true" }, [
+      h("div", { class: "capture-guide mouse-guide" }, [h("span", {}, "小鼠称重区（秤盘）")]),
+      h("div", { class: "framing-hint" }, "两个区域都清晰后再开始录制"),
+      h("div", { class: "capture-guide weight-guide" }, [h("span", {}, "体重读数区（显示屏）")]),
+    ]);
+    const stage = h("div", { class: "camera-stage record-stage" }, [
       video,
       recTimer,
-      h("div", { class: "lcd-guide" }, [h("span", {}, "SCALE / LCD")]),
+      guides,
       hint,
       h("div", { class: "shutter-bar" }, [shutter]),
     ]);
@@ -555,6 +595,7 @@
     let recording = false;
     let clockTimer = null;
     let startedAt = 0;
+    const stopGuideTracking = trackContainedVideo(video, stage, guides);
 
     (async () => {
       try {
@@ -610,7 +651,7 @@
       recTimer.hidden = false;
       shutter.classList.remove("idle");
       shutter.classList.add("recording");
-      hint.textContent = "录制中… 点击方块结束";
+      hint.textContent = "录制中：保持小鼠在绿框、体重数字在黄框内";
     }
 
     function stopRec() {
@@ -629,6 +670,7 @@
 
     return () => {
       clearInterval(clockTimer);
+      stopGuideTracking();
       if (recorder && recording) try { recorder.stop(); } catch (_) {}
       stopStream(stream);
     };
