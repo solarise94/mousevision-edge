@@ -241,15 +241,30 @@
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error("insecure");
     }
-    const stream = await navigator.mediaDevices.getUserMedia({
+    const capture = (facingMode) => navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
-        facingMode: { ideal: "environment" },
+        facingMode,
         width: { ideal: 720 },
         height: { ideal: 1280 },
         frameRate: { ideal: 15, max: 15 },
       },
     });
+    let stream;
+    try {
+      // `ideal` is only a preference and some phones select the selfie camera.
+      // Require the rear camera first; fall back only when the browser cannot
+      // satisfy or understand that constraint (desktop/older WebKit support).
+      stream = await capture({ exact: "environment" });
+    } catch (err) {
+      const constraintFailure = [
+        "OverconstrainedError",
+        "ConstraintNotSatisfiedError",
+        "NotFoundError",
+      ].includes(err && err.name);
+      if (!constraintFailure) throw err;
+      stream = await capture({ ideal: "environment" });
+    }
     videoEl.srcObject = stream;
     videoEl.muted = true;
     videoEl.playsInline = true;
@@ -414,7 +429,13 @@
     screen.appendChild(
       appbar("扫描箱号二维码", { back: "/", transparent: true })
     );
-    const video = h("video", { autoplay: "", muted: "", playsinline: "" });
+    const video = h("video", {
+      autoplay: "",
+      muted: "",
+      playsinline: "",
+      "webkit-playsinline": "",
+      "x5-playsinline": "",
+    });
     const stage = h("div", { class: "camera-stage" }, [
       video,
       h("div", { class: "scan-frame" }),
@@ -557,7 +578,13 @@
     screen.appendChild(
       appbar("", { back: "/", transparent: true, titleNode: titleEl })
     );
-    const video = h("video", { autoplay: "", muted: "", playsinline: "" });
+    const video = h("video", {
+      autoplay: "",
+      muted: "",
+      playsinline: "",
+      "webkit-playsinline": "",
+      "x5-playsinline": "",
+    });
     const timer = h("b", {}, "00:00:00");
     const recTimer = h("div", { class: "rec-timer", hidden: true }, [
       h("span", { class: "rec-dot" }),
