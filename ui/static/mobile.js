@@ -156,9 +156,13 @@
       ? h("button", { class: "iconbtn", onClick: opts.onLeft }, opts.leftIcon)
       : h("span", { class: "iconbtn" }, "");
     const right = opts.right || h("span", { class: "slot right" }, "");
+    // Accept either a string title or a pre-built node (so callers can mutate
+    // the title text in place, e.g. the record screen switching between
+    // 准备 / 录制中 / 上传中).
+    const titleChild = opts.titleNode || title;
     return h("header", { class: "appbar" + (opts.transparent ? " transparent" : "") }, [
       h("span", { class: "slot" }, [left]),
-      h("h1", {}, title),
+      typeof titleChild === "string" ? h("h1", {}, titleChild) : titleChild,
       h("span", { class: "slot right" }, [right]),
     ]);
   }
@@ -255,40 +259,35 @@
   function stopStream(stream) {
     if (stream) stream.getTracks().forEach((t) => t.stop());
   }
-  function trackContainedVideo(videoEl, stageEl, overlayEl) {
-    // The camera often returns a landscape stream even while the page is in
-    // portrait. Keep the guides on the actual object-fit:contain picture,
-    // instead of positioning them against the surrounding black stage.
-    function sync() {
-      const stageW = stageEl.clientWidth;
-      const stageH = stageEl.clientHeight;
-      const videoW = videoEl.videoWidth;
-      const videoH = videoEl.videoHeight;
-      if (!stageW || !stageH) return;
-
-      const ratio = videoW && videoH ? videoW / videoH : 16 / 9;
-      let width = stageW;
-      let height = width / ratio;
-      if (height > stageH) {
-        height = stageH;
-        width = height * ratio;
-      }
-      overlayEl.style.left = `${(stageW - width) / 2}px`;
-      overlayEl.style.top = `${(stageH - height) / 2}px`;
-      overlayEl.style.width = `${width}px`;
-      overlayEl.style.height = `${height}px`;
+  function computePreviewCrop(videoEl, stageEl) {
+    // The camera often returns a landscape stream while the page is portrait.
+    // CSS object-fit:cover; object-position:center shows only a centered slice
+    // of the full frame. Reproduce that visible region as normalized {x,y,w,h}
+    // so the backend analyses exactly what the operator framed (the off-screen
+    // left/right of the landscape clip is excluded), while the recording still
+    // stores the complete landscape stream. Returns null when geometry is
+    // unknown, in which case the server analyses the full frame.
+    const vw = videoEl.videoWidth;
+    const vh = videoEl.videoHeight;
+    const sw = stageEl.clientWidth;
+    const sh = stageEl.clientHeight;
+    if (!vw || !vh || !sw || !sh) return null;
+    const videoRatio = vw / vh;
+    const stageRatio = sw / sh;
+    let cropW, cropH;
+    if (videoRatio > stageRatio) {
+      // Wider than the stage: cover crops the left/right, full height visible.
+      cropH = 1;
+      cropW = stageRatio / videoRatio;
+    } else {
+      // Taller than the stage: cover crops top/bottom, full width visible.
+      cropW = 1;
+      cropH = videoRatio / stageRatio;
     }
-
-    videoEl.addEventListener("loadedmetadata", sync);
-    window.addEventListener("resize", sync);
-    const observer = window.ResizeObserver ? new ResizeObserver(sync) : null;
-    if (observer) observer.observe(stageEl);
-    sync();
-    return () => {
-      videoEl.removeEventListener("loadedmetadata", sync);
-      window.removeEventListener("resize", sync);
-      if (observer) observer.disconnect();
-    };
+    const x = (1 - cropW) / 2;
+    const y = (1 - cropH) / 2;
+    const r = (n) => Math.round(n * 10000) / 10000;
+    return { x: r(x), y: r(y), w: r(cropW), h: r(cropH) };
   }
   function pickMime() {
     if (!window.MediaRecorder) return "";
@@ -304,7 +303,7 @@
   /* ------------------------------------------------------------------ *
    * 上传
    * ------------------------------------------------------------------ */
-  function uploadVideo(blob, filename, box, onProgress, durationSec) {
+  function uploadVideo(blob, filename, box, onProgress, durationSec, previewCrop) {
     return new Promise((resolve, reject) => {
       const fd = new FormData();
       fd.append("cage_id", box.cageId);
@@ -312,6 +311,9 @@
       fd.append("expected_single", "true");
       if (durationSec != null && durationSec > 0) {
         fd.append("recorded_duration_sec", String(durationSec));
+      }
+      if (previewCrop) {
+        fd.append("preview_crop", JSON.stringify(previewCrop));
       }
       fd.append("video", blob, filename);
       const xhr = new XMLHttpRequest();
@@ -550,8 +552,10 @@
     }
     const box = state.currentBox;
     const screen = h("div", { class: "screen camera-screen" });
+    const titleEl = h("h1", {}, `录制准备 · ${box.cageId}`);
+    function setTitle(text) { titleEl.textContent = text; }
     screen.appendChild(
-      appbar(`录制中 · ${box.cageId}`, { back: "/", transparent: true })
+      appbar("", { back: "/", transparent: true, titleNode: titleEl })
     );
     const video = h("video", { autoplay: "", muted: "", playsinline: "" });
     const timer = h("b", {}, "00:00:00");
@@ -595,11 +599,38 @@
     let recording = false;
     let clockTimer = null;
     let startedAt = 0;
-    const stopGuideTracking = trackContainedVideo(video, stage, guides);
+    // The visible portrait region (what object-fit:cover shows of the
+    // landscape stream). Recomputed on viewport changes so it stays aligned
+    // with what the operator actually sees - iOS address-bar collapse, a
+    // permission banner, or rotation can shift the stage mid-recording. The
+    // value at upload time (after stop) is the final one actually shown.
+    let previewCrop = null;
+
+    function refreshCrop() {
+      previewCrop = computePreviewCrop(video, stage);
+    }
+    // Recompute whenever the stage geometry may have changed. visualViewport
+    // catches iOS address-bar/banner resizes that window.resize misses.
+    window.addEventListener("resize", refreshCrop);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", refreshCrop);
+      window.visualViewport.addEventListener("scroll", refreshCrop);
+    }
+    // Once the track dimensions are known, seed an initial value.
+    video.addEventListener("loadedmetadata", refreshCrop);
 
     (async () => {
       try {
         stream = await openBackCamera(video);
+        // Best-effort portrait lock so a mid-recording rotation does not change
+        // what object-fit:cover exposes. iOS Safari ignores this (no API); the
+        // live refreshCrop listener above still keeps the crop aligned if the
+        // viewport shifts. The promise rejects silently on unsupported browsers.
+        // NOTE: must use window.screen - the local `screen` DOM variable
+        // (the record stage) shadows the global Screen object here.
+        if (window.screen && window.screen.orientation && window.screen.orientation.lock) {
+          window.screen.orientation.lock("portrait").catch(() => {});
+        }
       } catch (err) {
         hint.textContent = "实时相机需 HTTPS，改用系统相机录制";
         shutter.classList.add("hidden");
@@ -618,6 +649,10 @@
         fileInput.click();
         return;
       }
+      // Seed the crop from the current viewport (refreshCrop keeps it live
+      // during recording). The recording keeps the full landscape stream; this
+      // crop tells the backend which slice the operator saw.
+      refreshCrop();
       chunks = [];
       const mime = pickMime();
       const opts = { videoBitsPerSecond: 1500000 };
@@ -639,7 +674,7 @@
       });
       // No timeslice: emit ONE complete container on stop(). A timeslice arg
       // (e.g. 2000) makes Android MediaRecorder produce fragmented MP4 shards
-      // that `new Blob(chunks)` merely concatenates — OpenCV then decodes only
+      // that `new Blob(chunks)` merely concatenates - OpenCV then decodes only
       // the first shard and the mouse-on-scale portion is never read, so every
       // job silently reports 0 detections. Recording the whole clip as a single
       // valid container fixes that at the source.
@@ -651,6 +686,7 @@
       recTimer.hidden = false;
       shutter.classList.remove("idle");
       shutter.classList.add("recording");
+      setTitle(`录制中 · ${box.cageId}`);
       hint.textContent = "录制中：保持小鼠在绿框、体重数字在黄框内";
     }
 
@@ -665,12 +701,22 @@
 
     async function doUpload(blob, filename, durationSec) {
       stopStream(stream);
-      renderUploading(box, blob, filename, durationSec);
+      setTitle("上传中");
+      // Use the final crop reflecting the viewport at the end of recording.
+      refreshCrop();
+      renderUploading(box, blob, filename, durationSec, previewCrop);
     }
 
     return () => {
       clearInterval(clockTimer);
-      stopGuideTracking();
+      window.removeEventListener("resize", refreshCrop);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener("resize", refreshCrop);
+        window.visualViewport.removeEventListener("scroll", refreshCrop);
+      }
+      if (window.screen && window.screen.orientation && window.screen.orientation.unlock) {
+        try { window.screen.orientation.unlock(); } catch (_) {}
+      }
       if (recorder && recording) try { recorder.stop(); } catch (_) {}
       stopStream(stream);
     };
@@ -679,7 +725,7 @@
   /* ================================================================== *
    * 视图：上传 + 完成 / 排队 (屏 4)
    * ================================================================== */
-  function renderUploading(box, blob, filename, durationSec) {
+  function renderUploading(box, blob, filename, durationSec, previewCrop) {
     const screen = h("div", { class: "screen" });
     screen.appendChild(appbar("上传视频", {}));
     const bar = h("span");
@@ -705,7 +751,7 @@
       bar.style.width = v + "%";
       pct.textContent = v + "%";
       if (v >= 100) text.textContent = "上传完成，正在入队…";
-    }, durationSec)
+    }, durationSec, previewCrop)
       .then((job) => {
         state.activeJobId = job.job_id;
         go("/done");
@@ -719,7 +765,7 @@
               h("strong", {}, "上传失败"),
               h("p", { class: "li-sub" }, err.message),
             ]),
-            h("button", { class: "btn primary", onClick: () => renderUploading(box, blob, filename, durationSec) }, "重试上传"),
+            h("button", { class: "btn primary", onClick: () => renderUploading(box, blob, filename, durationSec, previewCrop) }, "重试上传"),
             h("button", { class: "btn ghost", onClick: () => go("/record") }, "重新录制"),
           ])
         );

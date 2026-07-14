@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from mousevision.clip import clip_bounds_from_record
 from mousevision.detector import WeighingState
 from mousevision.driver import SessionDriver, SessionSavedEvent
-from mousevision.jobs import AnalysisJobManager, JobStore
+from mousevision.jobs import AnalysisJobManager, JobStore, _parse_preview_crop
 from mousevision.pipeline import load_config
 from mousevision.run import create_run_dir, finish_run, load_manifest, restore_renumber_temps, write_manifest
 from mousevision.source.video import VideoFileSource
@@ -865,6 +865,7 @@ async def api_create_job(
     requested_ordinal: int | None = Form(None),
     expected_single: bool = Form(True),
     recorded_duration_sec: int | None = Form(None),
+    preview_crop: str | None = Form(None),
     video: UploadFile = File(...),
 ) -> JSONResponse:
     """Upload one video and enqueue a run-scoped analysis job."""
@@ -925,6 +926,12 @@ async def api_create_job(
         }
         if recorded_duration_sec is not None:
             upload_updates["recorded_duration_sec"] = int(recorded_duration_sec)
+        # Visible region the operator framed on screen, as normalized
+        # {x,y,w,h}. Advisory only: invalid/missing falls back to full-frame
+        # analysis. Persist the raw blob so the worker can re-parse it.
+        crop_obj = _parse_preview_crop(preview_crop)
+        if crop_obj is not None:
+            upload_updates["preview_crop"] = json.dumps(crop_obj)
         job_store.update(job_id, **upload_updates)
         queued = job_manager.submit(job_id)
         return JSONResponse(_job_payload(queued), status_code=202)

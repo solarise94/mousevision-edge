@@ -71,6 +71,7 @@ class JobStore:
             "record_count",
             "decoded_frames",
             "recorded_duration_sec",
+            "preview_crop",
             "message",
             "error",
             "requested_ordinal",
@@ -113,6 +114,7 @@ class JobStore:
                         record_count INTEGER NOT NULL DEFAULT 0,
                         decoded_frames INTEGER NOT NULL DEFAULT 0,
                         recorded_duration_sec INTEGER NOT NULL DEFAULT 0,
+                        preview_crop TEXT,
                         requested_ordinal INTEGER,
                         message TEXT,
                         error TEXT,
@@ -145,6 +147,7 @@ class JobStore:
             "completed_at": "TEXT",
             "decoded_frames": "INTEGER NOT NULL DEFAULT 0",
             "recorded_duration_sec": "INTEGER NOT NULL DEFAULT 0",
+            "preview_crop": "TEXT",
         }
         for column, coltype in additions.items():
             if column not in existing:
@@ -391,6 +394,40 @@ class JobStore:
 AnalysisFn = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+def _parse_preview_crop(raw: Any) -> dict[str, float] | None:
+    """Decode a persisted ``preview_crop`` JSON blob into {x,y,w,h} floats.
+
+    Stored as TEXT in the job row. Returns ``None`` for missing/invalid input
+    so the pipeline falls back to full-frame analysis (legacy behaviour). Each
+    value is clamped to [0,1]; the rectangle must have positive area and must
+    lie fully within the frame (x+w <= 1, y+h <= 1). An overhanging rectangle
+    such as {x:0.9, w:0.9} is rejected rather than silently truncated, so the
+    analysed region always matches the persisted metadata.
+    """
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    try:
+        vals = {
+            k: float(obj[k])
+            for k in ("x", "y", "w", "h")
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    for k in vals:
+        vals[k] = max(0.0, min(vals[k], 1.0))
+    if vals["w"] <= 0.0 or vals["h"] <= 0.0:
+        return None
+    if vals["x"] + vals["w"] > 1.0 + 1e-9 or vals["y"] + vals["h"] > 1.0 + 1e-9:
+        return None
+    return vals
+
+
 class AnalysisJobManager:
     """Single-process, single-worker analysis queue for a 2C/4G edge server.
 
@@ -597,6 +634,12 @@ class AnalysisJobManager:
         start_ordinal = int(requested) if requested else 1
         cage_id = str(job["cage_id"])
         project_id = str(job.get("project_id") or "default")
+        # Mobile records a landscape stream but previews a portrait center
+        # crop. The client sends the visible region as normalized {x,y,w,h};
+        # replay it here so OCR / mouse detection only analyse what the
+        # operator framed. Advisory: a missing/invalid crop analyses the full
+        # frame (legacy behaviour).
+        crop = _parse_preview_crop(job.get("preview_crop"))
         # run_video can raise VideoFormatError itself when the video is
         # completely unopenable (VideoFileSource.frames() raises on
         # isOpened()==False). At that point no records, queue entries, or extra
@@ -620,6 +663,7 @@ class AnalysisJobManager:
                 start_ordinal=start_ordinal,
                 project_id=project_id,
                 upload_queue=self.upload_queue,
+                crop=crop,
             )
         except VideoFormatError:
             self._release_ordinals(cage_id, [start_ordinal] if requested else [])

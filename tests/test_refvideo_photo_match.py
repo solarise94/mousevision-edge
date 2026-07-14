@@ -57,3 +57,37 @@ def test_refvideo_photo_selection_valid(tmp_path: Path):
         assert pfi is not None, f"ordinal {i+1} missing photo_frame_index"
         assert isinstance(pfi, int), f"ordinal {i+1} photo_frame_index not int: {pfi}"
 
+
+@pytest.mark.skipif(not VIDEO.exists(), reason="reference video missing")
+def test_refvideo_center_crop_keeps_detection(tmp_path: Path):
+    """A preview crop + resize-to-reference must not break detection.
+
+    Mobile uploads a landscape stream cropped to a portrait center slice, then
+    the pipeline resizes the cropped frame back to the config's 720x1280 so the
+    fixed-pixel detector thresholds (lcd_detect.min_area, mouse_detect.min_area)
+    stay valid. This asserts the record count matches the no-crop baseline,
+    proving the crop+scale path does not silently drop detections.
+    """
+    config = load_config(CONFIG)
+    templates = ROOT / config.get("templates_dir", "assets/templates")
+    pipeline = WeighingPipeline(config, templates)
+    # Center crop keeping the central 80% width / full height - a realistic
+    # portrait center slice of a landscape stream, then resized back to 720x1280.
+    crop = {"x": 0.1, "y": 0.0, "w": 0.8, "h": 1.0}
+    result = pipeline.run_video(
+        VIDEO,
+        cage_id="C57-023",
+        output_root=tmp_path,
+        stop_after_first=False,
+        create_run=True,
+        crop=crop,
+    )
+    records = result.records or []
+    # The same 8 sessions must still be detected after crop + resize: if the
+    # resize did not restore the reference geometry, LCD area would fall below
+    # min_area and records would be lost.
+    assert len(records) == 8, f"expected 8 records after crop, got {len(records)}"
+    # Every record must have a readable weight (LCD OCR survived the resize).
+    for rec in records:
+        assert rec.get("weight") is not None, rec
+

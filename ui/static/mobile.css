@@ -178,8 +178,7 @@ html, body {
   position: relative; flex: 1; display: flex; align-items: center; justify-content: center;
   overflow: hidden; background: #000;
 }
-.camera-stage video { width: 100%; height: 100%; object-fit: cover; }
-.record-stage video { object-fit: contain; }
+.camera-stage video { width: 100%; height: 100%; object-fit: cover; object-position: center; }
 .scan-frame {
   position: absolute; width: 62vw; height: 62vw; max-width: 280px; max-height: 280px;
   border: 3px solid var(--green); border-radius: 18px;
@@ -191,6 +190,9 @@ html, body {
 }
 .weighing-guides {
   position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   pointer-events: none;
   overflow: visible;
 }
@@ -242,8 +244,8 @@ html, body {
 }
 .rec-timer {
   position: absolute; top: calc(14px + var(--safe-top)); left: 50%; transform: translateX(-50%);
-  display: flex; align-items: center; gap: 7px; font-weight: 600; font-variant-numeric: tabular-nums;
 }
+.rec-timer:not([hidden]) { display: flex; align-items: center; gap: 7px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .25; } }
 .shutter-bar {

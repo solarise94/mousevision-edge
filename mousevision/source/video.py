@@ -30,6 +30,8 @@ class VideoFileSource:
         max_frames: int | None = None,
         start_ms: float | None = None,
         end_ms: float | None = None,
+        crop: dict[str, float] | None = None,
+        target_size: tuple[int, int] | None = None,
     ) -> None:
         self.path = Path(path)
         if not self.path.exists():
@@ -39,6 +41,24 @@ class VideoFileSource:
         self.start_ms = start_ms
         self.end_ms = end_ms
         self._cap: cv2.VideoCapture | None = None
+        # Normalized crop region of the *full* recorded frame the client
+        # actually saw on screen (keys x,y,w,h, each in [0,1]). Mobile records
+        # a landscape stream but previews a portrait center crop via CSS
+        # object-fit:cover; ``crop`` reproduces that visible region so OCR /
+        # mouse detection only analyse what the operator framed - the rest of
+        # the landscape clip (off-screen left/right) is excluded. ``None`` keeps
+        # the legacy full-frame behaviour for CLI / tests. Resolved to absolute
+        # pixel bounds on the first decoded frame.
+        self.crop = crop
+        self._crop_px: tuple[int, int, int, int] | None = None
+        # Optional (width, height) to resize each frame to *after* cropping.
+        # The LCD/mouse detectors use fixed pixel thresholds (lcd_detect.min_area,
+        # mouse_detect.min_area, ...) tuned for the reference 720x1280 frame; a
+        # center crop shrinks the frame and would drop LCD area below those
+        # thresholds. Resizing the cropped frame back to the reference geometry
+        # keeps the thresholds meaningful. Only applied when a crop is set;
+        # ``None`` leaves the (already-cropped) frame at native resolution.
+        self.target_size = target_size
 
     def probe(self) -> dict[str, float]:
         """Read container-level metadata without decoding frames.
@@ -97,6 +117,35 @@ class VideoFileSource:
             ok, image = self._cap.read()
             if not ok:
                 break
+            # Resolve the absolute pixel crop box once, from the first decoded
+            # frame's real dimensions. The recorded stream's width/height are
+            # not knowable from container props alone for fragmented MP4, so we
+            # defer to image.shape. Only the visible region the operator framed
+            # is fed downstream; the full landscape clip is retained on disk.
+            if self.crop is not None and self._crop_px is None:
+                fh, fw = image.shape[:2]
+                c = self.crop
+                cx = max(0, min(int(round(float(c.get("x", 0.0)) * fw)), fw))
+                cy = max(0, min(int(round(float(c.get("y", 0.0)) * fh)), fh))
+                cw = max(0, min(int(round(float(c.get("w", 1.0)) * fw)), fw - cx))
+                ch = max(0, min(int(round(float(c.get("h", 1.0)) * fh)), fh - cy))
+                if cw <= 0 or ch <= 0:
+                    # Degenerate crop: fall back to full frame rather than yield
+                    # an empty image (which would break downstream shape checks).
+                    self.crop = None
+                else:
+                    self._crop_px = (cx, cy, cw, ch)
+            if self._crop_px is not None:
+                cx, cy, cw, ch = self._crop_px
+                image = image[cy:cy + ch, cx:cx + cw]
+                # Restore the reference geometry so the fixed-pixel detector
+                # thresholds (tuned for 720x1280) remain valid after the crop
+                # shrank the frame. Uses INTER_LINEAR for speed; analysis does
+                # not need sub-pixel fidelity here.
+                if self.target_size is not None:
+                    tw, th = self.target_size
+                    if image.shape[1] != tw or image.shape[0] != th:
+                        image = cv2.resize(image, (tw, th), interpolation=cv2.INTER_LINEAR)
             timestamp_ms = (index / fps) * 1000.0
             if self.end_ms is not None and timestamp_ms > self.end_ms:
                 break

@@ -53,6 +53,7 @@ class WeighingPipeline:
         persist: bool = True,
         start_ordinal: int = 1,
         project_id: str = "default",
+        crop: dict[str, float] | None = None,
     ) -> PipelineResult:
         stride = (
             frame_stride
@@ -100,7 +101,20 @@ class WeighingPipeline:
             project_id=project_id,
         )
 
-        source = VideoFileSource(video_path, frame_stride=stride)
+        # When a preview crop is applied (mobile uploads), resize the cropped
+        # frame back to the config's reference geometry so the fixed-pixel
+        # detector thresholds (lcd_detect.min_area, mouse_detect.min_area, ...)
+        # stay meaningful. frame_width/frame_height describe the reference
+        # video the thresholds were tuned against.
+        target_size = None
+        if crop is not None:
+            fw = int(self.config.get("frame_width") or 0)
+            fh = int(self.config.get("frame_height") or 0)
+            if fw > 0 and fh > 0:
+                target_size = (fw, fh)
+        source = VideoFileSource(
+            video_path, frame_stride=stride, crop=crop, target_size=target_size
+        )
         try:
             for frame in source.frames():
                 event = driver.process_frame(frame)
