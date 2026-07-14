@@ -32,6 +32,21 @@ html, body {
   overscroll-behavior-y: none;
 }
 
+/* Camera routes are edge-to-edge.  The class is toggled by the camera views
+   so a dynamic browser toolbar cannot reveal the app's light page background
+   underneath the fixed capture surface. */
+html.camera-mode,
+html.camera-mode body {
+  background: #000;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+html.camera-mode #app {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+}
+
 .app-root { min-height: 100vh; }
 
 .loading-splash {
@@ -174,12 +189,27 @@ html, body {
 
 /* ---------- Camera ---------- */
 .camera-screen {
+  /* Keep the capture page pinned to the visual viewport.  Without a fixed
+     containing block, iOS/embedded browsers can leave the document's body
+     exposed when their bottom toolbar expands or collapses. */
+  position: fixed;
+  inset: 0;
+  width: 100%;
   height: 100vh;
   height: 100dvh;
-  min-height: 0;
+  min-height: 100svh;
   overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
   background: #000;
   color: #fff;
+}
+.camera-screen button,
+.camera-screen input,
+.camera-screen video,
+.camera-screen canvas {
+  /* Keep controls tappable while the camera surface itself does not pan. */
+  touch-action: manipulation;
 }
 .camera-screen .appbar { flex: 0 0 auto; }
 .camera-stage {
@@ -251,14 +281,6 @@ html, body {
   object-fit: cover;
   object-position: center;
 }
-.system-preview {
-  display: block;
-  width: 100%;
-  max-height: 55vh;
-  margin: 12px 0;
-  background: #000;
-  border-radius: 12px;
-}
 .analysis-preview {
   display: block;
   width: 100%;
@@ -268,18 +290,6 @@ html, body {
   border-radius: 12px;
   object-fit: contain;
 }
-.system-cam-cta {
-  position: absolute;
-  left: 16px;
-  right: 16px;
-  bottom: calc(120px + var(--safe-bottom));
-  z-index: 4;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  align-items: stretch;
-}
-.system-cam-cta .btn { width: 100%; }
 .scan-frame {
   position: absolute; width: 62vw; height: 62vw; max-width: 280px; max-height: 280px;
   border: 3px solid var(--green); border-radius: 18px;

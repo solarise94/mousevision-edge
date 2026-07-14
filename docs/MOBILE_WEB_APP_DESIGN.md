@@ -556,7 +556,7 @@ C57BL/6 · 2025-07-08 · 共 12 只
 与 [WEB_APP_FRAMEWORK.md §6](./WEB_APP_FRAMEWORK.md) 一致：
 
 - **HTTPS + 有效证书**：`getUserMedia` 实时预览与录制
-- **HTTP 内网**：降级为系统相机/相册 `<input capture="environment">`
+- **HTTP 内网**：当前录制页不再提供系统相机降级；应切换到 HTTPS。后端保留历史系统视频兼容。
 - 部署拓扑：`手机 HTTPS → Caddy/Nginx → http://edge:8766`
 
 ### 7.2 二维码扫描

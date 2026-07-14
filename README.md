@@ -57,14 +57,14 @@ python -m ui.app
 
 ## Web 录像与后台分析
 
-项目现已包含一个手机优先的 Web 基本框架：浏览器后置相机录像或系统相机选视频，上传后生成独立 `job_id`，后端单 worker 串行调用现有 OCR/曲线分析管线，并返回批次报告。
+项目现已包含一个手机优先的 Web 基本框架：浏览器后置相机通过 Canvas 录像（取景框所见即上传像素），上传后生成独立 `job_id`，后端单 worker 串行调用现有 OCR/曲线分析管线，并返回批次报告。后端仍兼容历史 `system` 视频上传，但当前手机录制页不再提供系统相机回退入口。
 
 - 手机入口：`/mobile`
 - 任务 API：`/api/jobs`
 - 健康检查：`/api/health`
 - Podman 与 HTTPS 说明：[docs/WEB_APP_FRAMEWORK.md](docs/WEB_APP_FRAMEWORK.md)
 
-浏览器直接调用手机摄像头需要 HTTPS；通过普通内网 HTTP 地址时仍可使用系统相机/相册上传兜底。
+浏览器直接调用手机摄像头需要 HTTPS；普通内网 HTTP 地址无法使用当前网页录制页时，应改用 HTTPS 或支持网页相机的浏览器。
 
 ## 架构要点
 

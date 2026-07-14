@@ -643,7 +643,7 @@ class AnalysisJobManager:
         # - canvas: client already recorded a 720x1280 center-cropped canvas
         #   stream — do NOT apply preview_crop; optionally normalize size.
         # - css_crop / unset: legacy path using preview_crop coordinates.
-        # - system: file input / system camera; no crop; full-frame analysis.
+        # - system: legacy system-camera upload; no crop; full-frame analysis.
         capture_mode = str(job.get("capture_mode") or "").strip().lower()
         if capture_mode == "canvas":
             # Do not trust the client label alone: verify structured meta and

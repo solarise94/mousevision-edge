@@ -509,6 +509,7 @@
    * 视图：扫码选箱 (屏 2)
    * ================================================================== */
   async function viewScan() {
+    document.documentElement.classList.add("camera-mode");
     const screen = h("div", { class: "screen camera-screen" });
     screen.appendChild(
       appbar("扫描箱号二维码", { back: "/", transparent: true })
@@ -634,6 +635,7 @@
     }
 
     return () => {
+      document.documentElement.classList.remove("camera-mode");
       scanning = false;
       stopStream(stream);
     };
@@ -655,6 +657,7 @@
       go("/scan");
       return;
     }
+    document.documentElement.classList.add("camera-mode");
     const box = state.currentBox;
     const screen = h("div", { class: "screen camera-screen" });
     const titleEl = h("h1", {}, `录制准备 · ${box.cageId}`);
@@ -703,36 +706,12 @@
       guides,
       hint,
     ]);
-    const openSystemBtn = h(
-      "button",
-      { class: "btn primary", type: "button" },
-      "打开系统相机"
-    );
-    const systemCta = h("div", { class: "system-cam-cta", hidden: true }, [
-      openSystemBtn,
-    ]);
     const stage = h("div", { class: "camera-stage record-stage" }, [
       viewport,
       recTimer,
-      systemCta,
       h("div", { class: "shutter-bar" }, [switchCamBtn, shutter]),
     ]);
     screen.appendChild(stage);
-
-    const fileInput = h("input", {
-      type: "file",
-      accept: "video/*",
-      capture: "environment",
-      hidden: true,
-    });
-    fileInput.onchange = () => {
-      const f = fileInput.files && fileInput.files[0];
-      // Clear so the same file can be re-selected after cancel/retry.
-      fileInput.value = "";
-      if (f) confirmSystemClip(f, f.name || `mv-${Date.now()}.mp4`);
-    };
-    stage.appendChild(fileInput);
-    openSystemBtn.addEventListener("click", () => fileInput.click());
     mount(screen);
 
     let stream = null;
@@ -860,19 +839,20 @@
       };
     }
 
-    function fallbackToSystemCamera(reason) {
+    function disableRecording(reason) {
       useCanvas = false;
       paintedReady = false;
       setShutterArmed(false);
-      hint.textContent = reason || "请用系统相机录制，拍完后确认小鼠和读数清晰";
+      hint.textContent = reason || "当前浏览器无法进行网页录像，请更换浏览器后重试";
       shutter.classList.add("hidden");
       switchCamBtn.hidden = true;
-      systemCta.hidden = false;
       stopDraw();
       stopStream(stream);
       stream = null;
-      // Do NOT auto-click fileInput — mobile browsers require a user gesture.
-      // Keep the explicit button so cancel still leaves a retry path.
+      if (canvasStream) {
+        canvasStream.getTracks().forEach((t) => t.stop());
+        canvasStream = null;
+      }
     }
 
     async function startCamera(deviceId) {
@@ -885,7 +865,7 @@
       lastSourceSize = videoSourceSize(video, stream);
       const facing = (settings.facingMode || "").toLowerCase();
       if (facing && facing !== "environment") {
-        hint.textContent = "当前可能是前置摄像头，请点「切换摄像头」或改用系统相机";
+        hint.textContent = "当前可能是前置摄像头，请点「切换摄像头」";
         switchCamBtn.hidden = false;
         toast("未检测到后置摄像头，请切换");
       } else {
@@ -913,7 +893,7 @@
 
     (async () => {
       if (!useCanvas) {
-        fallbackToSystemCamera("浏览器不支持 Canvas 录像，改用系统相机");
+        disableRecording("浏览器不支持网页录像，请更换浏览器后重试");
         return;
       }
       try {
@@ -924,7 +904,7 @@
           window.screen.orientation.lock("portrait").catch(() => {});
         }
       } catch (err) {
-        fallbackToSystemCamera("实时相机需 HTTPS，改用系统相机录制");
+        disableRecording("无法打开实时相机，请确认 HTTPS 与摄像头权限");
       }
     })();
 
@@ -935,8 +915,8 @@
 
     function startRec() {
       if (!useCanvas || !stream || !window.MediaRecorder || typeof canvas.captureStream !== "function") {
-        toast("不支持网页录像，使用系统相机");
-        fallbackToSystemCamera();
+        toast("当前浏览器不支持网页录像，请更换浏览器后重试");
+        disableRecording();
         return;
       }
       // Require a successful paint — never record black/frozen frames.
@@ -948,8 +928,8 @@
       try {
         canvasStream = canvas.captureStream(15);
       } catch (err) {
-        toast("无法录制 Canvas，改用系统相机");
-        fallbackToSystemCamera();
+        toast("无法录制当前画面，请稍后重试");
+        disableRecording("无法录制当前画面，请更换浏览器后重试");
         return;
       }
       const mime = pickMime();
@@ -959,8 +939,8 @@
       catch (_) {
         try { recorder = new MediaRecorder(canvasStream); }
         catch (err2) {
-          toast("MediaRecorder 不可用，改用系统相机");
-          fallbackToSystemCamera();
+          toast("当前浏览器不支持网页录像，请更换浏览器后重试");
+          disableRecording();
           return;
         }
       }
@@ -1017,53 +997,8 @@
       renderUploading(box, blob, filename, durationSec, uploadOpts || {});
     }
 
-    function confirmSystemClip(file, filename) {
-      stopDraw();
-      stopStream(stream);
-      stream = null;
-      const url = URL.createObjectURL(file);
-      const screen2 = h("div", { class: "screen" });
-      screen2.appendChild(appbar("确认录像", { back: "/record" }));
-      const preview = h("video", {
-        class: "system-preview",
-        controls: "",
-        playsinline: "",
-        src: url,
-      });
-      const content = h("div", { class: "content" }, [
-        h("div", { class: "card" }, [
-          h("div", { class: "card-title" }, "请确认小鼠与 LCD 均清晰"),
-          preview,
-          h("p", { class: "li-sub" }, "系统相机无法显示绿黄框；确认画面可用后再上传。"),
-          h("button", {
-            class: "btn primary",
-            onClick: () => {
-              URL.revokeObjectURL(url);
-              doUpload(file, filename, null, {
-                captureMode: "system",
-                captureMeta: {
-                  client_version: CLIENT_VERSION,
-                  capture_mode: "system",
-                  user_agent: (navigator.userAgent || "").slice(0, 240),
-                },
-              });
-            },
-          }, "确认上传"),
-          h("button", {
-            class: "btn ghost",
-            onClick: () => {
-              URL.revokeObjectURL(url);
-              go("/record");
-            },
-          }, "重新录制"),
-        ]),
-      ]);
-      screen2.appendChild(content);
-      app.innerHTML = "";
-      mount(screen2);
-    }
-
     return () => {
+      document.documentElement.classList.remove("camera-mode");
       clearInterval(clockTimer);
       stopDraw();
       if (viewportObserver) {
