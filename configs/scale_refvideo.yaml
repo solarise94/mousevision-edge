@@ -34,7 +34,7 @@ templates_dir: assets/templates
 weight_reader: template
 ocr_api:
   base_url: http://mousevision-lcd-ocr:8768
-  timeout_ms: 500
+  timeout_ms: 5000
 
 # Template matching / OCR confidence floor
 match_threshold: 0.50
