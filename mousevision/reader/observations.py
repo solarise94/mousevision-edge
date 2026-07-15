@@ -1,0 +1,40 @@
+"""Structured weight observations between OCR service and temporal fusion."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RawWeightObservation:
+    weight: float | None
+    digits: list[str] = field(default_factory=list)
+    digit_confidences: list[float] = field(default_factory=list)
+    quality: float = 0.0
+    status: str = "unreadable"  # readable | zero_display | unreadable | bad_roi
+    screen_quad: list[list[float]] | None = None
+    locator_confidence: float = 0.0
+    locator: str | None = None
+    model_version: str | None = None
+    confidence: float = 0.0
+    raw_text: str = ""
+    latency_ms: float = 0.0
+
+    @property
+    def is_readable(self) -> bool:
+        return self.status == "readable" and self.weight is not None
+
+    @property
+    def is_zero_display(self) -> bool:
+        return self.status == "zero_display"
+
+
+@dataclass
+class StableWeightObservation:
+    weight: float
+    confidence: float
+    digits: list[str] = field(default_factory=list)
+    reason: str = "consensus"
+    needs_review: bool = False
+    review_reason: str = ""
+    screen_quad: list[list[float]] | None = None

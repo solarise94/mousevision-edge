@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     LCD_OCR_HOST=0.0.0.0 \
     LCD_OCR_PORT=8768 \
-    LCD_OCR_DEVICE=GPU
+    LCD_OCR_DEVICE=CPU
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -14,7 +14,6 @@ RUN apt-get update \
         libglib2.0-0 \
         libgomp1 \
         libgl1 \
-        ocl-icd-libopencl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,11 +22,12 @@ COPY requirements.txt ./
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt
 
-COPY lcd.py parse.py engine.py app.py ./
+COPY schemas.py locator.py normalize.py sevenseg_classic.py profile.py lcd.py parse.py engine.py app.py accept_0001.py ./
+COPY configs ./configs
 
 EXPOSE 8768
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl --fail http://127.0.0.1:8768/health || exit 1
 
 CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8768"]

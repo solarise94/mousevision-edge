@@ -23,6 +23,11 @@ class StateMachineConfig:
     leave_max: float = 0.30
     leave_hold_frames: int = 8
     weighing_min_samples: int = 5
+    # After saving a session, require this many near-empty frames before the
+    # next ENTER — blocks post-platform OCR garbage (23.x after 22.75).
+    empty_arm_frames: int = 5
+    # Absolute cooldown after a saved session (ms) before next ENTER is allowed.
+    reenter_cooldown_ms: float = 2500.0
 
 
 @dataclass
@@ -47,12 +52,17 @@ class WeighingStateMachine:
         self.session = SessionData()
         self._nonzero_count = 0
         self._leave_count = 0
+        self._platform_ref: float | None = None
+        self._arming = False
+        self._empty_arm_count = 0
+        self._reenter_after_ms: float = 0.0
         self.history: list[StateTransition] = []
 
     def reset_session(self) -> None:
         self.session = SessionData()
         self._nonzero_count = 0
         self._leave_count = 0
+        self._platform_ref = None
         self.history.clear()
 
     def _set_state(self, new_state: WeighingState, timestamp_ms: float, reason: str) -> None:
@@ -77,6 +87,11 @@ class WeighingStateMachine:
                 frame_index=frame_index,
             )
         )
+        if weight > self.config.enter_min:
+            if self._platform_ref is None:
+                self._platform_ref = float(weight)
+            elif abs(float(weight) - self._platform_ref) <= 1.0:
+                self._platform_ref = 0.85 * self._platform_ref + 0.15 * float(weight)
 
     def update(
         self,
@@ -84,15 +99,35 @@ class WeighingStateMachine:
         weight: float | None,
         confidence: float,
         frame_index: int,
+        *,
+        mouse_present: bool | None = None,
     ) -> WeighingState:
-        """Feed one sample. Returns current state after update."""
+        """Feed one sample. Returns current state after update.
+
+        Confirmed 0g with mouse still detected holds leave. Unreadable frames
+        still count toward leave. After ANALYZE→EMPTY, require empty_arm_frames
+        of near-empty before the next ENTER.
+        """
         cfg = self.config
         # Only ENTER/WEIGHING contribute to the weighing curve (not LEAVE).
         if self.state in {WeighingState.ENTER, WeighingState.WEIGHING} and weight is not None:
             self._append(timestamp_ms, weight, confidence, frame_index)
 
         if self.state == WeighingState.EMPTY:
-            if weight is not None and weight >= cfg.enter_min:
+            near_empty = weight is None or weight <= cfg.leave_max
+            if timestamp_ms < self._reenter_after_ms:
+                # Absolute post-session cooldown — ignore phantom platforms.
+                if near_empty:
+                    self._empty_arm_count += 1
+                return self.state
+            if self._arming:
+                if near_empty:
+                    self._empty_arm_count += 1
+                    if self._empty_arm_count >= cfg.empty_arm_frames:
+                        self._arming = False
+                else:
+                    self._empty_arm_count = 0
+            elif weight is not None and weight >= cfg.enter_min:
                 self.reset_session()
                 self._append(timestamp_ms, weight, confidence, frame_index)
                 self.session.enter_ms = timestamp_ms
@@ -112,9 +147,12 @@ class WeighingStateMachine:
                 self.reset_session()
 
         elif self.state == WeighingState.WEIGHING:
-            # Leave when weight is near-zero OR unreadable (hand/occlusion).
-            # Only a clear above-leave reading resets the counter.
-            if weight is None or weight <= cfg.leave_max:
+            confirmed_zero = weight is not None and weight <= cfg.leave_max
+            missing = weight is None
+            # Hold leave only on confirmed 0g while mouse still detected.
+            if confirmed_zero and mouse_present:
+                self._leave_count = 0
+            elif confirmed_zero or missing:
                 self._leave_count += 1
                 if self._leave_count >= cfg.leave_hold_frames:
                     self.session.leave_ms = timestamp_ms
@@ -133,3 +171,6 @@ class WeighingStateMachine:
     def finish_analyze(self, timestamp_ms: float) -> None:
         self._set_state(WeighingState.EMPTY, timestamp_ms, "record_saved")
         self.reset_session()
+        self._arming = True
+        self._empty_arm_count = 0
+        self._reenter_after_ms = float(timestamp_ms) + float(self.config.reenter_cooldown_ms)

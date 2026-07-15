@@ -2,16 +2,26 @@
 
 通用 OCR（RapidOCR / PP-OCRv6 + OpenVINO）读电子秤 LCD，供分析管线与复核工具共用。
 
+> 下一阶段将切换为：**无状态单帧 OCR 服务（定位吸附 + 七段码）+ mousevision 侧时序融合**；
+> RapidOCR 仅作审计/实验回退。阶段 B 强制先做无 CNN 验证。实施设计见
+> [`LCD_SEVEN_SEGMENT_UPGRADE.md`](LCD_SEVEN_SEGMENT_UPGRADE.md)。
+
 ## 门禁
 
-**先验收，再把主流程切到 `http_ocr`。**
+**先验收，再把主流程切到 `http_ocr`。** 两套都要过：
+
+1. **关键帧**：定位与单帧数字识别（`accept_0001.py`）
+2. **端到端 replay**：0001 必须 9 个 session，且第 1、7、9 次正确
 
 ```bash
-# 本机 CPU 验收（Mac 无 Iris Xe 时自动走 CPU）
-LCD_OCR_DEVICE=CPU python services/lcd_ocr/accept_0001.py tmp_ocr_acceptance/0001
+# 本机 CPU 验收（默认读 tests/fixtures/lcd_ocr/0001，可换临时目录）
+LCD_OCR_DEVICE=CPU python services/lcd_ocr/accept_0001.py
+# 或：python services/lcd_ocr/accept_0001.py tmp_ocr_acceptance/0001
 ```
 
-关键用例：`mouse_004`（原 8.38 → 应约 23.8）、以及 `scan5/t46xxx` 平台帧（约 24.1）。不通过则不要改 `weight_reader`。
+当前关键帧用例（版本库 `tests/fixtures/lcd_ocr/0001/`）：
+`mouse_004`（约 23.8）、`scan5` 平台帧（约 24.1）、`m2_photo_21.60`（`1`→`2` 回归）、
+以及端到端 9 session 门禁。不通过则不要改 `weight_reader`。
 
 ## API
 
@@ -65,8 +75,18 @@ systemctl --user start mousevision-lcd-ocr.service
 
 ## 本地跑服务
 
+主路径已改为：**HSV/hint 四角定位 → 透视校正 → 固定四槽位经典七段码**。
+RapidOCR 不再默认加载（仅 `LCD_OCR_AUDIT=1` 时懒加载审计）。
+
 ```bash
 cd services/lcd_ocr
 pip install -r requirements.txt
-LCD_OCR_DEVICE=CPU uvicorn app:app --host 127.0.0.1 --port 8768
+uvicorn app:app --host 127.0.0.1 --port 8768
+```
+
+调试：
+
+```bash
+python tools/export_lcd_debug.py path/to/frame.jpg -o tmp_lcd_debug
+python tools/compare_stage_b.py path/to/frame.jpg
 ```

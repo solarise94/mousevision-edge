@@ -52,15 +52,28 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(1)
     if args.all:
         print(f"sessions={len(records)} cage_id={args.cage_id}")
+        review_n = 0
         for i, rec in enumerate(records, 1):
             hist = rec.get("state_history") or []
+            needs = bool(rec.get("needs_review"))
+            if needs:
+                review_n += 1
+            flag = " REVIEW" if needs else ""
+            reason = rec.get("review_reason") or ""
             print(
                 f"  #{i:02d} ordinal={rec.get('ordinal')} cage={rec.get('cage_id')} "
                 f"weight={rec.get('weight')} conf={rec.get('confidence')} "
+                f"needs_review={needs}{flag} "
                 f"history_len={len(hist)} record_id={str(rec.get('record_id', ''))[:8]}"
             )
+            if needs and reason:
+                print(f"       review_reason={reason}")
             if result.output_dirs:
                 print(f"       dir={result.output_dirs[i - 1]}")
+        clean = len(records) - review_n
+        print(f"summary: clean={clean} needs_review={review_n} total={len(records)}")
+        if review_n:
+            print("NOTE: needs_review sessions are not gate-clean — do not treat as passed")
     else:
         print(f"output: {result.output_dir}")
         print(json.dumps(result.record, indent=2, ensure_ascii=False))

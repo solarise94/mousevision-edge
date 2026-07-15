@@ -21,6 +21,9 @@ class CurveAnalyzerConfig:
     # Defenses against OCR misreads feeding the platform picker.
     min_reader_confidence: float = 0.35
     max_jump_grams: float = 5.0
+    # Soft jump handling: down-weight spikes instead of deleting from the curve.
+    drop_jump_outliers: bool = False
+    jump_confidence_penalty: float = 0.25
     min_platform_points: int = 3
     prefer_nonzero_platform: bool = True
 
@@ -82,7 +85,10 @@ def _filter_curve(
     indices: np.ndarray,
     cfg: CurveAnalyzerConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Drop low-confidence points and large adjacent jumps."""
+    """Drop low-confidence points; soft-penalize (or optionally drop) jump spikes.
+
+    Raw session curves are preserved upstream; this only affects platform picking.
+    """
     keep = confs >= cfg.min_reader_confidence
     if not np.any(keep):
         return times, weights, confs, indices
@@ -92,6 +98,7 @@ def _filter_curve(
         return times, weights, confs, indices
 
     jump_keep = np.ones(len(weights), dtype=bool)
+    adjusted = confs.astype(np.float64, copy=True)
     for i in range(1, len(weights) - 1):
         prev_w, cur_w, next_w = float(weights[i - 1]), float(weights[i]), float(weights[i + 1])
         # Isolated spike: far from both neighbors while neighbors agree.
@@ -100,8 +107,13 @@ def _filter_curve(
             and abs(cur_w - next_w) > cfg.max_jump_grams
             and abs(prev_w - next_w) <= cfg.max_jump_grams
         ):
-            jump_keep[i] = False
-    return times[jump_keep], weights[jump_keep], confs[jump_keep], indices[jump_keep]
+            if cfg.drop_jump_outliers:
+                jump_keep[i] = False
+            else:
+                adjusted[i] = max(0.0, float(adjusted[i]) - cfg.jump_confidence_penalty)
+    if cfg.drop_jump_outliers:
+        return times[jump_keep], weights[jump_keep], adjusted[jump_keep], indices[jump_keep]
+    return times, weights, adjusted, indices
 
 
 class WeightCurveAnalyzer:
@@ -169,8 +181,20 @@ class WeightCurveAnalyzer:
 
         best: tuple[int, int, float, float] | None = None
         if candidates:
-            candidates.sort(key=lambda c: c[0], reverse=True)
-            _score, i0, i1, median, std = candidates[0]
+            # Classic 4↔9 (~5g): down-weight the higher twin when both exist.
+            adjusted: list[tuple[float, int, int, float, float]] = []
+            for score, i0, i1, median, std in candidates:
+                pen = 1.0
+                for _s2, _a, _b, median2, _std2 in candidates:
+                    if (
+                        4.5 <= abs(median - median2) <= 5.5
+                        and median > median2
+                        and median2 > self.config.near_zero
+                    ):
+                        pen = min(pen, 0.55)
+                adjusted.append((score * pen, i0, i1, median, std))
+            adjusted.sort(key=lambda c: c[0], reverse=True)
+            _score, i0, i1, median, std = adjusted[0]
             best = (i0, i1, median, std)
 
         if best is None:
