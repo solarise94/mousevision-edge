@@ -26,8 +26,6 @@ def test_parse_zero():
     assert r.weight == 0.0
 
 
-def test_parse_rejects_garbage():
-    r = parse_weight_text("AL22", 0.5)
-    # May or may not parse; if it does must stay in range
-    if r.weight is not None:
-        assert 0 <= r.weight <= 80
+def test_parse_rejects_alphanumeric_junk():
+    r = parse_weight_text("61F2 g", 0.9)
+    assert r.weight is None

@@ -135,10 +135,21 @@ class LcdOcrEngine:
         best_raw = " | ".join(raw_all)
         best_digits: list[str] = []
         if votes:
-            # Prefer consensus among rounded values, then highest confidence.
-            rounded = [round(w, 2) for w, _, _, _ in votes]
-            consensus = max(set(rounded), key=rounded.count)
-            pool = [v for v in votes if round(v[0], 2) == consensus]
+            # Consensus by (count, mean conf); break ties toward higher conf,
+            # then prefer non-integer (XX.XX) readings typical of the LCD.
+            by_value: dict[float, list[tuple[float, float, str, list[str]]]] = {}
+            for v in votes:
+                by_value.setdefault(round(v[0], 2), []).append(v)
+
+            def rank(val: float) -> tuple[int, float, int]:
+                pool = by_value[val]
+                mean_conf = sum(p[1] for p in pool) / len(pool)
+                # Prefer fractional LCD style (23.19) over whole grams (61).
+                frac_bonus = 1 if abs(val - round(val)) > 1e-6 else 0
+                return (len(pool), mean_conf, frac_bonus)
+
+            consensus = max(by_value.keys(), key=rank)
+            pool = by_value[consensus]
             best_weight, best_conf, best_raw_one, best_digits = max(pool, key=lambda v: v[1])
             best_raw = best_raw_one if not raw_all else best_raw
 
