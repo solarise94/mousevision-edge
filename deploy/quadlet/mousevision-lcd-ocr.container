@@ -11,7 +11,7 @@ Environment=LCD_OCR_HOST=0.0.0.0
 Environment=LCD_OCR_PORT=8768
 Environment=LCD_OCR_DEVICE=GPU
 # Iris Xe render node + render group (gid from `getent group render`)
-Device=/dev/dri/renderD128:/dev/dri/renderD128
+AddDevice=/dev/dri/renderD128:/dev/dri/renderD128
 GroupAdd=990
 # Host Intel OpenCL + Level Zero stack (install: intel-opencl-icd libze1 libze-intel-gpu1)
 Volume=/etc/OpenCL/vendors:/etc/OpenCL/vendors:ro
