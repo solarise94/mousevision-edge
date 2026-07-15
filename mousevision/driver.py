@@ -96,18 +96,19 @@ class SessionDriver:
         self._pinned = False
 
     def _build_reader(self, cfg: dict[str, Any], expected: Any):
+        # Env overrides YAML so Quadlet can flip http_ocr without rebuilding config.
         reader_kind = str(
-            cfg.get("weight_reader")
-            or os.environ.get("MOUSEVISION_WEIGHT_READER")
+            os.environ.get("MOUSEVISION_WEIGHT_READER")
+            or cfg.get("weight_reader")
             or "template"
         ).lower()
         ocr_cfg = cfg.get("ocr_api") or {}
         ocr_url = (
-            ocr_cfg.get("base_url")
-            or os.environ.get("MOUSEVISION_OCR_URL")
+            os.environ.get("MOUSEVISION_OCR_URL")
+            or ocr_cfg.get("base_url")
             or ""
         ).rstrip("/")
-        # Only switch to http_ocr when explicitly configured AND url is reachable config.
+        # Only switch to http_ocr when explicitly configured AND url is set.
         if reader_kind in {"http_ocr", "ocr"} and ocr_url:
             return HttpOcrReader(
                 ocr_url,
