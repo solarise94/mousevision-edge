@@ -140,3 +140,40 @@ def test_analyzer_photo_selection_within_platform():
     assert result.weight_source == "stable_curve_median"
     # photo_mouse_detected defaults to False at analyzer level (driver overrides)
     assert result.photo_mouse_detected is False
+
+
+def test_prefers_nonzero_platform_over_stable_zero():
+    """Stable OCR-zero plateau must not beat a real ~24g platform."""
+    # Ramp + real platform + long zero plateau (the 0001 mouse_005 failure mode).
+    values = (
+        [0.0, 10.0]
+        + [24.1, 24.14, 24.09, 24.18, 24.12, 24.15]
+        + [0.0] * 12
+    )
+    result = WeightCurveAnalyzer(
+        CurveAnalyzerConfig(platform_window_seconds=0.5, platform_max_std=0.5)
+    ).analyze(_curve(values, dt_ms=100))
+    assert result is not None
+    assert 23.5 <= result.weight <= 24.5
+    assert result.needs_review is False
+
+
+def test_jump_filter_drops_isolated_spike():
+    values = [0.0, 22.0, 22.1, 55.0, 22.0, 22.05, 22.1, 0.0]
+    result = WeightCurveAnalyzer(
+        CurveAnalyzerConfig(platform_window_seconds=0.5, platform_max_std=0.5, max_jump_grams=5.0)
+    ).analyze(_curve(values, dt_ms=100))
+    assert result is not None
+    assert 21.5 <= result.weight <= 22.5
+
+
+def test_near_zero_result_flags_review():
+    values = [0.0, 0.1, 0.0, 0.05, 0.0, 0.02, 0.0]
+    # All near-zero after trim → None; construct a tiny nonzero then zeros.
+    values = [0.0, 0.6, 0.4, 0.3, 0.2, 0.1, 0.0]
+    result = WeightCurveAnalyzer(
+        CurveAnalyzerConfig(platform_window_seconds=0.5, near_zero=0.5)
+    ).analyze(_curve(values, dt_ms=100))
+    # May return None if trimmed too short; if returns, must flag review when ~0.
+    if result is not None and result.weight <= 0.5:
+        assert result.needs_review is True

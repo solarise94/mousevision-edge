@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -12,6 +13,7 @@ from mousevision.buffer import RingFrameBuffer
 from mousevision.clip import clip_bounds_from_history
 from mousevision.detect import detect_mouse_box
 from mousevision.detector import StateMachineConfig, WeighingState, WeighingStateMachine
+from mousevision.reader.http_ocr import HttpOcrReader
 from mousevision.reader.template import TemplateReader
 from mousevision.recorder import Recorder
 from mousevision.run import bump_record_count
@@ -65,14 +67,7 @@ class SessionDriver:
         cfg = self.config
         self.device_id = self.device_id or str(cfg.get("device_id", "scale01"))
         expected = cfg.get("expected_digits")
-        self.reader = TemplateReader(
-            self.templates_dir,
-            match_threshold=float(cfg.get("match_threshold", 0.5)),
-            min_digit_confidence=float(cfg.get("min_digit_confidence", 0.45)),
-            lcd_detect=cfg.get("lcd_detect"),
-            weight_roi=cfg.get("weight_roi"),
-            expected_digits=tuple(expected) if expected else (3, 4),
-        )
+        self.reader = self._build_reader(cfg, expected)
         self.buffer = RingFrameBuffer(
             window_seconds=float(cfg.get("buffer_seconds", 12)),
             max_items=int(cfg.get("buffer_max_items", 400)),
@@ -93,10 +88,42 @@ class SessionDriver:
                 near_zero=float(cfg.get("near_zero", 0.5)),
                 photo_match_tol=float(cfg.get("photo_match_tol", 0.02)),
                 photo_min_confidence=float(cfg.get("photo_min_confidence", 0.45)),
+                min_reader_confidence=float(cfg.get("min_reader_confidence", 0.35)),
+                max_jump_grams=float(cfg.get("max_jump_grams", 5.0)),
             )
         )
         self.recorder = Recorder(self.output_root, self.device_id)
         self._pinned = False
+
+    def _build_reader(self, cfg: dict[str, Any], expected: Any):
+        reader_kind = str(
+            cfg.get("weight_reader")
+            or os.environ.get("MOUSEVISION_WEIGHT_READER")
+            or "template"
+        ).lower()
+        ocr_cfg = cfg.get("ocr_api") or {}
+        ocr_url = (
+            ocr_cfg.get("base_url")
+            or os.environ.get("MOUSEVISION_OCR_URL")
+            or ""
+        ).rstrip("/")
+        # Only switch to http_ocr when explicitly configured AND url is reachable config.
+        if reader_kind in {"http_ocr", "ocr"} and ocr_url:
+            return HttpOcrReader(
+                ocr_url,
+                timeout_ms=int(ocr_cfg.get("timeout_ms", 500)),
+                lcd_detect=cfg.get("lcd_detect"),
+                weight_roi=cfg.get("weight_roi"),
+                match_threshold=float(cfg.get("match_threshold", 0.35)),
+            )
+        return TemplateReader(
+            self.templates_dir,
+            match_threshold=float(cfg.get("match_threshold", 0.5)),
+            min_digit_confidence=float(cfg.get("min_digit_confidence", 0.45)),
+            lcd_detect=cfg.get("lcd_detect"),
+            weight_roi=cfg.get("weight_roi"),
+            expected_digits=tuple(expected) if expected else (3, 4),
+        )
 
     def process_frame(self, frame: Frame) -> FrameEvent:
         weight, conf = self.reader.read_weight(frame.image)
@@ -214,6 +241,14 @@ class SessionDriver:
         analysis.photo_frame_index = photo_idx
         analysis.photo_observed_weight = observed_w
         analysis.photo_weight_delta = weight_delta
+        # Defense: mouse still on scale but OCR/platform settled at ~0g → force review.
+        near_zero = float(self.config.get("near_zero", 0.5))
+        if mouse_detected and analysis.weight <= near_zero:
+            analysis.needs_review = True
+            reason = "mouse_on_scale_zero_weight"
+            analysis.review_reason = (
+                f"{analysis.review_reason},{reason}" if analysis.review_reason else reason
+            )
         history = [
             {
                 "previous": t.previous.value,

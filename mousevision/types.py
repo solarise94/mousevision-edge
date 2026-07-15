@@ -44,6 +44,8 @@ class AnalysisResult:
     weight_source: str = "stable_curve_median"
     photo_mouse_detected: bool = False
     photo_verified: bool = False
+    needs_review: bool = False
+    review_reason: str = ""
 
 
 @dataclass

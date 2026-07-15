@@ -28,10 +28,20 @@ mouse_detect:
 
 templates_dir: assets/templates
 
-# Template matching
+# Weight reader: template (default) | http_ocr (after lcd-ocr acceptance gate)
+# Production: set MOUSEVISION_WEIGHT_READER=http_ocr and MOUSEVISION_OCR_URL=
+# to the lcd-ocr service DNS name (NOT 127.0.0.1 inside the main container).
+weight_reader: template
+ocr_api:
+  base_url: http://mousevision-lcd-ocr:8768
+  timeout_ms: 500
+
+# Template matching / OCR confidence floor
 match_threshold: 0.50
 min_digit_confidence: 0.45
 expected_digits: [3, 4]
+min_reader_confidence: 0.35
+max_jump_grams: 5.0
 
 # Ring buffer
 buffer_seconds: 12.0

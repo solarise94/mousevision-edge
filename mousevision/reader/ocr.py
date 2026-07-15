@@ -1,19 +1,25 @@
-"""OCR reader stub — reserved for alternate scale models.
-
-Mac PoC fallback can later wire PaddleOCR.
-Android edge device should use ML Kit Text Recognition instead (not PaddleOCR).
-"""
+"""OCR reader — thin local wrapper; production uses HttpOcrReader + lcd-ocr service."""
 
 from __future__ import annotations
 
 import numpy as np
 
+from mousevision.reader.http_ocr import HttpOcrReader
+
 
 class OCRReader:
-    """Placeholder. PoC uses TemplateReader; platform-specific OCR later."""
+    """Backward-compatible name; delegates to HttpOcrReader when url is set."""
+
+    def __init__(self, base_url: str | None = None, **kwargs) -> None:
+        if not base_url:
+            raise NotImplementedError(
+                "OCRReader requires base_url of the lcd-ocr service. "
+                "Use TemplateReader for offline PoC, or HttpOcrReader(base_url=...)."
+            )
+        self._inner = HttpOcrReader(base_url, **kwargs)
 
     def read_weight(self, image: np.ndarray) -> tuple[float | None, float]:
-        raise NotImplementedError(
-            "OCRReader is reserved. Use TemplateReader for PoC; "
-            "on Android prefer ML Kit, on Mac optionally PaddleOCR."
-        )
+        return self._inner.read_weight(image)
+
+    def lcd_box(self, image: np.ndarray):
+        return self._inner.lcd_box(image)

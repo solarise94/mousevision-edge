@@ -1,0 +1,31 @@
+[Unit]
+Description=MouseVision LCD OCR (RapidOCR + OpenVINO / Iris Xe)
+After=network-online.target
+
+[Container]
+Image=localhost/mousevision-lcd-ocr:latest
+ContainerName=mousevision-lcd-ocr
+PublishPort=127.0.0.1:8768:8768
+Network=mousevision.network
+Environment=LCD_OCR_HOST=0.0.0.0
+Environment=LCD_OCR_PORT=8768
+Environment=LCD_OCR_DEVICE=GPU
+# Iris Xe render node + render group (gid from `getent group render`)
+Device=/dev/dri/renderD128:/dev/dri/renderD128
+GroupAdd=990
+# Host Intel OpenCL + Level Zero stack (install: intel-opencl-icd libze1 libze-intel-gpu1)
+Volume=/etc/OpenCL/vendors:/etc/OpenCL/vendors:ro
+Volume=/usr/lib/x86_64-linux-gnu/intel-opencl:/usr/lib/x86_64-linux-gnu/intel-opencl:ro
+Volume=/usr/lib/x86_64-linux-gnu/libigdgmm.so.12:/usr/lib/x86_64-linux-gnu/libigdgmm.so.12:ro
+Volume=/usr/lib/x86_64-linux-gnu/libze_loader.so.1:/usr/lib/x86_64-linux-gnu/libze_loader.so.1:ro
+Volume=/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1:/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1:ro
+HealthCmd=curl --fail http://127.0.0.1:8768/health || exit 1
+HealthInterval=30s
+HealthStartPeriod=60s
+HealthRetries=3
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

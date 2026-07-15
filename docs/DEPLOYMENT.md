@@ -70,9 +70,12 @@ uvicorn app（python -m ui.app）
 容器走 **Quadlet**（podman 5.x systemd 集成），不是 compose 长驻：
 
 - Quadlet 配置：`~/.config/containers/systemd/mousevision.container`
+- LCD OCR（可选独立服务）：`mousevision-lcd-ocr.container` + `mousevision.network`（见 `deploy/quadlet/`、`docs/LCD_OCR_SERVICE.md`）
 - systemd 服务：`mousevision.service`（`systemctl --user`）
 - linger 已启用（VM 重启后自动拉起）
 - 容器 kill 后 systemd 自愈（Restart=always）
+
+主分析容器访问 OCR 必须用**同一网络的服务名**（例如 `http://mousevision-lcd-ocr:8768`），不要用主容器内的 `127.0.0.1:8768`。
 
 ```bash
 # 状态

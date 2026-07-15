@@ -71,7 +71,8 @@ python -m ui.app
 - 业务围绕**状态机**（EMPTY → ENTER → WEIGHING → LEAVE → ANALYZE），Camera/Video 只是 `FrameSource`
 - CLI / UI 共用 `SessionDriver`（逐帧喂帧、保存回调）
 - **批次边界**：每次扫码/整段运行创建独立 `run_<stamp>_<id>/`，箱号 `cage_id` 在批次内固定，鼠只用 `ordinal`
-- 默认读数：`TemplateReader`（7 段 LCD 模板匹配）；OCR 接口预留（Mac 可选 PaddleOCR，Android 用 ML Kit）
+- 默认读数：`TemplateReader`（7 段 LCD 模板匹配）
+- 可选独立 OCR 服务：`services/lcd_ocr`（RapidOCR + OpenVINO / Iris Xe），经 `HttpOcrReader` 调用；**须先过 0001 验收门禁再切** `weight_reader: http_ocr`（见 [`docs/LCD_OCR_SERVICE.md`](docs/LCD_OCR_SERVICE.md)）
 - LCD / 鼠只检测阈值在 `configs/*.yaml`（支持 `lcd_detect.mode: fixed` + `weight_roi`）
 - 最终体重：完整曲线回溯找平台中位数，不是“稳定 X 秒”
 - 箱号：PoC 由 CLI/UI 注入；可选 `pyzbar` 读帧内二维码；Android 阶段接 ML Kit / ZXing

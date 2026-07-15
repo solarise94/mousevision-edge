@@ -18,6 +18,11 @@ class CurveAnalyzerConfig:
     # for backward config compatibility but no longer gate photo selection.
     photo_match_tol: float = 0.02
     photo_min_confidence: float = 0.45
+    # Defenses against OCR misreads feeding the platform picker.
+    min_reader_confidence: float = 0.35
+    max_jump_grams: float = 5.0
+    min_platform_points: int = 3
+    prefer_nonzero_platform: bool = True
 
 
 def select_photo_frame(
@@ -59,6 +64,46 @@ def select_photo_frame(
     return int(indices[best]), round(observed, 2), round(delta, 3), "platform_midpoint"
 
 
+def _iqr_keep_mask(values: np.ndarray) -> np.ndarray:
+    """Boolean mask keeping points within [Q1 - 1.5 IQR, Q3 + 1.5 IQR]."""
+    if len(values) < 4:
+        return np.ones(len(values), dtype=bool)
+    q1 = float(np.percentile(values, 25))
+    q3 = float(np.percentile(values, 75))
+    iqr = q3 - q1
+    lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    return (values >= lo) & (values <= hi)
+
+
+def _filter_curve(
+    times: np.ndarray,
+    weights: np.ndarray,
+    confs: np.ndarray,
+    indices: np.ndarray,
+    cfg: CurveAnalyzerConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Drop low-confidence points and large adjacent jumps."""
+    keep = confs >= cfg.min_reader_confidence
+    if not np.any(keep):
+        return times, weights, confs, indices
+    times, weights, confs, indices = times[keep], weights[keep], confs[keep], indices[keep]
+
+    if len(weights) < 2:
+        return times, weights, confs, indices
+
+    jump_keep = np.ones(len(weights), dtype=bool)
+    for i in range(1, len(weights) - 1):
+        prev_w, cur_w, next_w = float(weights[i - 1]), float(weights[i]), float(weights[i + 1])
+        # Isolated spike: far from both neighbors while neighbors agree.
+        if (
+            abs(cur_w - prev_w) > cfg.max_jump_grams
+            and abs(cur_w - next_w) > cfg.max_jump_grams
+            and abs(prev_w - next_w) <= cfg.max_jump_grams
+        ):
+            jump_keep[i] = False
+    return times[jump_keep], weights[jump_keep], confs[jump_keep], indices[jump_keep]
+
+
 class WeightCurveAnalyzer:
     def __init__(self, config: CurveAnalyzerConfig | None = None) -> None:
         self.config = config or CurveAnalyzerConfig()
@@ -71,6 +116,12 @@ class WeightCurveAnalyzer:
         weights = np.array([p.weight for p in curve], dtype=np.float64)
         confs = np.array([p.confidence for p in curve], dtype=np.float64)
         indices = np.array([p.frame_index for p in curve], dtype=np.int64)
+
+        times, weights, confs, indices = _filter_curve(
+            times, weights, confs, indices, self.config
+        )
+        if len(weights) < 5:
+            return None
 
         # Trim leading / trailing near-zero segments.
         nonzero = weights > self.config.near_zero
@@ -96,27 +147,31 @@ class WeightCurveAnalyzer:
                 times, weights, confs, indices, mid0, mid1
             )
 
-        best_score = -1.0
-        best: tuple[int, int, float, float] | None = None  # i0, i1, median, std
-
+        candidates: list[tuple[float, int, int, float, float]] = []
         for i in range(len(weights)):
             j = i
             while j < len(weights) and (times[j] - times[i]) <= window_ms:
                 j += 1
-            if j - i < 3:
+            if j - i < self.config.min_platform_points:
                 continue
             segment = weights[i:j]
             std = float(np.std(segment))
             if std > self.config.platform_max_std:
                 continue
             median = float(np.median(segment))
-            # Prefer long + stable platforms; weight only as tiny tiebreaker.
             length_score = min(1.0, (j - i) / 15.0)
             stability = max(0.0, 1.0 - std / self.config.platform_max_std)
             score = length_score + stability + median * 0.001
-            if score > best_score:
-                best_score = score
-                best = (i, j, median, std)
+            # Prefer real weighing platforms over stable OCR-zero plateaus.
+            if self.config.prefer_nonzero_platform and median <= self.config.near_zero:
+                score *= 0.05
+            candidates.append((score, i, j, median, std))
+
+        best: tuple[int, int, float, float] | None = None
+        if candidates:
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            _score, i0, i1, median, std = candidates[0]
+            best = (i0, i1, median, std)
 
         if best is None:
             # Fallback: lowest-std window ignoring max_std hard cut.
@@ -125,13 +180,16 @@ class WeightCurveAnalyzer:
                 j = i
                 while j < len(weights) and (times[j] - times[i]) <= window_ms:
                     j += 1
-                if j - i < 3:
+                if j - i < self.config.min_platform_points:
                     continue
                 segment = weights[i:j]
                 std = float(np.std(segment))
-                if std < best_std:
-                    best_std = std
-                    best = (i, j, float(np.median(segment)), std)
+                median = float(np.median(segment))
+                # Still de-prioritize near-zero fallbacks when any heavier window exists.
+                rank_std = std + (10.0 if median <= self.config.near_zero else 0.0)
+                if rank_std < best_std:
+                    best_std = rank_std
+                    best = (i, j, median, std)
 
         if best is None:
             return None
@@ -149,19 +207,50 @@ class WeightCurveAnalyzer:
         i1: int,
     ) -> AnalysisResult:
         segment = weights[i0:i1]
-        median = float(np.median(segment))
-        std = float(np.std(segment))
+        seg_confs = confs[i0:i1]
+        mask = _iqr_keep_mask(segment)
+        filtered = segment[mask]
+        filtered_confs = seg_confs[mask]
+        if len(filtered) < max(2, self.config.min_platform_points - 1):
+            filtered = segment
+            filtered_confs = seg_confs
+            mask = np.ones(len(segment), dtype=bool)
+
+        median = float(np.median(filtered))
+        std = float(np.std(filtered))
         final_weight = round(median, 2)
-        conf = self._confidence(i1 - i0, std, float(np.mean(confs[i0:i1])))
+        conf = self._confidence(len(filtered), std, float(np.mean(filtered_confs)))
+
+        # Map filtered indices back for photo selection.
+        kept_local = np.where(mask)[0]
+        if len(kept_local) == 0:
+            kept_local = np.arange(i0, i1) - i0
+        photo_times = times[i0:i1][kept_local]
+        photo_weights = weights[i0:i1][kept_local]
+        photo_confs = confs[i0:i1][kept_local]
+        photo_indices = indices[i0:i1][kept_local]
         photo_i, observed, delta, selection = select_photo_frame(
-            times,
-            weights,
-            confs,
-            indices,
-            i0,
-            i1,
+            photo_times,
+            photo_weights,
+            photo_confs,
+            photo_indices,
+            0,
+            len(photo_times),
             final_weight,
         )
+
+        needs_review = False
+        reasons: list[str] = []
+        if len(filtered) < self.config.min_platform_points:
+            needs_review = True
+            reasons.append("few_platform_points")
+        if std > self.config.platform_max_std:
+            needs_review = True
+            reasons.append("high_platform_std")
+        if final_weight <= self.config.near_zero:
+            needs_review = True
+            reasons.append("near_zero_weight")
+
         return AnalysisResult(
             weight=final_weight,
             confidence=conf,
@@ -172,6 +261,8 @@ class WeightCurveAnalyzer:
             photo_weight_delta=delta,
             photo_selection=selection,
             weight_source="stable_curve_median",
+            needs_review=needs_review,
+            review_reason=",".join(reasons),
         )
 
     def _confidence(self, n: int, std: float, reader_conf: float) -> float:

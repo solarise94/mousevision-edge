@@ -23,6 +23,7 @@ build/
 # 运行时产物（数据、上传、调试输出）
 output/
 tmp_frames/
+tmp_ocr_acceptance/
 *.mp4.bak
 
 # 参考视频：体积较大，需手动放置（见 README）
@@ -31,7 +32,9 @@ RefVideo/*.mp4
 # 部署专用配置（含本地 token / 端口，不进仓库）
 compose.deploy.yaml
 *.container
+!deploy/quadlet/*.container
 *.service
+!deploy/quadlet/*.service
 
 # 本地凭证 / 环境
 .env

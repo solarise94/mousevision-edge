@@ -86,6 +86,8 @@ class Recorder:
                 "photo_selection": analysis.photo_selection,
                 "photo_mouse_detected": analysis.photo_mouse_detected,
                 "photo_verified": analysis.photo_verified,
+                "needs_review": analysis.needs_review,
+                "review_reason": analysis.review_reason,
                 "verification_method": "点击回放视频确认实际称重过程",
                 "state_history": state_history or [],
                 "photo_saved": image is not None,
