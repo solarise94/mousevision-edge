@@ -483,6 +483,7 @@ class AnalysisJobManager:
         self._jobs_since_prune = 0
 
     def start(self) -> None:
+        self._reconcile_held()
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -785,6 +786,29 @@ class AnalysisJobManager:
             "decoded_frames": decoded_frames,
         }
 
+
+
+    def _reconcile_held(self) -> None:
+        """Startup reconciliation: if any Pending queue rows belong to runs
+        that never passed postflight (format_suspect or crashed), re-hold them.
+        """
+        if self.upload_queue is None:
+            return
+        try:
+            pending = self.upload_queue.list_pending(limit=10000)
+            to_hold: list[str] = []
+            for row in pending:
+                record_path = Path(row.get("record_path") or "")
+                if not record_path.exists():
+                    continue
+                import json as _json
+                raw = _json.loads(record_path.read_text(encoding="utf-8"))
+                if raw.get("format_suspect"):
+                    to_hold.append(str(raw.get("record_id") or ""))
+            if to_hold:
+                self.upload_queue.hold_pending(to_hold)
+        except Exception:
+            pass
 
     def _mark_run_format_suspect(self, run_dir: Path, reason: str) -> None:
         """Mark all records under run_dir as format_suspect (stays Held)."""

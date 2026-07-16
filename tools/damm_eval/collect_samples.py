@@ -30,7 +30,7 @@ def main() -> None:
             if not jsonl.exists():
                 continue
         # Collect photo.jpg from the same mouse_NNN directory.
-        photo = jsonl.parent / "photo.jpg"
+        photo = jsonl.parent.parent / "photo.jpg"
         for line in jsonl.read_text(encoding="utf-8").strip().splitlines():
             row = json.loads(line)
             if idx >= args.max_per_session * len(args.source):
@@ -41,7 +41,7 @@ def main() -> None:
                 shutil.copy2(photo, dest)
             manifest.append({
                 "sample_id": idx,
-                "source": str(jsonl.parent),
+                "source": str(jsonl.parent.parent),
                 "frame_index": row.get("frame_index"),
                 "timestamp_ms": row.get("timestamp_ms"),
                 "ocr_weight": row.get("weight"),

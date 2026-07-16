@@ -151,6 +151,11 @@ class SessionDriver:
             or __import__("os").environ.get("MOUSEVISION_TRAINING_COLLECT", "")
         )
         self._training_obs: list[dict[str, object]] = []
+        if self._collect_training and self.use_http_ocr:
+            try:
+                self.reader._collect_assets = True
+            except Exception:
+                pass
         self._unstable_raw_range_g = float(
             (cfg.get("temporal") or {}).get("unstable_raw_range_g")
             or cfg.get("unstable_raw_range_g")
@@ -330,6 +335,12 @@ class SessionDriver:
             if self.use_http_ocr and isinstance(self.reader, HttpOcrReader):
                 self.reader.reset_tracking()
 
+        if prev_state == WeighingState.ENTER and state == WeighingState.EMPTY:
+            self.buffer.clear()
+            self._pinned = False
+            self._session_raw_samples.clear()
+            self._training_obs.clear()
+            self.fusion.reset()
 
         return event
 
@@ -642,11 +653,14 @@ class SessionDriver:
                 reason = "abort_short_session"
             elif end_reason == "session_timeout":
                 reason = "session_timeout"
+            elif end_reason == "video_eof":
+                reason = "video_eof"
             analysis = self._manual_fallback_result(
                 curve_snapshot, reason=reason, end_reason=end_reason
             )
         elif end_reason == "session_timeout":
-            # Timeout always forces manual even if a platform was found.
+            # Only session_timeout forces manual; video_eof lets the analyzer
+            # decide (a stable curve at EOF is a valid result).
             analysis.requires_manual_weight = True
             analysis.needs_review = True
             if analysis.guessed_weight is None and analysis.weight is not None:

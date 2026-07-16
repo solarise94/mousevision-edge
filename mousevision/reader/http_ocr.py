@@ -41,6 +41,7 @@ class HttpOcrReader:
         self._last_box: LcdBox | None = None
         self._last_obs: RawWeightObservation | None = None
         self._hint_age = 0
+        self._collect_assets = False
 
     def close(self) -> None:
         self._client.close()
@@ -49,6 +50,7 @@ class HttpOcrReader:
         self._last_quad = None
         self._last_box = None
         self._hint_age = 0
+        self._collect_assets = False
 
     def lcd_box(self, image: np.ndarray | None = None) -> LcdBox | None:
         """Return last known LCD bbox (from service screen_quad)."""
@@ -60,7 +62,8 @@ class HttpOcrReader:
         if not ok:
             return RawWeightObservation(weight=None, status="unreadable")
 
-        data: dict[str, Any] = {"return_debug": "false"}
+        return_debug = bool(getattr(self, "_collect_assets", False))
+        data: dict[str, Any] = {"return_debug": "true" if return_debug else "false"}
         files = {"file": ("frame.jpg", buf.tobytes(), "image/jpeg")}
         use_hint = self._last_quad is not None
         if use_hint:
@@ -69,6 +72,7 @@ class HttpOcrReader:
             if self._hint_age >= self.force_relocate_every:
                 use_hint = False
                 self._hint_age = 0
+        self._collect_assets = False
         if use_hint and self._last_quad is not None:
             data["quad_hint"] = json.dumps(self._last_quad)
         if self.weight_roi is not None and self._last_quad is None:

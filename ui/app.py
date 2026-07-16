@@ -263,7 +263,6 @@ class PlaybackEngine:
                 "source_video": s.source_video,
             }
 
-            _validate_video_codec(Path(video_path))
     def _resolve_run_video(self, source_run_id: str) -> Path | None:
         """Resolve and validate the video path recorded in a run manifest."""
         runs = self.registry.list_runs()
@@ -969,6 +968,8 @@ async def api_create_job(
                 meta_text = meta_text[:4000]
             upload_updates["capture_meta"] = meta_text
         job_store.update(job_id, **upload_updates)
+        # P1-d: validate codec before submitting analysis job.
+        _validate_video_codec(target)
         queued = job_manager.submit(job_id)
         return JSONResponse(_job_payload(queued), status_code=202)
     except HTTPException as exc:
@@ -1729,6 +1730,75 @@ class BatchRecordAction(BaseModel):
     action: str = Field(..., pattern="^(publish|unpublish|delete|restore|verify|reject)$")
 
 
+
+
+
+@app.post("/api/runs/{run_id}/release-suspect", dependencies=[Depends(require_write_access)])
+def api_release_suspect(
+    run_id: str,
+    user: dict[str, Any] = Depends(require_write_access),
+) -> dict[str, Any]:
+    """P0-b: Manually release a format_suspect run after operator confirms
+    the video is complete. Promotes all Held records to Pending and clears
+    the format_suspect flag."""
+    actor = _actor(user)
+    # Find all records under this run and release them.
+    import glob as _glob
+    output_root = Path(DEFAULT_OUTPUT)
+    run_dir = None
+    for d in sorted(output_root.glob(f"run_{run_id}*")):
+        if d.is_dir():
+            run_dir = d
+            break
+    if run_dir is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    released = 0
+    for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
+        try:
+            raw = json.loads(rec_path.read_text(encoding="utf-8"))
+            if not raw.get("format_suspect"):
+                continue
+            raw["format_suspect"] = False
+            raw["format_suspect_reason"] = ""
+            rec_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+            rid = str(raw.get("record_id") or "")
+            if rid:
+                upload_queue.release_held([rid])
+                released += 1
+        except Exception:
+            pass
+    _audit(actor, "run.release_suspect", target_type="run", target_id=run_id, detail={"released": released})
+    return {"ok": True, "run_id": run_id, "released": released}
+
+
+@app.post("/api/runs/{run_id}/reject-suspect", dependencies=[Depends(require_write_access)])
+def api_reject_suspect(
+    run_id: str,
+    user: dict[str, Any] = Depends(require_write_access),
+) -> dict[str, Any]:
+    """P0-b: Manually reject a format_suspect run. Deletes all records
+    and removes them from the upload queue."""
+    actor = _actor(user)
+    output_root = Path(DEFAULT_OUTPUT)
+    run_dir = None
+    for d in sorted(output_root.glob(f"run_{run_id}*")):
+        if d.is_dir():
+            run_dir = d
+            break
+    if run_dir is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    deleted = 0
+    for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
+        try:
+            raw = json.loads(rec_path.read_text(encoding="utf-8"))
+            rid = str(raw.get("record_id") or "")
+            if rid:
+                upload_queue.delete_by_record_id(rid)
+                deleted += 1
+        except Exception:
+            pass
+    _audit(actor, "run.reject_suspect", target_type="run", target_id=run_id, detail={"deleted": deleted})
+    return {"ok": True, "run_id": run_id, "deleted": deleted}
 
 @app.post("/api/records/{record_id}/detection-label", dependencies=[Depends(require_write_access)])
 def api_set_detection_label(

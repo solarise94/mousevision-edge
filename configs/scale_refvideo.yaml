@@ -111,4 +111,5 @@ photo_match_tol: 0.02
 photo_min_confidence: 0.45
 
 # Video processing
-frame_stride: 2  # process every Nth frame
+# Migrated to time-based sampling (P0-a): frame_stride deprecated.
+analysis_fps: 7.5

@@ -771,6 +771,7 @@
       dl,
       manualBlock,
       detectionBlock,
+      rec.format_suspect ? h("div", { class: "format-suspect-banner", style: "background:#fff3cd;border:1px solid #ffc107;padding:8px;border-radius:4px;margin:8px 0" }, h("span", null, `⚠️ 视频格式可疑: ${rec.format_suspect_reason || "截断检测未通过"}。记录已隔离。`), h("button", { class: "btn", style: "margin-left:8px", onClick: async () => { if(confirm("确认视频完整？将释放所有隔离记录。")) { await api(`/api/runs/${rec.run_id}/release-suspect`, { method: "POST" }); await loadRecords(); render(); } } }, "确认完整"), h("button", { class: "btn danger", style: "margin-left:4px", onClick: async () => { if(confirm("确认拒绝？将删除所有隔离记录。")) { await api(`/api/runs/${rec.run_id}/reject-suspect`, { method: "POST" }); await loadRecords(); render(); } } }, "拒绝删除")) : null,
       h("p", { class: "muted", style: "font-size:11px;line-height:1.5" }, helpText),
       rec.notes ? h("p", { class: "muted", style: "font-size:12px" }, `备注: ${rec.notes}`) : null,
       actions

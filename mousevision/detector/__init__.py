@@ -186,13 +186,12 @@ class WeighingStateMachine:
                         WeighingState.WEIGHING, timestamp_ms, "sustained_nonzero"
                     )
             elif weight is not None and weight <= cfg.empty_max:
-                # Short abort: keep curve/history and go ANALYZE so driver can
-                # emit a manual record instead of silently discarding.
-                self.session.leave_ms = timestamp_ms
-                self.session.end_reason = "abort_short_session"
-                self._set_state(
-                    WeighingState.ANALYZE, timestamp_ms, "abort_short_session"
-                )
+                # ENTER abort: reset to EMPTY (not ANALYZE). This is OCR noise
+                # during entry, not a real session. The P1-a short-session
+                # guarantee is handled by analyze() returning None -> driver
+                # manual fallback, not by aborting ENTER to ANALYZE.
+                self._set_state(WeighingState.EMPTY, timestamp_ms, "abort_to_empty")
+                self.reset_session()
 
         elif self.state == WeighingState.WEIGHING:
             confirmed_zero = weight is not None and weight <= cfg.leave_max

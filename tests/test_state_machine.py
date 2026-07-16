@@ -36,14 +36,14 @@ def test_full_cycle_empty_to_analyze():
 
 
 def test_abort_false_enter():
-    """Short abort after ENTER keeps curve and goes ANALYZE (manual path)."""
+    """ENTER abort resets to EMPTY (OCR noise during entry, not a real session)."""
     sm = WeighingStateMachine(
         StateMachineConfig(enter_min=1.0, weighing_min_samples=5, empty_max=0.15)
     )
     _feed(sm, [0.0, 2.0, 0.0, 0.0])
-    assert sm.state == WeighingState.ANALYZE
-    assert sm.session.end_reason == "abort_short_session"
-    assert len(sm.session.curve) >= 1
+    assert sm.state == WeighingState.EMPTY
+    # Session is reset (no curve retained).
+    assert len(sm.session.curve) == 0
 
 
 def test_history_cleared_between_sessions():

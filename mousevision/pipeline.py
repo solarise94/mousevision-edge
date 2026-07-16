@@ -173,8 +173,9 @@ class WeighingPipeline:
                     driver.sm.session.end_reason = "video_eof"
                     driver.sm._set_state(_WS.ANALYZE, last_ts, "video_eof")
                     driver._handle_analyze()
-                except Exception:
-                    pass
+                except Exception as e:
+                    import logging
+                    logging.getLogger("pipeline").warning("EOF flush failed: %s", e)
             if create_run and persist:
                 finish_run(active_run, status="completed" if driver.saved_events else "empty")
 
