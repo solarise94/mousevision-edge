@@ -87,6 +87,18 @@ def test_leave_counts_unreadable_frames():
     assert sm.state in {WeighingState.LEAVE, WeighingState.ANALYZE}
 
 
+def test_require_mouse_for_enter_blocks_weight_without_mouse_not_low_weight():
+    sm = WeighingStateMachine(
+        StateMachineConfig(
+            enter_min=1.0,
+            weighing_min_samples=2,
+            require_mouse_for_enter=True,
+        )
+    )
+    assert sm.update(100, 16.0, 0.9, 1, mouse_present=False) == WeighingState.EMPTY
+    assert sm.update(200, 2.5, 0.9, 2, mouse_present=True) == WeighingState.ENTER
+
+
 def test_mouse_present_blocks_zero_leave():
     sm = WeighingStateMachine(
         StateMachineConfig(
@@ -103,7 +115,8 @@ def test_mouse_present_blocks_zero_leave():
     sm.update(200, 0.0, 0.9, 2, mouse_present=True)
     sm.update(300, 0.0, 0.9, 3, mouse_present=True)
     assert sm.state == WeighingState.WEIGHING
-    # Unreadable must not forever-hold even if mouse blob is true.
+    # Unreadable frames eventually end the current session even if a stale
+    # mouse blob remains; they cannot re-arm the next session by themselves.
     sm.update(400, None, 0.0, 4, mouse_present=True)
     sm.update(500, None, 0.0, 5, mouse_present=True)
     assert sm.state in {WeighingState.LEAVE, WeighingState.ANALYZE}
@@ -188,6 +201,25 @@ def test_reenter_cooldown_blocks_phantom_session():
     sm.update(2600, 0.0, 0.9, 7)
     sm.update(2700, 22.75, 0.9, 8)
     assert sm.state == WeighingState.ENTER
+
+
+def test_empty_frames_during_cooldown_rearm_next_animal():
+    sm = WeighingStateMachine(
+        StateMachineConfig(
+            enter_min=1.0,
+            empty_arm_frames=3,
+            reenter_cooldown_ms=1000.0,
+            require_mouse_for_enter=True,
+        )
+    )
+    sm.finish_analyze(0)
+    sm.update(100, None, 0.0, 1, mouse_present=False)
+    sm.update(250, None, 0.0, 2, mouse_present=False)
+    sm.update(400, None, 0.0, 3, mouse_present=False)
+    # Still blocked by the absolute cooldown.
+    assert sm.update(900, 2.5, 0.9, 4, mouse_present=True) == WeighingState.EMPTY
+    # Once cooldown expires, a real low-weight animal may enter immediately.
+    assert sm.update(1100, 2.5, 0.9, 5, mouse_present=True) == WeighingState.ENTER
 
 
 def test_leave_state_not_appended_to_curve():

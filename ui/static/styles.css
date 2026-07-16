@@ -302,6 +302,26 @@ html, body {
   transform: translateY(-2px);
   border-color: rgba(61, 220, 132, 0.45);
 }
+.mouse-card.needs-review {
+  border-color: rgba(232, 140, 48, 0.65);
+}
+.mouse-card.needs-review:hover {
+  border-color: rgba(220, 70, 60, 0.7);
+}
+.mouse-card.needs-review .card-weight {
+  color: #e89c30;
+}
+.mouse-card .review-badge {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  background: rgba(180, 60, 30, 0.90);
+  color: #fff;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 700;
+}
 .mouse-card .thumb {
   position: relative;
   aspect-ratio: 3 / 4;

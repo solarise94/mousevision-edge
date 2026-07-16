@@ -1,5 +1,10 @@
 # LCD 七段码识别升级方案
 
+> **后续状态更新**：阶段 B 在 0001 上通过，但 RefVideo 的 HTTP OCR / 工作台链路仍存在
+> `0.00 → 11.11`、`17.72 → 11.76` 和 session 漏检。下一阶段不再继续调单个
+> 宽高阈值，改用开源 decoder A/B 与双视频门禁。详见
+> [`LCD_OCR_OPEN_SOURCE_BACKENDS.md`](LCD_OCR_OPEN_SOURCE_BACKENDS.md)。
+
 ## 1. 结论（已拍板）
 
 最终共识：

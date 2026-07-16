@@ -46,6 +46,10 @@ class AnalysisResult:
     photo_verified: bool = False
     needs_review: bool = False
     review_reason: str = ""
+    # Unstable settlement: keep a guess in ``weight`` for display, but require
+    # experimenter confirmation before the value counts as clean.
+    guessed_weight: float | None = None
+    requires_manual_weight: bool = False
 
 
 @dataclass

@@ -160,6 +160,12 @@ class MouseRegistry:
                     "box_id": record.get("cage_id") or record.get("box_id") or "-",
                     "weight": record.get("weight"),
                     "confidence": record.get("confidence"),
+                    "needs_review": bool(record.get("needs_review")),
+                    "review_reason": str(record.get("review_reason") or ""),
+                    "guessed_weight": record.get("guessed_weight"),
+                    "requires_manual_weight": bool(record.get("requires_manual_weight")),
+                    "weight_source": record.get("weight_source"),
+                    "clip_file": record.get("clip_file"),
                     "timestamp": record.get("timestamp")
                     or datetime.now().isoformat(timespec="seconds"),
                     "dir": rel,

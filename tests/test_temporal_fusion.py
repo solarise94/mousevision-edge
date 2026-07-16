@@ -36,6 +36,15 @@ def test_needs_three_of_five_consensus():
     assert abs(stable.weight - 22.75) < 1e-6
 
 
+def test_low_nonzero_weight_is_not_silently_filtered():
+    fusion = TemporalWeightFusion(TemporalFusionConfig(window_size=5, min_agree=3))
+    assert fusion.update(_obs(2.5)) is None
+    assert fusion.update(_obs(2.5)) is None
+    stable = fusion.update(_obs(2.5))
+    assert stable is not None
+    assert abs(stable.weight - 2.5) < 1e-6
+
+
 def test_mouse_on_zero_holds():
     fusion = TemporalWeightFusion()
     out = fusion.update(_obs(0.0, status="zero_display"), mouse_present=True)

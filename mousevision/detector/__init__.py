@@ -28,6 +28,8 @@ class StateMachineConfig:
     empty_arm_frames: int = 5
     # Absolute cooldown after a saved session (ms) before next ENTER is allowed.
     reenter_cooldown_ms: float = 2500.0
+    # HTTP OCR: require mouse on scale before ENTER (blocks phantom 10.11 opens).
+    require_mouse_for_enter: bool = False
 
 
 @dataclass
@@ -119,6 +121,13 @@ class WeighingStateMachine:
                 # Absolute post-session cooldown — ignore phantom platforms.
                 if near_empty:
                     self._empty_arm_count += 1
+                    # Empty evidence observed during cooldown is still valid;
+                    # otherwise a quickly placed next animal can never re-arm.
+                    if (
+                        self._arming
+                        and self._empty_arm_count >= cfg.empty_arm_frames
+                    ):
+                        self._arming = False
                 return self.state
             if self._arming:
                 if near_empty:
@@ -128,6 +137,9 @@ class WeighingStateMachine:
                 else:
                     self._empty_arm_count = 0
             elif weight is not None and weight >= cfg.enter_min:
+                if cfg.require_mouse_for_enter and mouse_present is not True:
+                    # Phantom non-zero OCR without a mouse — stay EMPTY.
+                    return self.state
                 self.reset_session()
                 self._append(timestamp_ms, weight, confidence, frame_index)
                 self.session.enter_ms = timestamp_ms

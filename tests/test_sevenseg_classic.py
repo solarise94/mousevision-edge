@@ -5,11 +5,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services" / "lcd_ocr"))
 
 from sevenseg_classic import compose_weight, decode_seven_seg, read_fixed_slots  # noqa: E402
+from engine import LcdOcrEngine  # noqa: E402
+from profile import load_scale_profile  # noqa: E402
 
 
 def _digit_canvas(segments: set[str], *, size: tuple[int, int] = (40, 28)) -> np.ndarray:
@@ -39,16 +42,15 @@ def test_decode_seven():
 
 
 def test_decode_bloomed_narrow_one_not_two():
-    """w/h≈0.25 with blooming a/e/g must still be 1 (21.60 regression)."""
-    h, w = 71, 16
-    dig = np.zeros((h, w), dtype=np.uint8)
-    dig[:, w - 5 :] = 255  # thick right stem only
-    # Bloom spill on left half — would otherwise look like a "2".
-    dig[2:10, 2:12] = 180
-    dig[32:40, 1:10] = 200
-    dig[55:65, 2:12] = 160
-    r = decode_seven_seg(dig)
-    assert r.char == "1"
+    """Real 21.60 fixture: blooming narrow 1 must not become 2/7."""
+    root = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "lcd_ocr" / "0001"
+    img = cv2.imread(str(root / "frames" / "m2_photo_21.60.jpg"))
+    assert img is not None
+    eng = LcdOcrEngine(scale_profile=load_scale_profile())
+    r = eng.read(img)
+    assert r.weight is not None
+    assert abs(float(r.weight) - 21.60) <= 0.35
+    assert r.digits[1] == "1"
 
 
 def test_compose_four_digits():

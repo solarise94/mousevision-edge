@@ -189,29 +189,39 @@ async function loadMice() {
   const items = data.items || [];
   lastKnownCount = items.length;
   const cage = data.cage_id || currentCageId || "-";
-  $("listStat").textContent = `箱 ${cage} · 本批次 ${items.length} 只`;
   $("btnNew").textContent = `+ 新批次单只`;
 
   const grid = $("mouseGrid");
   grid.innerHTML = "";
   $("listEmpty").hidden = items.length > 0;
 
+  const reviewN = items.filter((m) => m.needs_review).length;
+  const cleanN = items.length - reviewN;
+  $("listStat").textContent =
+    `箱 ${cage} · 本批次 ${items.length} 只` +
+    (items.length ? ` · 干净 ${cleanN} · 待复核 ${reviewN}` : "");
+
   items.forEach((m) => {
     const card = document.createElement("button");
-    card.className = "mouse-card";
+    const needsReview = !!m.needs_review;
+    card.className = needsReview ? "mouse-card needs-review" : "mouse-card";
     card.type = "button";
     const ordinal = m.ordinal ?? m.index;
+    const statusLabel = needsReview
+      ? "待复核"
+      : `评分 ${m.confidence != null ? Number(m.confidence).toFixed(2) : "-"}`;
     card.innerHTML = `
       <div class="thumb">
         <img src="${m.photo_url}?size=thumb" alt="mouse ${ordinal}" loading="lazy" />
         <span class="idx">#${String(ordinal).padStart(2, "0")}</span>
+        ${needsReview ? '<span class="review-badge">待复核</span>' : ""}
       </div>
       <div class="card-body">
         <div class="card-title">${m.label || "第 " + String(ordinal).padStart(2, "0") + " 只"}</div>
         <div class="card-weight">${fmtWeight(m.weight)}</div>
         <div class="card-meta">
           <span>${m.cage_id || m.box_id || "-"}</span>
-          <span>评分 ${m.confidence != null ? Number(m.confidence).toFixed(2) : "-"}</span>
+          <span>${statusLabel}</span>
         </div>
         <div class="card-time">${(m.timestamp || "").replace("T", " ")}</div>
       </div>

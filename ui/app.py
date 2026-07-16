@@ -576,6 +576,7 @@ class PlaybackEngine:
             persist=persist,
             on_saved=on_saved,
             upload_queue=self.upload_queue if persist else None,
+            source_video=str(play_path),
         )
         source = VideoFileSource(
             play_path,
@@ -1405,6 +1406,17 @@ def api_record(
             )
             mouse["clip_start_ms"] = raw.get("clip_start_ms")
             mouse["clip_end_ms"] = raw.get("clip_end_ms")
+            mouse["needs_review"] = bool(raw.get("needs_review", mouse.get("needs_review")))
+            mouse["review_reason"] = str(raw.get("review_reason") or mouse.get("review_reason") or "")
+            mouse["guessed_weight"] = raw.get("guessed_weight")
+            mouse["requires_manual_weight"] = bool(raw.get("requires_manual_weight"))
+            mouse["weight_source"] = raw.get("weight_source")
+            mouse["clip_file"] = raw.get("clip_file")
+            mouse["clip_url"] = (
+                f"/api/records/{record_id}/clip" if raw.get("clip_file") else None
+            )
+            if raw.get("weight") is not None:
+                mouse["weight"] = raw.get("weight")
         except Exception:
             pass
     meta = records_meta.ensure(record_id)
@@ -1465,6 +1477,121 @@ def api_record_photo(
     return _serve_photo(path, size)
 
 
+@app.get("/api/records/{record_id}/clip", response_model=None)
+def api_record_clip(
+    record_id: str,
+    include_deleted: bool = Query(False),
+    user: dict[str, Any] | None = Depends(current_user),
+):
+    allow_deleted = bool(include_deleted and user and user.get("role") in {"admin", "operator"})
+    mouse = _assert_record_readable(record_id, include_deleted=allow_deleted)
+    raw_path = DEFAULT_OUTPUT / mouse["dir"] / "record.json"
+    clip_name = "clip.mp4"
+    if raw_path.exists():
+        try:
+            raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            clip_name = str(raw.get("clip_file") or clip_name)
+        except Exception:
+            pass
+    path = DEFAULT_OUTPUT / mouse["dir"] / clip_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="片段不存在")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        headers={"Cache-Control": "max-age=3600"},
+    )
+
+
+def _load_mutable_record(record_id: str) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    mouse = registry.get_by_record_id(record_id)
+    if mouse is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    path = DEFAULT_OUTPUT / mouse["dir"] / "record.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="记录文件不存在")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"无法读取记录: {exc}") from exc
+    return mouse, path, raw
+
+
+def _reject_if_manual_weight_required(record_id: str) -> None:
+    _, _, raw = _load_mutable_record(record_id)
+    if bool(raw.get("requires_manual_weight")):
+        raise HTTPException(
+            status_code=400,
+            detail="无稳定帧：请先手填确认体重后再核对/发布",
+        )
+
+
+class ConfirmWeightBody(BaseModel):
+    weight: float = Field(..., gt=0, lt=80)
+    note: str | None = None
+
+
+@app.post("/api/records/{record_id}/confirm-weight", dependencies=[Depends(require_write_access)])
+def api_confirm_weight(
+    record_id: str,
+    body: ConfirmWeightBody,
+    user: dict[str, Any] = Depends(require_write_access),
+) -> dict[str, Any]:
+    mouse, path, raw = _load_mutable_record(record_id)
+    if not bool(raw.get("requires_manual_weight")):
+        raise HTTPException(status_code=400, detail="该记录不需要手填体重")
+    weight = round(float(body.weight), 2)
+    if raw.get("guessed_weight") is None and raw.get("weight") is not None:
+        raw["guessed_weight"] = raw.get("weight")
+    raw["weight"] = weight
+    raw["weight_source"] = "manual_confirmed"
+    raw["requires_manual_weight"] = False
+    reasons = [r for r in str(raw.get("review_reason") or "").split(",") if r]
+    drop = {"no_stable_platform", "unstable_raw_range", "insufficient_raw_samples", "high_platform_std", "few_platform_points"}
+    reasons = [r for r in reasons if r not in drop]
+    raw["review_reason"] = ",".join(reasons)
+    raw["needs_review"] = bool(reasons)
+    raw["manual_weight_by"] = user.get("username", "unknown")
+    raw["manual_weight_at"] = datetime.now().isoformat(timespec="seconds")
+    if body.note:
+        raw["manual_weight_note"] = str(body.note)
+    path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    actor = user.get("username", "unknown")
+    if body.note:
+        records_meta.update(record_id, operator=actor, notes=str(body.note))
+    # Enqueue (or refresh) only after manual confirmation — unstable records
+    # were intentionally held out of the pending upload queue.
+    photo_path = path.parent / str(raw.get("photo") or "photo.jpg")
+    queued = upload_queue.update_by_record_id(
+        record_id,
+        raw,
+        record_path=path,
+        photo_path=photo_path if photo_path.is_file() else None,
+    )
+    if not queued:
+        upload_queue.enqueue(
+            raw,
+            record_path=path,
+            photo_path=photo_path if photo_path.is_file() else None,
+        )
+    _audit(
+        actor,
+        "record.confirm_weight",
+        target_type="record",
+        target_id=record_id,
+        detail={"weight": weight, "guessed_weight": raw.get("guessed_weight")},
+    )
+    return {
+        "ok": True,
+        "record_id": record_id,
+        "weight": weight,
+        "needs_review": raw["needs_review"],
+        "requires_manual_weight": False,
+        "weight_source": raw["weight_source"],
+        "dir": mouse.get("dir"),
+    }
+
+
 @app.delete("/api/records/{record_id}", dependencies=[Depends(require_write_access)])
 def api_delete_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
     mouse = registry.get_by_record_id(record_id)
@@ -1517,6 +1644,7 @@ def api_update_record_meta(
 def api_publish_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
     if registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
+    _reject_if_manual_weight_required(record_id)
     actor = user.get("username", "unknown")
     meta = records_meta.publish(record_id, operator=actor)
     _audit(actor, "record.publish", target_type="record", target_id=record_id)
@@ -1537,6 +1665,7 @@ def api_unpublish_record(record_id: str, user: dict[str, Any] = Depends(require_
 def api_verify_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
     if registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
+    _reject_if_manual_weight_required(record_id)
     actor = user.get("username", "unknown")
     meta = records_meta.verify(record_id, operator=actor)
     _audit(actor, "record.verify", target_type="record", target_id=record_id)
@@ -1578,6 +1707,12 @@ def api_batch_records(
         if registry.get_by_record_id(rid) is None:
             results.append({"record_id": rid, "ok": False, "error": "not_found"})
             continue
+        if body.action in {"publish", "verify"}:
+            try:
+                _reject_if_manual_weight_required(rid)
+            except HTTPException as exc:
+                results.append({"record_id": rid, "ok": False, "error": str(exc.detail)})
+                continue
         meta = handler(rid, operator=actor)
         if body.action == "delete":
             upload_queue.delete_by_record_id(rid)

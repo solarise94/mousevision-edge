@@ -152,6 +152,17 @@ def collect_records(
                     "duration_sec": _duration_sec(raw),
                     "clip_start_ms": raw.get("clip_start_ms"),
                     "clip_end_ms": raw.get("clip_end_ms"),
+                    "needs_review": bool(raw.get("needs_review", mouse.get("needs_review"))),
+                    "review_reason": str(raw.get("review_reason") or mouse.get("review_reason") or ""),
+                    "guessed_weight": raw.get("guessed_weight"),
+                    "requires_manual_weight": bool(raw.get("requires_manual_weight")),
+                    "weight_source": raw.get("weight_source"),
+                    "clip_file": raw.get("clip_file"),
+                    "clip_url": (
+                        f"/api/records/{record_id}/clip"
+                        if raw.get("clip_file")
+                        else None
+                    ),
                     "run_started_at": run.get("started_at"),
                 }
             )
@@ -300,11 +311,14 @@ def overview_stats(
         include_deleted=True,
     )
     active = [r for r in records if r.get("status") != "deleted"]
+    # Formal stats exclude needs_review values (workbench policy).
+    clean = [r for r in active if not r.get("needs_review")]
     weights = [
         float(r["weight"])
-        for r in active
+        for r in clean
         if r.get("weight") is not None
     ]
+    review_count = sum(1 for r in active if r.get("needs_review"))
     status_counts = {"pending": 0, "published": 0, "deleted": 0}
     for rec in records:
         status_counts[rec.get("status", "pending")] = (
@@ -326,15 +340,18 @@ def overview_stats(
         "pending_count": status_counts.get("pending", 0),
         "published_count": status_counts.get("published", 0),
         "deleted_count": status_counts.get("deleted", 0),
+        "needs_review_count": review_count,
         "average_weight": avg_weight,
         "meta_overlay": meta_counts,
         "daily_counts": daily_filled,
         "weight_stats": _compute_weight_stats(weights, is_single_cohort=bool(cage_id)),
-        "cage_weights": _compute_cage_weight_view(active),
+        "cage_weights": _compute_cage_weight_view(clean),
         "filters": {
             "strain": strain, "cage_id": cage_id,
             "date_from": date_from, "date_to": date_to, "status": status,
             "n": len(active),
+            "n_clean": len(clean),
+            "n_review": review_count,
         },
     }
 

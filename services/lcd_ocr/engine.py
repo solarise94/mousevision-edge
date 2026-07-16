@@ -1,4 +1,4 @@
-"""LCD OCR engine: locate → warp → fixed-slot classic seven-seg (RapidOCR audit optional)."""
+"""LCD OCR engine: locate → normalize → pluggable DigitDecoder (RapidOCR audit optional)."""
 
 from __future__ import annotations
 
@@ -9,12 +9,15 @@ from typing import Any
 
 import numpy as np
 
+from decoders import get_decoder
+from decoders.base import DecoderResult
 from locator import locate_screen, quad_to_bbox
-from normalize import NormalizeConfig, normalize_digit_strip, strip_slot_candidates
+from normalize import NormalizeConfig, strip_slot_candidates
 from profile import load_scale_profile
 from schemas import (
     STATUS_BAD_ROI,
     STATUS_READABLE,
+    STATUS_TRANSITION,
     STATUS_UNREADABLE,
     STATUS_ZERO,
     LatencyBreakdown,
@@ -24,15 +27,41 @@ from sevenseg_classic import ClassicRead, read_fixed_slots
 
 logger = logging.getLogger("lcd_ocr.engine")
 
-MODEL_VERSION = "classic-sevenseg-v1"
+
+def _map_status(status: str) -> str:
+    if status == "readable":
+        return STATUS_READABLE
+    if status == "zero_display":
+        return STATUS_ZERO
+    if status == "transition":
+        return STATUS_TRANSITION
+    return STATUS_UNREADABLE
+
+
+def _result_to_classic(result: DecoderResult) -> ClassicRead:
+    return ClassicRead(
+        weight=result.weight,
+        digits=list(result.digits),
+        digit_confidences=list(result.digit_confidences),
+        quality=float(result.quality),
+        status=result.status,
+        evidence=dict(result.evidence or {}),
+    )
 
 
 class LcdOcrEngine:
     def __init__(self, *, scale_profile: dict[str, Any] | None = None) -> None:
         self.device = "CPU"
-        self.model_name = MODEL_VERSION
-        self.model_version = MODEL_VERSION
         profile = scale_profile if scale_profile is not None else load_scale_profile()
+        decoder_name = str(
+            os.environ.get("LCD_OCR_DECODER")
+            or (profile.get("lcd_ocr") or {}).get("decoder")
+            or "classic_v2"
+        ).strip()
+        self.decoder_name = decoder_name
+        self.decoder = get_decoder(decoder_name)
+        self.model_name = f"{self.decoder.name}"
+        self.model_version = f"{self.decoder.name}-v1"
         norm = profile.get("lcd_normalization") or {}
         roi = norm.get("digit_roi", [0.20, 0.08, 0.66, 0.84])
         self.norm_cfg = NormalizeConfig(
@@ -60,12 +89,12 @@ class LcdOcrEngine:
         self._latency_window: list[float] = []
         self._warmup_done = False
         self.scale_profile_name = str(profile.get("scale_profile", "current_scale_v1"))
+        self._use_legacy_classic = decoder_name.lower() in {"classic", "classic_v1"}
 
     def warmup(self) -> dict[str, float]:
         """Tiny synthetic probe for /health real latency."""
         img = np.zeros((240, 320, 3), dtype=np.uint8)
-        # Paint a fake blue rectangle so locate has something to find.
-        img[80:140, 40:280] = (200, 80, 40)  # BGR-ish blue-ish
+        img[80:140, 40:280] = (200, 80, 40)
         t0 = time.perf_counter()
         _ = self.read(img, return_debug=False)
         ms = (time.perf_counter() - t0) * 1000.0
@@ -83,6 +112,7 @@ class LcdOcrEngine:
             "ok": True,
             "device": self.device,
             "model": self.model_version,
+            "decoder": self.decoder_name,
             "p50_latency_ms": round(float(np.percentile(arr, 50)), 2),
             "p95_latency_ms": round(float(np.percentile(arr, 95)), 2),
             "rapidocr_audit_ready": self._audit_engine is not None,
@@ -170,14 +200,7 @@ class LcdOcrEngine:
         total = (time.perf_counter() - t0) * 1000.0
         self._note_latency(total)
 
-        status = classic.status
-        if status == "readable":
-            status = STATUS_READABLE
-        elif status == "zero_display":
-            status = STATUS_ZERO
-        else:
-            status = STATUS_UNREADABLE
-
+        status = _map_status(classic.status)
         conf = float(classic.quality)
         if classic.digit_confidences:
             conf = float(
@@ -192,9 +215,11 @@ class LcdOcrEngine:
                 "strip_shape": list(strip.shape),
                 "digits": classic.digits,
                 "model": self.model_version,
+                "decoder": self.decoder_name,
                 "screen_method": screen_method,
                 "slot_mode": self.norm_cfg.slot_mode,
                 "strip_variant": chosen_label,
+                "evidence": classic.evidence,
             }
             if run_audit:
                 debug["audit_text"] = self._audit_text(strip)
@@ -223,78 +248,100 @@ class LcdOcrEngine:
             debug=debug,
         )
 
-    @staticmethod
+    def _decode_slots(self, strip: Any, slots: list) -> ClassicRead:
+        if self._use_legacy_classic:
+            return read_fixed_slots(slots)
+        result = self.decoder.read(strip, slots)
+        return _result_to_classic(result)
+
     def _vote_variants(
+        self,
         usable: list[tuple[str, Any, list]],
     ) -> tuple[ClassicRead, Any, str]:
-        """Combine raw/CLAHE strip decodes: digit-wise majority when both readable."""
+        """Pick one intact variant — never stitch conflicting slot digits."""
         reads: list[tuple[ClassicRead, Any, str]] = []
         for label, strip, slots in usable:
-            reads.append((read_fixed_slots(slots), strip, label))
+            reads.append((self._decode_slots(strip, slots), strip, label))
 
         readable = [
             (r, s, lab)
             for r, s, lab in reads
             if r.status == "readable" and r.weight is not None and r.weight > 0.05
         ]
-        if len(readable) >= 2:
-            # Prefer CLAHE digit on pure ties (often recovers weak segments).
-            clahe_digits = next(
-                (list(r.digits) for r, _s, lab in readable if lab == "clahe"),
-                None,
+        # CLAHE often blooms leading "1" into "7" (15.10→75.10). Drop out-of-band.
+        phys = [
+            t for t in readable if 5.0 <= float(t[0].weight) <= 50.0  # type: ignore[arg-type]
+        ]
+        pool = phys if phys else readable
+
+        def _digit_diffs(a: ClassicRead, b: ClassicRead) -> int:
+            da, db = list(a.digits), list(b.digits)
+            if len(da) != 4 or len(db) != 4:
+                return 4
+            return sum(1 for x, y in zip(da, db) if x != y)
+
+        def _leading_mismatch(a: ClassicRead, b: ClassicRead) -> bool:
+            da, db = list(a.digits), list(b.digits)
+            return (
+                len(da) == 4
+                and len(db) == 4
+                and da[0].isdigit()
+                and db[0].isdigit()
+                and da[0] != db[0]
             )
-            digits_out: list[str] = []
-            confs_out: list[float] = []
-            for i in range(4):
-                ballot: dict[str, list[float]] = {}
-                for r, _s, _lab in readable:
-                    if i >= len(r.digits):
-                        continue
-                    ch = r.digits[i]
-                    cf = (
-                        float(r.digit_confidences[i])
-                        if i < len(r.digit_confidences)
-                        else float(r.quality)
-                    )
-                    ballot.setdefault(ch, []).append(cf)
-                if not ballot:
-                    continue
 
-                def rank(ch: str) -> tuple[int, float, int]:
-                    clahe_bonus = (
-                        1
-                        if clahe_digits is not None
-                        and i < len(clahe_digits)
-                        and clahe_digits[i] == ch
-                        else 0
-                    )
-                    return (len(ballot[ch]), float(np.mean(ballot[ch])), clahe_bonus)
+        if len(pool) >= 2:
+            weights = [float(t[0].weight) for t in pool]  # type: ignore[arg-type]
+            wspan = max(weights) - min(weights)
+            max_diffs = 0
+            lead_bad = False
+            for i in range(len(pool)):
+                for j in range(i + 1, len(pool)):
+                    max_diffs = max(max_diffs, _digit_diffs(pool[i][0], pool[j][0]))
+                    if _leading_mismatch(pool[i][0], pool[j][0]):
+                        lead_bad = True
+            # Hard conflict: incompatible platforms (e.g. 11.xx vs 17.xx).
+            hard = lead_bad or (wspan > 1.0 and max_diffs >= 1) or max_diffs >= 2 and wspan > 0.35
+            if hard:
+                # Prefer intact animal-range majority-of-one; else transition.
+                if len(phys) == 1:
+                    return phys[0][0], phys[0][1], f"phys:{phys[0][2]}"
+                return (
+                    ClassicRead(
+                        weight=None,
+                        digits=list(pool[0][0].digits),
+                        digit_confidences=list(pool[0][0].digit_confidences)
+                        or [0.0] * 4,
+                        quality=0.0,
+                        status="transition",
+                        evidence={
+                            "quality_gate": "variant_conflict",
+                            "variants": [
+                                {
+                                    "label": lab,
+                                    "weight": r.weight,
+                                    "digits": list(r.digits),
+                                }
+                                for r, _s, lab in pool
+                            ],
+                        },
+                    ),
+                    pool[0][1],
+                    "variant_conflict",
+                )
+            # Soft disagreement (last digit jitter): pick best intact reading.
+            return max(pool, key=lambda t: float(t[0].quality))
 
-                winner = max(ballot.keys(), key=rank)
-                digits_out.append(winner)
-                confs_out.append(float(np.mean(ballot[winner])))
-            if len(digits_out) == 4 and all(c.isdigit() or c == "blank" for c in digits_out):
-                from sevenseg_classic import compose_weight
-
-                weight = compose_weight(digits_out)
-                if weight is not None and weight > 0.05:
-                    quality = float(np.mean(confs_out))
-                    merged = ClassicRead(
-                        weight=round(float(weight), 2),
-                        digits=digits_out,
-                        digit_confidences=confs_out,
-                        quality=quality,
-                        status="readable",
-                    )
-                    _r, strip, lab = max(readable, key=lambda t: float(t[0].quality))
-                    return merged, strip, f"majority:{lab}"
-
-        if readable:
-            return max(readable, key=lambda t: float(t[0].quality))
+        if pool:
+            return pool[0][0], pool[0][1], pool[0][2]
 
         zeros = [t for t in reads if t[0].status == "zero_display"]
         if zeros:
             return zeros[0]
+
+        transitions = [t for t in reads if t[0].status == "transition"]
+        if transitions:
+            return transitions[0]
 
         return max(reads, key=lambda t: float(t[0].quality))
 

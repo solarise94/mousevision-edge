@@ -9,6 +9,7 @@ from typing import Any
 # Single-frame statuses only — no temporal conclusions.
 STATUS_READABLE = "readable"
 STATUS_ZERO = "zero_display"
+STATUS_TRANSITION = "transition"
 STATUS_UNREADABLE = "unreadable"
 STATUS_BAD_ROI = "bad_roi"
 

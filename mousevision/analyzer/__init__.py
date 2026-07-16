@@ -26,6 +26,11 @@ class CurveAnalyzerConfig:
     jump_confidence_penalty: float = 0.25
     min_platform_points: int = 3
     prefer_nonzero_platform: bool = True
+    # A scale can show a short, stable intermediate value before settling.
+    # Prefer a later equally stable platform without looking at its magnitude.
+    settlement_recency_weight: float = 0.40
+    # Cap confidence when we only have a guessed (unstable) weight.
+    unstable_confidence_cap: float = 0.35
 
 
 def select_photo_frame(
@@ -173,7 +178,13 @@ class WeightCurveAnalyzer:
             median = float(np.median(segment))
             length_score = min(1.0, (j - i) / 15.0)
             stability = max(0.0, 1.0 - std / self.config.platform_max_std)
-            score = length_score + stability + median * 0.001
+            recency = float(i) / float(max(1, len(weights) - 1))
+            score = (
+                length_score
+                + stability
+                + median * 0.001
+                + self.config.settlement_recency_weight * recency
+            )
             # Prefer real weighing platforms over stable OCR-zero plateaus.
             if self.config.prefer_nonzero_platform and median <= self.config.near_zero:
                 score *= 0.05
@@ -197,8 +208,11 @@ class WeightCurveAnalyzer:
             _score, i0, i1, median, std = adjusted[0]
             best = (i0, i1, median, std)
 
+        unstable_fallback = False
         if best is None:
-            # Fallback: lowest-std window ignoring max_std hard cut.
+            # No window passed platform_max_std — still pick a lowest-std guess,
+            # but mark as no_stable_platform (do not silently write clean).
+            unstable_fallback = True
             best_std = 1e9
             for i in range(len(weights)):
                 j = i
@@ -219,7 +233,9 @@ class WeightCurveAnalyzer:
             return None
 
         i0, i1, _median, _std = best
-        return self._result_from_platform(times, weights, confs, indices, i0, i1)
+        return self._result_from_platform(
+            times, weights, confs, indices, i0, i1, unstable=unstable_fallback
+        )
 
     def _result_from_platform(
         self,
@@ -229,6 +245,8 @@ class WeightCurveAnalyzer:
         indices: np.ndarray,
         i0: int,
         i1: int,
+        *,
+        unstable: bool = False,
     ) -> AnalysisResult:
         segment = weights[i0:i1]
         seg_confs = confs[i0:i1]
@@ -265,6 +283,9 @@ class WeightCurveAnalyzer:
 
         needs_review = False
         reasons: list[str] = []
+        requires_manual = False
+        guessed: float | None = None
+        weight_source = "stable_curve_median"
         if len(filtered) < self.config.min_platform_points:
             needs_review = True
             reasons.append("few_platform_points")
@@ -274,6 +295,14 @@ class WeightCurveAnalyzer:
         if final_weight <= self.config.near_zero:
             needs_review = True
             reasons.append("near_zero_weight")
+        if unstable:
+            needs_review = True
+            requires_manual = True
+            guessed = final_weight
+            weight_source = "guessed_unstable"
+            if "no_stable_platform" not in reasons:
+                reasons.append("no_stable_platform")
+            conf = min(float(conf), float(self.config.unstable_confidence_cap))
 
         return AnalysisResult(
             weight=final_weight,
@@ -284,9 +313,11 @@ class WeightCurveAnalyzer:
             photo_observed_weight=observed,
             photo_weight_delta=delta,
             photo_selection=selection,
-            weight_source="stable_curve_median",
+            weight_source=weight_source,
             needs_review=needs_review,
             review_reason=",".join(reasons),
+            guessed_weight=guessed,
+            requires_manual_weight=requires_manual,
         )
 
     def _confidence(self, n: int, std: float, reader_conf: float) -> float:

@@ -37,11 +37,13 @@ def _curve(
 
 
 def test_platform_median_ignores_ramp_and_zero():
-    values = [0, 8, 18, 24, 25, 24.8, 25.1, 24.9, 25.0, 12, 0, 0]
+    # Long enough plateau that an 0.8s window stays inside the stable region.
+    values = [0, 8, 18, 24, 25, 24.8, 25.1, 24.9, 25.0, 25.05, 24.95, 25.0, 12, 0, 0]
     result = WeightCurveAnalyzer().analyze(_curve(values))
     assert result is not None
     assert 24.5 <= result.weight <= 25.5
     assert result.confidence > 0.4
+    assert result.requires_manual_weight is False
     assert result.photo_observed_weight is not None
     assert result.photo_weight_delta is not None
     assert result.weight_source == "stable_curve_median"
@@ -158,6 +160,20 @@ def test_prefers_nonzero_platform_over_stable_zero():
     assert result.needs_review is False
 
 
+def test_prefers_later_settled_platform_over_early_intermediate_value():
+    curve = [
+        CurvePoint(i * 100.0, 17.10, 0.9, i) for i in range(5)
+    ] + [
+        CurvePoint(1000.0 + i * 100.0, 17.22, 0.9, 10 + i)
+        for i in range(3)
+    ]
+    result = WeightCurveAnalyzer(
+        CurveAnalyzerConfig(platform_window_seconds=0.8, platform_max_std=0.35)
+    ).analyze(curve)
+    assert result is not None
+    assert abs(result.weight - 17.22) < 1e-6
+
+
 def test_jump_filter_drops_isolated_spike():
     values = [0.0, 22.0, 22.1, 55.0, 22.0, 22.05, 22.1, 0.0]
     result = WeightCurveAnalyzer(
@@ -177,3 +193,34 @@ def test_near_zero_result_flags_review():
     # May return None if trimmed too short; if returns, must flag review when ~0.
     if result is not None and result.weight <= 0.5:
         assert result.needs_review is True
+
+
+def test_no_stable_platform_marks_manual_guess():
+    """When no window passes platform_max_std, guess + require manual weight."""
+    # Steadily rising curve — every short window has high std.
+    values = [10.0 + i * 0.8 for i in range(12)]
+    result = WeightCurveAnalyzer(
+        CurveAnalyzerConfig(
+            platform_window_seconds=0.5,
+            platform_max_std=0.05,
+            min_platform_points=3,
+        )
+    ).analyze(_curve(values, dt_ms=100))
+    assert result is not None
+    assert result.requires_manual_weight is True
+    assert result.needs_review is True
+    assert "no_stable_platform" in result.review_reason
+    assert result.weight_source == "guessed_unstable"
+    assert result.guessed_weight == result.weight
+    assert result.confidence <= 0.35
+
+
+def test_stable_platform_does_not_require_manual():
+    values = [0.0, 20.0] + [22.5] * 8 + [0.0]
+    result = WeightCurveAnalyzer(
+        CurveAnalyzerConfig(platform_window_seconds=0.5, platform_max_std=0.35)
+    ).analyze(_curve(values, dt_ms=100))
+    assert result is not None
+    assert result.requires_manual_weight is False
+    assert result.weight_source == "stable_curve_median"
+    assert abs(result.weight - 22.5) < 1e-6

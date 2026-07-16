@@ -84,6 +84,38 @@ def _top_bar_score(digit: np.ndarray) -> float:
     return span * intensity
 
 
+def _continuous_top_bar(digit: np.ndarray) -> float:
+    """Score for a real segment-a, excluding the right-stem tip.
+
+    Narrow "1" digits light the top-right via the stem itself; bloom may
+    also light the left. A true "7" fills the mid top band continuously.
+    """
+    h, w = digit.shape
+    if h < 6 or w < 3:
+        return 0.0
+    y0, y1 = int(h * 0.02), max(int(h * 0.18), 2)
+    # Exclude rightmost 28% so the vertical stem tip does not count as 'a'.
+    x1 = max(int(w * 0.08) + 2, int(w * 0.72))
+    band = digit[y0:y1, int(w * 0.08) : x1]
+    if band.size == 0:
+        return 0.0
+    col_on = (band > 0).any(axis=0).astype(np.uint8)
+    if col_on.size == 0:
+        return 0.0
+    longest = cur = 0
+    for v in col_on:
+        if v:
+            cur += 1
+            longest = max(longest, cur)
+        else:
+            cur = 0
+    span = float(longest) / float(col_on.size)
+    mid0 = int(col_on.size * 0.25)
+    mid1 = int(col_on.size * 0.85)
+    mid = float(np.mean(col_on[mid0:mid1])) if mid1 > mid0 else 0.0
+    return span * (0.45 + 0.55 * mid)
+
+
 def decode_seven_seg(digit_bin: np.ndarray) -> SlotDecode:
     ys, xs = np.where(digit_bin > 0)
     if len(xs) < 5:
@@ -95,11 +127,8 @@ def decode_seven_seg(digit_bin: np.ndarray) -> SlotDecode:
         return SlotDecode("blank", 0.70, 0.0)
 
     top_bar = _top_bar_score(digit)
-
-    # Narrow glyph → always "1". Blooming on a ~16px slot otherwise
-    # hallucinates a/d/e/g and votes "2" (21.60 → 22.60).
-    if w / h < 0.32:
-        return SlotDecode("1", 0.92, top_bar)
+    cont_top = _continuous_top_bar(digit)
+    aspect = float(w) / float(h)
 
     segments = {
         "a": (0.00, 0.16, 0.18, 0.82),
@@ -118,9 +147,23 @@ def decode_seven_seg(digit_bin: np.ndarray) -> SlotDecode:
     thr = max(55.0, peak * 0.38)
     g_thr = max(thr, peak * 0.50)
     on = {name: means[name] >= (g_thr if name == "g" else thr) for name in segments}
-
-    if top_bar >= 0.40:
+    # Only force segment-a ON when the bar is continuous toward the right stem.
+    if cont_top >= 0.45:
         on["a"] = True
+
+    right_stem = means["b"] >= thr * 0.80 and means["c"] >= thr * 0.80
+    left_weak = means["e"] < thr * 0.70 and means["f"] < thr * 0.70
+    right_frac = float(np.mean(digit[:, int(w * 0.55) :] > 0))
+    left_frac = float(np.mean(digit[:, : max(1, int(w * 0.45))] > 0))
+
+    # Narrow glyphs: default to "1" unless a continuous top bar supports "7".
+    # Never early-return "7" from aspect+raw top alone (breaks "3").
+    if aspect < 0.32:
+        # Real blooming "1" tops out around cont_top≈0.49; true narrow "7"
+        # continuous-a scores higher once the stem tip is excluded.
+        if cont_top >= 0.58 and right_stem and left_weak:
+            return SlotDecode("7", 0.90, top_bar)
+        return SlotDecode("1", 0.92, top_bar)
 
     bits = 0
     order = "abcdefg"
@@ -144,6 +187,18 @@ def decode_seven_seg(digit_bin: np.ndarray) -> SlotDecode:
             near = [c for d, _, _, c in candidates if d == best_d]
             if set(near) >= {"2", "3"}:
                 best_c = "3" if means["c"] >= means["e"] else "2"
+            # Glare on segment-d turns a true 7 into mask-near-3. Prefer 7 when
+            # mid (g) and lower-left (e) are clearly off.
+            if (
+                best_c == "3"
+                and means["g"] < g_thr * 0.85
+                and means["e"] < thr * 0.70
+                and means["a"] >= thr
+                and means["b"] >= thr * 0.80
+            ):
+                best_c = "7"
+            if set(near) >= {"3", "7"} and means["g"] < g_thr * 0.85:
+                best_c = "7"
             char = best_c
             conf = 0.65 if best_d == 0 else 0.58
         else:
@@ -153,12 +208,19 @@ def decode_seven_seg(digit_bin: np.ndarray) -> SlotDecode:
             np.mean([means[n] / 255.0 for n in order if on[n]] or [0.5])
         )
 
-    if char == "1" and top_bar >= 0.40:
+    # 3 vs 7 with d-bleed: no g/e → 7.
+    if char == "3" and means["g"] < g_thr * 0.85 and means["e"] < thr * 0.70 and means["a"] >= thr:
         char = "7"
-        conf = min(0.95, conf + 0.10)
-    elif char == "7" and top_bar < 0.18 and w / h < 0.35:
-        char = "1"
-        conf = min(0.90, conf)
+        conf = min(0.93, conf + 0.05)
+
+    # Multi-evidence 1/7: continuous top bar beats width; raw top_bar alone does not.
+    if char in {"1", "7"}:
+        if cont_top >= 0.45 and (right_stem or means["b"] >= thr * 0.75):
+            char = "7"
+            conf = min(0.95, conf + 0.10)
+        elif cont_top < 0.22 and (aspect < 0.35 or right_frac > left_frac * 1.4):
+            char = "1"
+            conf = min(0.90, conf)
 
     # 4 vs 9: glare on a/d often turns a true 4 into mask-9. Prefer 4 when
     # bottom-left (e) is off and a/d are not both solidly on.
@@ -250,7 +312,8 @@ class ClassicRead:
     digits: list[str]
     digit_confidences: list[float]
     quality: float
-    status: str  # readable | zero_display | unreadable
+    status: str  # readable | zero_display | transition | unreadable
+    evidence: dict | None = None
 
 
 def read_fixed_slots(slot_patches: list[np.ndarray]) -> ClassicRead:

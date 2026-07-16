@@ -194,6 +194,21 @@ html, body {
 .status-deleted { background: rgba(255,77,79,0.2); color: var(--mv-danger); }
 .record-card .body { padding: 10px 12px; }
 .record-card .weight { color: var(--mv-green); font-size: 22px; font-weight: 800; }
+.record-card.needs-review {
+  border-color: rgba(232, 140, 48, 0.55);
+}
+.record-card.needs-review .weight { color: #e89c30; }
+.record-card .review-badge {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  background: rgba(180, 60, 30, 0.92);
+  color: #fff;
+  border-radius: 999px;
+  padding: 3px 7px;
+  font-size: 10px;
+  font-weight: 700;
+}
 .record-card .meta { color: var(--mv-muted); font-size: 11px; margin-top: 4px; }
 
 .detail {
@@ -214,6 +229,43 @@ html, body {
   margin-bottom: 12px;
 }
 .detail .media img, .detail .media video { width: 100%; display: block; }
+.detail .media .session-clip {
+  margin-top: 8px;
+  max-height: 220px;
+}
+.manual-weight-panel {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(232, 140, 48, 0.45);
+  border-radius: var(--mv-radius-sm);
+  background: rgba(232, 140, 48, 0.08);
+}
+.manual-weight-hint {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #e8b06a;
+}
+.manual-weight-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.manual-weight-input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--mv-line);
+  background: #0f1218;
+  color: var(--mv-text);
+  font-size: 14px;
+}
+.actions .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .detail dl {
   margin: 0; display: grid; gap: 10px;
 }

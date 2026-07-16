@@ -11,7 +11,7 @@ class RawWeightObservation:
     digits: list[str] = field(default_factory=list)
     digit_confidences: list[float] = field(default_factory=list)
     quality: float = 0.0
-    status: str = "unreadable"  # readable | zero_display | unreadable | bad_roi
+    status: str = "unreadable"  # readable | zero_display | transition | unreadable | bad_roi
     screen_quad: list[list[float]] | None = None
     locator_confidence: float = 0.0
     locator: str | None = None

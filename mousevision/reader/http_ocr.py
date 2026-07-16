@@ -27,17 +27,20 @@ class HttpOcrReader:
         match_threshold: float = 0.35,
         weight_roi: dict | None = None,
         lcd_detect: dict | None = None,
+        # Force a full HSV relocate every N frames (do not send sticky hint).
+        force_relocate_every: int = 12,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout_ms / 1000.0
         self.match_threshold = match_threshold
-        # weight_roi / lcd_detect kept for config compatibility; locating is server-side.
         self.weight_roi = weight_roi
         self.lcd_detect = lcd_detect or {}
+        self.force_relocate_every = max(1, int(force_relocate_every))
         self._client = httpx.Client(timeout=self.timeout)
         self._last_quad: list[list[float]] | None = None
         self._last_box: LcdBox | None = None
         self._last_obs: RawWeightObservation | None = None
+        self._hint_age = 0
 
     def close(self) -> None:
         self._client.close()
@@ -45,6 +48,7 @@ class HttpOcrReader:
     def reset_tracking(self) -> None:
         self._last_quad = None
         self._last_box = None
+        self._hint_age = 0
 
     def lcd_box(self, image: np.ndarray | None = None) -> LcdBox | None:
         """Return last known LCD bbox (from service screen_quad)."""
@@ -52,16 +56,22 @@ class HttpOcrReader:
         return self._last_box
 
     def read_observation(self, image: np.ndarray) -> RawWeightObservation:
-        ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         if not ok:
             return RawWeightObservation(weight=None, status="unreadable")
 
         data: dict[str, Any] = {"return_debug": "false"}
         files = {"file": ("frame.jpg", buf.tobytes(), "image/jpeg")}
-        if self._last_quad is not None:
+        use_hint = self._last_quad is not None
+        if use_hint:
+            self._hint_age += 1
+            # Periodic forced HSV relocate: omit sticky hint this frame.
+            if self._hint_age >= self.force_relocate_every:
+                use_hint = False
+                self._hint_age = 0
+        if use_hint and self._last_quad is not None:
             data["quad_hint"] = json.dumps(self._last_quad)
         if self.weight_roi is not None and self._last_quad is None:
-            # First-frame optional fixed ROI hint via lcd_box fields.
             data.update(
                 {
                     "lcd_x": str(int(self.weight_roi["x"])),
@@ -81,13 +91,16 @@ class HttpOcrReader:
 
         obs = self._parse_payload(payload)
         self._last_obs = obs
-        if obs.status in {"unreadable", "bad_roi"}:
-            # Drop sticky hint so a bad locate cannot poison later frames.
+        if obs.status in {"unreadable", "bad_roi", "transition"}:
+            # Drop sticky hint so a bad locate / transition cannot poison later frames.
             self._last_quad = None
             self._last_box = None
+            self._hint_age = 0
         elif obs.screen_quad is not None:
             self._last_quad = obs.screen_quad
             self._last_box = self._box_from_quad(obs.screen_quad)
+            if not use_hint:
+                self._hint_age = 0
         return obs
 
     def read_weight(self, image: np.ndarray) -> tuple[float | None, float]:

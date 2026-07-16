@@ -1,0 +1,12 @@
+{
+  "source": "tmp_ocr_acceptance/0001 (and photo crops)",
+  "cases": [
+    {"path": "mouse_004_photo.jpg", "expect": 23.79, "tol": 1.0, "critical": true},
+    {"path": "scan5/t46500_24.18.jpg", "expect": 24.18, "tol": 0.8, "critical": true},
+    {"path": "scan5/t48300_24.14.jpg", "expect": 24.14, "tol": 0.8, "critical": true},
+    {"path": "mouse_003_photo.jpg", "expect": 23.66, "tol": 1.0, "critical": false},
+    {"path": "mouse_006_photo.jpg", "expect": 23.47, "tol": 1.0, "critical": false},
+    {"path": "frames/m4_t32300.jpg", "expect": 23.79, "tol": 1.0, "critical": true},
+    {"path": "frames/m2_photo_21.60.jpg", "expect": 21.60, "tol": 0.35, "critical": true, "one_seven": false, "note": "narrow 1 blooming"}
+  ]
+}

@@ -90,3 +90,33 @@ def test_register_idempotent_on_run_ordinal(tmp_path: Path):
     )
     assert a["ordinal"] == b["ordinal"] == 1
     assert a["weight"] == b["weight"] == 16.15
+
+
+def test_registry_exposes_needs_review(tmp_path: Path):
+    output = tmp_path / "output"
+    run_dir, man = create_run_dir(output, cage_id="C57-023")
+    session_dir = run_dir / "mouse_001"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    img = np.zeros((20, 20, 3), dtype=np.uint8)
+    cv2.imwrite(str(session_dir / "photo.jpg"), img)
+    (session_dir / "record.json").write_text(
+        json.dumps(
+            {
+                "cage_id": "C57-023",
+                "weight": 16.15,
+                "confidence": 0.9,
+                "ordinal": 1,
+                "run_id": man["run_id"],
+                "record_id": "rec-1",
+                "needs_review": True,
+                "review_reason": "cluster_conflict:demo",
+                "photo": "photo.jpg",
+                "timestamp": "2026-07-10T12:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = MouseRegistry(tmp_path / "reg.json", output)
+    mice = reg._mice_in_dir(run_dir, run_id=man["run_id"])
+    assert mice[0]["needs_review"] is True
+    assert "cluster_conflict" in mice[0]["review_reason"]

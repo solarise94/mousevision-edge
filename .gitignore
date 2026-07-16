@@ -24,6 +24,10 @@ build/
 output/
 tmp_frames/
 tmp_ocr_acceptance/
+tmp_lcd_debug/
+
+# 工具本地缓存
+.zcode/
 *.mp4.bak
 
 # 参考视频：体积较大，需手动放置（见 README）

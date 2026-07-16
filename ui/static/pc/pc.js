@@ -576,19 +576,33 @@
       "div",
       { class: "record-grid" },
       ...state.records.map((rec) => {
+        const needsReview = !!rec.needs_review;
+        const needsManual = !!rec.requires_manual_weight;
         const card = h("button", {
-          class: `record-card${state.selectedId === rec.record_id ? " selected" : ""}`,
+          class: `record-card${state.selectedId === rec.record_id ? " selected" : ""}${needsReview || needsManual ? " needs-review" : ""}`,
           onClick: () => onSelect(rec),
         });
         const thumb = h("div", { class: "thumb" });
         thumb.appendChild(h("img", { src: rec.photo_url + "?size=thumb", alt: "" }));
         thumb.appendChild(h("span", { class: "idx" }, `#${String(rec.ordinal).padStart(2, "0")}`));
         thumb.appendChild(h("span", { class: `status-badge status-${rec.status}` }, statusLabel(rec.status)));
+        if (needsManual) {
+          thumb.appendChild(h("span", { class: "review-badge" }, "无稳定帧"));
+        } else if (needsReview) {
+          thumb.appendChild(h("span", { class: "review-badge" }, "待复核"));
+        }
+        const weightLabel = needsManual
+          ? `猜测 ${fmtWeight(rec.guessed_weight != null ? rec.guessed_weight : rec.weight)}`
+          : fmtWeight(rec.weight);
+        const metaBits = [rec.cage_id];
+        if (needsManual) metaBits.push("请手填");
+        else if (needsReview) metaBits.push("待复核");
+        if (rec.timestamp) metaBits.push(rec.timestamp);
         card.appendChild(thumb);
         card.appendChild(
           h("div", { class: "body" },
-            h("div", { class: "weight" }, fmtWeight(rec.weight)),
-            h("div", { class: "meta" }, `${rec.cage_id} · ${rec.timestamp || ""}`)
+            h("div", { class: "weight" }, weightLabel),
+            h("div", { class: "meta" }, metaBits.join(" · "))
           )
         );
         return card;
@@ -601,44 +615,125 @@
     const photo = rec.status === "deleted"
       ? `${rec.photo_url}?include_deleted=true&size=full`
       : `${rec.photo_url}?size=full`;
+    const needsManual = !!rec.requires_manual_weight;
     const dl = h("dl");
+    const weightRow = needsManual
+      ? `猜测 ${fmtWeight(rec.guessed_weight != null ? rec.guessed_weight : rec.weight)}（待手填）`
+      : fmtWeight(rec.weight);
     const rows = [
       ["记录 ID", rec.record_id],
       ["箱号", rec.cage_id],
       ["品系", rec.strain || "-"],
       ["小鼠编号", rec.ordinal != null ? String(rec.ordinal).padStart(2, "0") : "-"],
-      ["体重", fmtWeight(rec.weight)],
+      ["体重", weightRow],
       ["置信度", rec.confidence != null ? Number(rec.confidence).toFixed(2) : "-"],
+      [
+        "复核",
+        needsManual
+          ? `无稳定帧 (${rec.review_reason || "no_stable_platform"})`
+          : rec.needs_review
+            ? `待复核 (${rec.review_reason || "-"})`
+            : "否",
+      ],
       ["称重时间", rec.timestamp || "-"],
       ["录制时长", rec.duration_sec != null ? `${rec.duration_sec}s` : "-"],
       ["状态", statusLabel(rec.status)],
     ];
     rows.forEach(([k, v]) => dl.appendChild(h("div", null, h("dt", null, k), h("dd", null, v))));
 
+    const mediaKids = [h("img", { src: photo, alt: "" })];
+    if (rec.clip_url) {
+      mediaKids.push(
+        h("video", {
+          class: "session-clip",
+          src: rec.clip_url,
+          controls: true,
+          playsInline: true,
+        })
+      );
+    }
+
+    let manualBlock = null;
+    if (needsManual && canWrite()) {
+      const input = h("input", {
+        type: "number",
+        step: "0.01",
+        min: "0.1",
+        max: "79.9",
+        class: "manual-weight-input",
+        placeholder: "手填体重 (g)",
+        value: rec.guessed_weight != null ? String(rec.guessed_weight) : "",
+      });
+      const confirmBtn = h(
+        "button",
+        {
+          class: "btn primary",
+          onClick: async () => {
+            const v = Number(input.value);
+            if (!(v > 0) || !(v < 80)) {
+              alert("请输入有效体重 (0–80 g)");
+              return;
+            }
+            try {
+              await api(`/api/records/${rec.record_id}/confirm-weight`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ weight: v }),
+              });
+              await loadRecords();
+              try {
+                state.selected = await api(`/api/records/${rec.record_id}`);
+                state.selectedId = rec.record_id;
+              } catch (_) {}
+              render();
+            } catch (err) {
+              alert(err.message || String(err));
+            }
+          },
+        },
+        "确认体重"
+      );
+      manualBlock = h("div", { class: "manual-weight-panel" }, [
+        h("p", { class: "manual-weight-hint" },
+          "无稳定帧：算法未找到可靠平台。请回看片段后手填实际体重；未确认前不可核对/发布。"
+        ),
+        h("div", { class: "manual-weight-row" }, input, confirmBtn),
+      ]);
+    }
+
     const actions = h("div", { class: "actions" });
     if (canWrite()) {
       const btns = [
-        ["核对通过", "primary", () => act(rec.record_id, "verify")],
-        ["发布", "primary", () => act(rec.record_id, "publish")],
-        ["撤回发布", "", () => act(rec.record_id, "unpublish")],
-        ["删除", "danger", () => act(rec.record_id, "delete")],
-        ["恢复", "", () => act(rec.record_id, "restore")],
-        ["回放复核", "", () => reviewPlayback(rec)],
+        ["核对通过", "primary", () => act(rec.record_id, "verify"), needsManual],
+        ["发布", "primary", () => act(rec.record_id, "publish"), needsManual],
+        ["撤回发布", "", () => act(rec.record_id, "unpublish"), false],
+        ["删除", "danger", () => act(rec.record_id, "delete"), false],
+        ["恢复", "", () => act(rec.record_id, "restore"), false],
+        ["回放复核", "", () => reviewPlayback(rec), false],
       ];
-      btns.forEach(([label, cls, fn]) =>
-        actions.appendChild(h("button", { class: `btn ${cls}`.trim(), onClick: fn }, label))
-      );
+      btns.forEach(([label, cls, fn, disabled]) => {
+        const props = {
+          class: `btn ${cls}`.trim(),
+          title: disabled ? "请先手填确认体重" : "",
+          onClick: fn,
+        };
+        if (disabled) props.disabled = "disabled";
+        actions.appendChild(h("button", props, label));
+      });
     }
+
+    const helpText = needsManual
+      ? "此会话无稳定平台读数。体重以实验员手填为准；下方片段便于核对 LCD。"
+      : "体重为稳定称重曲线算法计算;照片用于确认小鼠在秤状态,数字可能略有差异。如需核验完整称重过程,请点击「回放复核」。";
 
     return h(
       "div",
       { class: "detail" },
       h("h3", null, "记录详情"),
-      h("div", { class: "media" }, h("img", { src: photo, alt: "" })),
+      h("div", { class: "media" }, ...mediaKids),
       dl,
-      h("p", { class: "muted", style: "font-size:11px;line-height:1.5" },
-        "体重为稳定称重曲线算法计算;照片用于确认小鼠在秤状态,数字可能略有差异。如需核验完整称重过程,请点击「回放复核」。"
-      ),
+      manualBlock,
+      h("p", { class: "muted", style: "font-size:11px;line-height:1.5" }, helpText),
       rec.notes ? h("p", { class: "muted", style: "font-size:12px" }, `备注: ${rec.notes}`) : null,
       actions
     );
@@ -659,9 +754,13 @@
       action === "delete"
         ? `/api/records/${recordId}`
         : `/api/records/${recordId}/${ep}`;
-    await api(url, { method });
-    await loadRecords();
-    render();
+    try {
+      await api(url, { method });
+      await loadRecords();
+      render();
+    } catch (err) {
+      alert(err.message || String(err));
+    }
   }
 
   async function reviewPlayback(rec) {

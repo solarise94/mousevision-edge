@@ -147,6 +147,23 @@ class UploadQueue:
             finally:
                 conn.close()
 
+    def get_payload(self, record_id: str) -> dict[str, Any] | None:
+        """Return the queued JSON payload for ``record_id``, or None."""
+        if not record_id:
+            return None
+        with self.lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT payload FROM upload_queue WHERE record_id = ?",
+                    (record_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                return json.loads(str(row["payload"]))
+            finally:
+                conn.close()
+
     def list_pending(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.lock:
             conn = self._connect()

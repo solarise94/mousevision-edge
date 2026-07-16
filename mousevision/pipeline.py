@@ -101,6 +101,7 @@ class WeighingPipeline:
             upload_queue=queue if persist else None,
             start_ordinal=start_ordinal,
             project_id=project_id,
+            source_video=str(video_path),
         )
 
         # When a preview crop is applied (mobile CSS-crop uploads), or when the

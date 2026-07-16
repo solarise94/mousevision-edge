@@ -12,6 +12,8 @@ services:
       MOUSEVISION_PORT: "8766"
       MOUSEVISION_OUTPUT_DIR: "/app/output"
       MOUSEVISION_MAX_UPLOAD_MB: "250"
+      # Fixed ffmpeg decode (same binary as Containerfile apt package).
+      MOUSEVISION_VIDEO_BACKEND: "ffmpeg"
     volumes:
       - ./output:/app/output:Z
     restart: unless-stopped

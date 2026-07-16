@@ -213,6 +213,43 @@ def locate_hsv_quad(
     return best
 
 
+def _quad_center(quad: list[tuple[float, float]] | list[list[float]]) -> tuple[float, float]:
+    xs = [float(p[0]) for p in quad]
+    ys = [float(p[1]) for p in quad]
+    return (sum(xs) / 4.0, sum(ys) / 4.0)
+
+
+def _quad_wh(quad: list[tuple[float, float]] | list[list[float]]) -> tuple[float, float]:
+    xs = [float(p[0]) for p in quad]
+    ys = [float(p[1]) for p in quad]
+    return (max(xs) - min(xs), max(ys) - min(ys))
+
+
+def _hint_diverges_from_hsv(
+    hinted: LocateResult,
+    hsv: LocateResult,
+    *,
+    image_shape: tuple[int, ...],
+    max_center_frac: float = 0.06,
+    max_size_ratio: float = 1.35,
+) -> bool:
+    """True when sticky hint drifted away from a fresh HSV locate."""
+    h, w = int(image_shape[0]), int(image_shape[1])
+    diag = float(np.hypot(h, w))
+    hc = _quad_center(hinted.screen_quad)
+    ec = _quad_center(hsv.screen_quad)
+    dist = float(np.hypot(hc[0] - ec[0], hc[1] - ec[1]))
+    if dist > max(25.0, max_center_frac * diag):
+        return True
+    hw, hh = _quad_wh(hinted.screen_quad)
+    ew, eh = _quad_wh(hsv.screen_quad)
+    if hw <= 1 or hh <= 1 or ew <= 1 or eh <= 1:
+        return True
+    wr = max(hw / ew, ew / hw)
+    hr = max(hh / eh, eh / hh)
+    return wr > max_size_ratio or hr > max_size_ratio
+
+
 def locate_screen(
     image: np.ndarray,
     *,
@@ -225,29 +262,8 @@ def locate_screen(
     min_height: int = 40,
     min_locator_confidence: float = 0.55,
 ) -> LocateResult | None:
-    """Formal fallback order: hint → fixed ROI → full-frame HSV."""
-    if quad_hint is not None:
-        hinted = validate_hint(image, quad_hint, hsv_low=hsv_low, hsv_high=hsv_high)
-        if hinted is not None and hinted.confidence >= min_locator_confidence:
-            return hinted
-
-    if fixed_roi is not None:
-        fixed = locate_fixed_roi(image, fixed_roi)
-        if fixed is not None:
-            # Prefer HSV refinement inside/near fixed ROI when possible.
-            hsv = locate_hsv_quad(
-                image,
-                hsv_low=hsv_low,
-                hsv_high=hsv_high,
-                min_area=max(2000, min_area // 2),
-                min_width=max(80, min_width // 2),
-                min_height=max(20, min_height // 2),
-            )
-            if hsv is not None and hsv.confidence >= min_locator_confidence:
-                return hsv
-            return fixed
-
-    return locate_hsv_quad(
+    """Formal fallback: compare hint vs HSV when both exist; prefer HSV on drift."""
+    hsv = locate_hsv_quad(
         image,
         hsv_low=hsv_low,
         hsv_high=hsv_high,
@@ -255,3 +271,23 @@ def locate_screen(
         min_width=min_width,
         min_height=min_height,
     )
+
+    if quad_hint is not None:
+        hinted = validate_hint(image, quad_hint, hsv_low=hsv_low, hsv_high=hsv_high)
+        if hinted is not None and hinted.confidence >= min_locator_confidence:
+            if (
+                hsv is not None
+                and hsv.confidence >= min_locator_confidence
+                and _hint_diverges_from_hsv(hinted, hsv, image_shape=image.shape)
+            ):
+                return hsv
+            return hinted
+
+    if fixed_roi is not None:
+        fixed = locate_fixed_roi(image, fixed_roi)
+        if fixed is not None:
+            if hsv is not None and hsv.confidence >= min_locator_confidence:
+                return hsv
+            return fixed
+
+    return hsv

@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MOUSEVISION_HOST=0.0.0.0 \
     MOUSEVISION_PORT=8766 \
     MOUSEVISION_OUTPUT_DIR=/app/output \
-    MOUSEVISION_MAX_UPLOAD_MB=250
+    MOUSEVISION_MAX_UPLOAD_MB=250 \
+    MOUSEVISION_VIDEO_BACKEND=ffmpeg
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

@@ -20,7 +20,8 @@ class TemporalFusionConfig:
     one_seven_min_confidence: float = 0.55
     cluster_conflict_ratio: float = 0.35  # second cluster / top cluster
     near_zero: float = 0.15
-    min_weight: float = 5.0
+    # No animal-weight floor: valid low weights must not be silently dropped.
+    min_weight: float = 0.0
     max_weight: float = 50.0
     # Mild stick: suppress tiny plateau jitter (22.72↔22.80) without locking
     # wrong first clusters like 29.x forever.
@@ -63,7 +64,7 @@ class TemporalWeightFusion:
         if mouse_present and obs.is_zero_display:
             return None
 
-        if obs.status in {"unreadable", "bad_roi"}:
+        if obs.status in {"unreadable", "bad_roi", "transition"}:
             return None
 
         if obs.is_zero_display:

@@ -13,3 +13,5 @@ Version-controlled critical frames for `services/lcd_ocr/accept_0001.py`.
 | `frames/m2_photo_21.60.jpg` | 21.60 | narrow `1` blooming → `2` regression |
 
 Source video for full e2e remains outside git (`tmp_ocr_acceptance/0001/source.mp4`).
+
+See also: `tests/fixtures/lcd_ocr/refvideo/` and `docs/LCD_OCR_OPEN_SOURCE_BACKENDS.md`.

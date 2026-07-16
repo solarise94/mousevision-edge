@@ -88,6 +88,8 @@ class Recorder:
                 "photo_verified": analysis.photo_verified,
                 "needs_review": analysis.needs_review,
                 "review_reason": analysis.review_reason,
+                "guessed_weight": analysis.guessed_weight,
+                "requires_manual_weight": bool(analysis.requires_manual_weight),
                 "verification_method": "点击回放视频确认实际称重过程",
                 "state_history": state_history or [],
                 "photo_saved": image is not None,

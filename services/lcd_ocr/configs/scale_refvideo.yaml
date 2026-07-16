@@ -38,6 +38,10 @@ lcd_normalization:
   skew_warp_threshold: 35.0
   min_locator_confidence: 0.55
 
+# Production LCD OCR decoder (override with LCD_OCR_DECODER env).
+lcd_ocr:
+  decoder: classic_v2
+
 # Mouse blob detector (UI overlay + leave hold)
 mouse_detect:
   gray_threshold: 70
@@ -64,9 +68,10 @@ temporal:
   min_confidence: 0.45
   one_seven_min_confidence: 0.55
   cluster_conflict_ratio: 0.35
-  min_weight: 5.0
+  # Do not impose an animal-weight floor; expose low reads to fusion/review.
+  min_weight: 0.0
   max_weight: 50.0
-  stick_tol: 0.20
+  stick_tol: 0.08
 
 # Template matching / OCR confidence floor
 match_threshold: 0.50
@@ -87,8 +92,9 @@ leave_max: 0.30
 leave_hold_frames: 10
 weighing_min_samples: 5
 # HTTP OCR only (SessionDriver forces 0 for TemplateReader / RefVideo):
-empty_arm_frames: 5
-reenter_cooldown_ms: 2500
+empty_arm_frames: 3
+# RefVideo turnaround can be ~3–5s; 2500ms was skipping the next real session.
+reenter_cooldown_ms: 1000
 
 # Curve analyzer
 platform_window_seconds: 0.8

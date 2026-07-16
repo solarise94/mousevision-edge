@@ -5,6 +5,10 @@
 > 下一阶段将切换为：**无状态单帧 OCR 服务（定位吸附 + 七段码）+ mousevision 侧时序融合**；
 > RapidOCR 仅作审计/实验回退。阶段 B 强制先做无 CNN 验证。实施设计见
 > [`LCD_SEVEN_SEGMENT_UPGRADE.md`](LCD_SEVEN_SEGMENT_UPGRADE.md)。
+>
+> 当前经典段位规则在 0001 上通过，但在 RefVideo 工作台链路出现 `0.00 → 11.11`
+> 和 `17.72 → 11.76`。开源后端 A/B、双视频门禁及工作台配套修复见
+> [`LCD_OCR_OPEN_SOURCE_BACKENDS.md`](LCD_OCR_OPEN_SOURCE_BACKENDS.md)。
 
 ## 门禁
 
