@@ -113,6 +113,55 @@ def test_four_nine_prefers_higher_confidence():
     assert abs(later[-1].weight - 24.18) < 0.2
 
 
+def test_weak_minority_conflict_emits_majority():
+    """A 2-vote minority cluster must not starve the majority: the fused
+    output is emitted (state machine keeps moving) while the review flag
+    still propagates to the session record."""
+    fusion = TemporalWeightFusion(
+        TemporalFusionConfig(
+            window_size=8,
+            min_agree=3,
+            conflict_min_agree=2,
+            cluster_conflict_ratio=0.35,
+        )
+    )
+    # 22.50 x2 (weak minority) + 23.6x x3 (majority), like 0001 S3 on server
+    fusion.update(_obs(22.50, digits=["2", "2", "5", "0"]))
+    fusion.update(_obs(22.50, digits=["2", "2", "5", "0"]))
+    fusion.update(_obs(23.58, digits=["2", "3", "5", "8"]))
+    fusion.update(_obs(23.60, digits=["2", "3", "6", "0"]))
+    out = fusion.update(_obs(23.62, digits=["2", "3", "6", "2"]))
+    assert out is not None
+    assert abs(out.weight - 23.6) < 0.1
+    assert fusion.last_needs_review
+    assert "cluster_conflict" in fusion.last_review_reason
+
+
+def test_strong_minority_conflict_still_holds():
+    """Both clusters well supported (>= min_agree) with no sticky match:
+    keep holding — this is a genuine dual plateau for the raw-cluster
+    analyzer to resolve."""
+    fusion = TemporalWeightFusion(
+        TemporalFusionConfig(
+            window_size=8,
+            min_agree=3,
+            conflict_min_agree=2,
+            cluster_conflict_ratio=0.35,
+            stick_tol=0.01,
+        )
+    )
+    # Establish a far-away plateau first (so sticky cannot match either side).
+    for _ in range(3):
+        fusion.update(_obs(22.10, digits=["2", "2", "1", "0"]))
+    out = None
+    for _ in range(3):
+        fusion.update(_obs(24.90, digits=["2", "4", "9", "0"]))
+    for _ in range(3):
+        out = fusion.update(_obs(25.50, digits=["2", "5", "5", "0"]))
+    assert out is None
+    assert fusion.last_needs_review
+
+
 def test_out_of_range_weight_ignored():
     fusion = TemporalWeightFusion(TemporalFusionConfig(window_size=5, min_agree=3))
     for _ in range(5):

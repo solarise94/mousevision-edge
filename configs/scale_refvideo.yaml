@@ -138,7 +138,8 @@ orphan_scan:
   enabled: true
   tol: 0.15
   min_votes: 3
-  min_span_ms: 400
+  # Server-side decodes can be sparse: 3 reads span only ~0.33s there.
+  min_span_ms: 250
   min_conf: 0.45
 
 # Same weight again within 2s of a saved record = same animal re-adjusted.

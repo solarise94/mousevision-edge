@@ -209,7 +209,7 @@ class SessionDriver:
         self._orphan_enabled = bool(oc.get("enabled", True))
         self._orphan_tol = float(oc.get("tol", 0.15))
         self._orphan_min_votes = int(oc.get("min_votes", 3))
-        self._orphan_min_span_ms = float(oc.get("min_span_ms", 400.0))
+        self._orphan_min_span_ms = float(oc.get("min_span_ms", 250.0))
         self._orphan_min_conf = float(oc.get("min_conf", 0.45))
         # Duplicate re-placement suppression: same weight again right after a
         # saved session is the same animal being re-adjusted, not a new record.

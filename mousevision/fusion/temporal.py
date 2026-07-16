@@ -182,7 +182,14 @@ class TemporalWeightFusion:
                 self.last_review_reason = (
                     f"cluster_conflict:{w0}x{top_count}_vs_{w1}x{second_count}"
                 )
-                return None
+                if second_count >= self.config.min_agree:
+                    # Genuine dual plateau (both sides well supported): hold
+                    # the output — the raw-cluster analyzer resolves it later.
+                    return None
+                # Weak minority (1-2 flicker reads): emit the majority anyway
+                # so the state machine is not starved; the review flag above
+                # still reaches the session record.
+                # (fall through to the normal emit path)
 
         # Mild stick for tiny jitter around an established plateau.
         if self._last_stable is not None and self._last_stable.weight > self.config.near_zero:
