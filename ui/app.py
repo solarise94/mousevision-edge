@@ -1740,6 +1740,25 @@ class BatchRecordAction(BaseModel):
 
 
 
+
+def _find_run_dir_by_id(run_id: str) -> Path | None:
+    """Find run directory by exact manifest run_id."""
+    run_id = str(run_id).strip()
+    if not run_id:
+        return None
+    for run in registry.list_runs():
+        if str(run.get("run_id")) == run_id:
+            path = Path(str(run.get("path") or ""))
+            return path if path.is_dir() else None
+    for run_dir in DEFAULT_OUTPUT.glob("run_*"):
+        if not run_dir.is_dir():
+            continue
+        manifest = load_manifest(run_dir) or {}
+        if str(manifest.get("run_id") or "") == run_id:
+            return run_dir
+    return None
+
+
 @app.post("/api/runs/{run_id}/release-suspect", dependencies=[Depends(require_write_access)])
 def api_release_suspect(
     run_id: str,
@@ -1785,6 +1804,18 @@ def api_reject_suspect(
     run_dir = _find_run_dir_by_id(run_id)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="run not found")
+    # Validate that this run actually has format_suspect records.
+    has_suspect = False
+    for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
+        try:
+            raw = json.loads(rec_path.read_text(encoding="utf-8"))
+            if raw.get("format_suspect"):
+                has_suspect = True
+                break
+        except Exception:
+            pass
+    if not has_suspect:
+        raise HTTPException(status_code=400, detail="该 run 未处于隔离状态，无法拒绝")
     deleted = 0
     for mouse_dir in sorted(run_dir.glob("mouse_*")):
         if not mouse_dir.is_dir():
@@ -1797,7 +1828,6 @@ def api_reject_suspect(
                 upload_queue.delete_by_record_id(rid)
                 records_meta.update(rid, status="deleted", operator=actor)
                 deleted += 1
-            # Delete the mouse directory entirely.
             import shutil as _shutil
             _shutil.rmtree(mouse_dir, ignore_errors=True)
         except Exception:

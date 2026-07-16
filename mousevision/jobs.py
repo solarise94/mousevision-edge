@@ -601,11 +601,16 @@ class AnalysisJobManager:
                     completed_at=_now(),
                 )
             except Exception as exc:
-                # Analysis failed: release the reserved ordinal so failed jobs
-                # do not permanently occupy a slot (design §3.5.2 rule 3).
+                # Analysis failed. Only release ordinal if no records were
+                # persisted (records occupy ordinals; releasing causes conflicts).
+                try:
+                    persisted = bool(result.records) if result else False
+                except Exception:
+                    persisted = False
                 if (
                     self.release_ordinals is not None
                     and requested_ordinal is not None
+                    and not persisted
                 ):
                     try:
                         self.release_ordinals(cage_id, int(requested_ordinal))
@@ -778,6 +783,14 @@ class AnalysisJobManager:
             run_dir = Path(getattr(result, "output_root", "") or "")
         if run_dir and run_dir.is_dir():
             self._release_held_for_run(run_dir)
+            # Write postflight_passed flag so startup reconciliation can
+            # distinguish "released and safe" from "crashed before release".
+            try:
+                manifest = load_manifest(run_dir) or {}
+                manifest["postflight_passed"] = True
+                write_manifest(run_dir, manifest)
+            except Exception:
+                pass
         elif self.upload_queue is not None:
             self.upload_queue.release_held(None)
         return {
@@ -812,12 +825,12 @@ class AnalysisJobManager:
                 if raw.get("format_suspect"):
                     to_hold.append(rid)
                     continue
-                # Case 2: run manifest status is not 'completed'.
+                # Case 2: postflight never passed (crashed before release).
                 run_dir = record_path.parent.parent  # mouse_NNN -> run_*
                 manifest_path = run_dir / "manifest.json"
                 if manifest_path.exists():
                     manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
-                    if str(manifest.get("status") or "") not in {"completed", "empty"}:
+                    if not manifest.get("postflight_passed"):
                         to_hold.append(rid)
             if to_hold:
                 self.upload_queue.hold_pending(to_hold)

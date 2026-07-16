@@ -164,6 +164,8 @@ def collect_records(
                         else None
                     ),
                     "run_started_at": run.get("started_at"),
+                    "format_suspect": bool(raw.get("format_suspect") or False) if raw else False,
+                    "format_suspect_reason": (raw.get("format_suspect_reason") or "") if raw else "",
                 }
             )
     items.sort(key=lambda r: r.get("timestamp") or "", reverse=True)
