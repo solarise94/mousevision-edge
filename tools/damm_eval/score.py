@@ -27,10 +27,10 @@ def main() -> None:
                 "glove_gt": int(row.get("glove_gt", 0)),
             }
 
-    tp = fp_mouse = fn = 0
+    tp = fp_mouse = false_neg = 0
     for p in preds:
-        fn = p["file"]
-        gt = labels.get(fn, {})
+        fname = p["file"]
+        gt = labels.get(fname, {})
         has_mouse_gt = bool(gt.get("mouse_gt", 0))
         has_glove_gt = bool(gt.get("glove_gt", 0))
         has_pred = p["n_detections"] > 0
@@ -39,7 +39,7 @@ def main() -> None:
         elif has_pred and has_glove_gt and not has_mouse_gt:
             fp_mouse += 1
         elif not has_pred and has_mouse_gt:
-            fn += 1
+            false_neg += 1
 
     n = max(1, len(preds))
     report = {
@@ -47,8 +47,8 @@ def main() -> None:
         "labeled_frames": len(labels),
         "true_positive": tp,
         "false_positive_glove": fp_mouse,
-        "false_negative": fn,
-        "mouse_detection_rate": round(tp / max(1, tp + fn), 3),
+        "false_negative": false_neg,
+        "mouse_detection_rate": round(tp / max(1, tp + false_neg), 3),
         "glove_false_positive_rate": round(fp_mouse / n, 3),
     }
     args.output.write_text(json.dumps(report, indent=2))

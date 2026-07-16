@@ -159,6 +159,22 @@ class WeighingPipeline:
                     break
         finally:
             source.close()
+            # P1-a: If video ends while still in ENTER/WEIGHING (mouse never
+            # left), flush the state machine to ANALYZE so the session is not
+            # silently lost. The driver will produce a manual-weight record.
+            from mousevision.detector import WeighingState as _WS
+            if driver.sm.state in {_WS.ENTER, _WS.WEIGHING}:
+                try:
+                    last_ts = (
+                        driver.sm.session.curve[-1].timestamp_ms
+                        if driver.sm.session.curve
+                        else 0.0
+                    )
+                    driver.sm.session.end_reason = "video_eof"
+                    driver.sm._set_state(_WS.ANALYZE, last_ts, "video_eof")
+                    driver._handle_analyze()
+                except Exception:
+                    pass
             if create_run and persist:
                 finish_run(active_run, status="completed" if driver.saved_events else "empty")
 

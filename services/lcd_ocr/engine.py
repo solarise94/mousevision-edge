@@ -7,6 +7,7 @@ import os
 import time
 from typing import Any
 
+import cv2
 import numpy as np
 
 from decoders import get_decoder
@@ -51,6 +52,59 @@ def _result_to_classic(result: DecoderResult) -> ClassicRead:
         evidence=dict(result.evidence or {}),
     )
 
+
+
+def _detect_sign_patch(
+    screen: np.ndarray, cfg: "NormalizeConfig"
+) -> bool:
+    """Detect a minus sign in the left margin of the normalized LCD screen.
+
+    The scale shows a leading '-' to the left of the digit area when the
+    reading is negative. We check the narrow strip just left of digit_roi
+    for a single horizontal bar at the vertical midpoint of the digit area
+    (where a minus sign segment would be, not the screen border).
+    """
+    if screen.size == 0:
+        return False
+    h, w = screen.shape[:2]
+    # digit_roi is [x, y, rw, rh] normalized. The sign area is to the left.
+    dx, dy, drw, drh = cfg.digit_roi
+    sign_x0 = max(0, int(w * max(0.0, dx - 0.12)))
+    sign_x1 = max(sign_x0 + 1, int(w * max(0.02, dx - 0.04)))
+    # Restrict to the vertical midpoint band of the digit area (not top/bottom border).
+    mid_y = dy + drh * 0.5
+    band_h = drh * 0.25  # narrow band around midpoint
+    sign_y0 = max(0, int(h * (mid_y - band_h)))
+    sign_y1 = max(sign_y0 + 2, int(h * (mid_y + band_h)))
+    patch = screen[sign_y0:sign_y1, sign_x0:sign_x1]
+    if patch.size == 0:
+        return False
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
+    # Minus sign = a single bright horizontal bar. Use connected components
+    # to ensure it's one wide, short blob (not digit segments or noise).
+    p92 = float(np.percentile(gray, 92))
+    thr = max(150.0, p92 * 0.88)
+    _, bw = cv2.threshold(gray.astype(np.uint8), thr, 255, cv2.THRESH_BINARY)
+    if float(np.mean(bw)) > 127:
+        bw = cv2.bitwise_not(bw)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    n_cc, _labels, stats, _centroids = cv2.connectedComponentsWithStats(bw, 8)
+    patch_w = sign_x1 - sign_x0
+    patch_h = sign_y1 - sign_y0
+    for i in range(1, n_cc):
+        x, y, cw, ch, area = (int(v) for v in stats[i])
+        if area < 30:
+            continue
+        # Minus sign: wide and short. Width > 4x height, width > 50% of patch.
+        # Must be vertically centered in the patch (not at top/bottom border).
+        if ch <= 0:
+            continue
+        aspect = float(cw) / float(ch)
+        cy = y + ch / 2.0
+        centered = (patch_h * 0.2) <= cy <= (patch_h * 0.8)
+        if aspect >= 4.0 and cw >= 0.5 * patch_w and ch <= 0.35 * patch_h and centered:
+            return True
+    return False
 
 class LcdOcrEngine:
     def __init__(self, *, scale_profile: dict[str, Any] | None = None) -> None:
@@ -227,7 +281,30 @@ class LcdOcrEngine:
             if run_audit:
                 debug["audit_text"] = self._audit_text(strip)
 
+        # P1-c: detect negative sign in left margin of normalized screen.
+        is_negative = False
+        try:
+            is_negative = _detect_sign_patch(warped, self.norm_cfg)
+        except Exception:
+            pass
+        if is_negative:
+            classic.status = "negative_display"
+            status = STATUS_NEGATIVE
+            classic.weight = None
         raw = "".join(c if c.isdigit() else ("_" if c == "blank" else "?") for c in classic.digits)
+        if is_negative:
+            raw = "-" + raw
+        # P1-e: collect normalized screen + chosen strip as base64 for flywheel.
+        collection = None
+        if return_debug or os.environ.get("LCD_OCR_COLLECT_ASSETS"):
+            import base64 as _b64
+            collection = {}
+            for _name, _img in [("normalized_screen", warped), ("chosen_strip", strip)]:
+                try:
+                    _buf = cv2.imencode(".jpg", _img, [cv2.IMWRITE_JPEG_QUALITY, 80])[1]
+                    collection[_name] = _b64.b64encode(_buf.tobytes()).decode("ascii")
+                except Exception:
+                    pass
         return ReadResult(
             weight=classic.weight,
             digits=classic.digits,
@@ -247,6 +324,7 @@ class LcdOcrEngine:
             ),
             confidence=conf,
             raw_text=raw,
+            collection_assets=collection,
             lcd_box=quad_to_bbox(located.screen_quad),
             debug=debug,
         )

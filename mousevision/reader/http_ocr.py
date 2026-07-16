@@ -168,5 +168,6 @@ class HttpOcrReader:
             model_version=payload.get("model_version"),
             confidence=conf,
             raw_text=str(payload.get("raw_text") or ""),
+        collection_assets=payload.get("collection_assets"),
             latency_ms=latency,
         )

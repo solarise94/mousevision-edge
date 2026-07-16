@@ -230,6 +230,7 @@ class SessionDriver:
                         "screen_quad": raw.screen_quad,
                         "model_version": raw.model_version,
                         "collection_scope": "session",
+                        "collection_assets": raw.collection_assets,
                     }
                 )
             lcd = self.reader.lcd_box()
@@ -812,9 +813,22 @@ class SessionDriver:
                 assets = out / "training_assets"
                 assets.mkdir(parents=True, exist_ok=True)
                 import json as _json
+                import base64 as _b64
                 with (assets / "ocr_observations.jsonl").open("w", encoding="utf-8") as fh:
                     for row in self._training_obs:
                         fh.write(_json.dumps(row, ensure_ascii=False) + "\n")
+                # Save decoded base64 images for each observation that has assets.
+                for i, row in enumerate(self._training_obs):
+                    ca = row.get("collection_assets")
+                    if not ca:
+                        continue
+                    frame_dir = assets / f"frame_{i:04d}"
+                    frame_dir.mkdir(exist_ok=True)
+                    for asset_name, b64data in ca.items():
+                        try:
+                            (frame_dir / f"{asset_name}.jpg").write_bytes(_b64.b64decode(b64data))
+                        except Exception:
+                            pass
                 (assets / "manifest.json").write_text(
                     _json.dumps(
                         {

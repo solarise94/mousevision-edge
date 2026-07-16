@@ -49,6 +49,8 @@ class ReadResult:
     raw_text: str = ""
     lcd_box: dict[str, int] | None = None
     debug: dict[str, Any] | None = None
+    # P1-e: training flywheel assets (base64 JPEG, only when collection enabled).
+    collection_assets: dict[str, str] | None = None  # {normalized_screen, chosen_strip, sign_patch}
 
     def to_api_dict(self) -> dict[str, Any]:
         return {
@@ -67,4 +69,5 @@ class ReadResult:
             "device": self.device,
             "latency_ms": self.latency.to_dict(),
             "debug": self.debug,
+            "collection_assets": self.collection_assets,
         }

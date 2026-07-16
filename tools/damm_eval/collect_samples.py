@@ -29,13 +29,16 @@ def main() -> None:
                 break
             if not jsonl.exists():
                 continue
-        # We don't have actual frame images in P1-e yet (only OCR observations).
-        # This script is a placeholder: when P1-e is enhanced to save frame
-        # crops, it will collect them here. For now, record metadata.
+        # Collect photo.jpg from the same mouse_NNN directory.
+        photo = jsonl.parent / "photo.jpg"
         for line in jsonl.read_text(encoding="utf-8").strip().splitlines():
             row = json.loads(line)
             if idx >= args.max_per_session * len(args.source):
                 break
+            # Copy the session photo as the evaluation frame.
+            if photo.exists():
+                dest = args.output / f"sample_{idx:04d}.jpg"
+                shutil.copy2(photo, dest)
             manifest.append({
                 "sample_id": idx,
                 "source": str(jsonl.parent),
@@ -43,6 +46,7 @@ def main() -> None:
                 "timestamp_ms": row.get("timestamp_ms"),
                 "ocr_weight": row.get("weight"),
                 "ocr_status": row.get("status"),
+                "image_file": f"sample_{idx:04d}.jpg" if photo.exists() else None,
             })
             idx += 1
 

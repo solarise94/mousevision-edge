@@ -195,7 +195,7 @@ def _ffprobe_video(path: Path) -> dict[str, float]:
 # showinfo log lines look like:
 #   [Parsed_showinfo_0 @ 0x...] n:   0 pts:      0 pts_time:0.000000 ...
 # We extract the frame index (n) and presentation timestamp (pts_time).
-_SHOWINFO_RE = re.compile(r"n:\s*(\d+)\s+pts:\s*\d+\s+pts_time:\s*([\d.]+)")
+_SHOWINFO_RE = re.compile(r"n:\s*(\d+)\s+pts:\s*-?\d+\s+pts_time:\s*(-?[\d.]+)")
 
 
 class _ShowinfoPtsReader(threading.Thread):
@@ -426,9 +426,9 @@ class VideoFileSource:
             # generic analysis failure.
             raise VideoFormatError(f"无法打开视频文件：{self.path}")
 
-        fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 15.0)
         if fps <= 1e-3:
-            fps = 30.0
+            fps = 15.0
 
         index = 0
         if self.start_ms is not None and self.start_ms > 0:
@@ -459,6 +459,7 @@ class VideoFileSource:
                     timestamp_ms=timestamp_ms,
                     index=index,
                     timestamp_source="fallback_fps",
+                    raw_pts_ms=None,
                 )
                 emitted += 1
                 if use_time:
@@ -490,7 +491,7 @@ class VideoFileSource:
         if width <= 0 or height <= 0:
             raise VideoFormatError(f"无法打开视频文件：{self.path}")
         if fps <= 1e-3:
-            fps = 30.0
+            fps = 15.0
 
         # Build ffmpeg command with showinfo filter for PTS extraction.
         # -loglevel info is required: showinfo writes at info level.
@@ -590,6 +591,7 @@ class VideoFileSource:
                         timestamp_ms=pts_ms,
                         index=index,
                         timestamp_source=ts_source,
+                        raw_pts_ms=raw_pts_ms if raw_pts_ms is not None else None,
                     )
                     last_emitted_ms = pts_ms
                     emitted += 1
@@ -659,7 +661,7 @@ class VideoFileSource:
         if width <= 0 or height <= 0:
             return 0.0
         if fps <= 1e-3:
-            fps = 30.0
+            fps = 15.0
 
         cmd = [
             _ffmpeg_bin(),

@@ -721,18 +721,18 @@ def test_truncation_rolls_back_persisted_records(tmp_path: Path):
         run_video=lambda *a, **kw: fake_result,
     )
 
-    # _run_pipeline should raise VideoFormatError after rolling back.
+    # v3: truncation raises VideoFormatError but does NOT rollback.
+    # Records stay Held (not Pending), run_dir preserved, ordinals NOT released.
     with pytest.raises(VideoFormatError, match="远短于录制时长"):
         manager._run_pipeline(job)
 
-    # Rollback verifications:
-    # 1. upload queue must be empty (orphan records removed).
+    # Held isolation verifications:
+    # 1. upload queue has 0 Pending (records stay Held, not synced).
     assert queue.list_pending(limit=50) == []
-    # 2. run_dir must be gone (record.json + photo.jpg + mouse_NNN removed).
-    assert not run_dir.exists()
-    # 3. all reserved ordinals released: requested(1) + extra(2).
-    assert ("C57-023", 1) in released
-    assert ("C57-023", 2) in released
+    # 2. run_dir still exists (preserved for manual review).
+    assert run_dir.exists()
+    # 3. ordinals NOT released (kept as gaps until manual resolution).
+    assert released == []
 
 
 def test_truncation_releases_all_ordinals_descending_with_real_registry(tmp_path: Path):
@@ -812,25 +812,24 @@ def test_truncation_releases_all_ordinals_descending_with_real_registry(tmp_path
     with pytest.raises(VideoFormatError):
         manager._run_pipeline(job)
 
-    # Before the fix: next_ordinal would be 2 (only tail=4 reclaimed -> 4, but
-    # 1,2,3 left as gaps). After the descending-release fix: next_ordinal
-    # returns all the way to 1.
+    # v3: truncation does NOT rollback/release ordinals. They stay reserved
+    # as gaps until manual resolution. next_ordinal stays at 5 (4 reserved).
     box = reg.get("C57-023")
-    assert box["next_ordinal"] == 1, (
-        f"expected all 4 ordinals reclaimed (next_ordinal=1), "
-        f"got next_ordinal={box['next_ordinal']} — descending release broken"
+    assert box["next_ordinal"] == 5, (
+        f"v3: ordinals NOT released (Held isolation); "
+        f"expected next_ordinal=5, got {box['next_ordinal']}"
     )
 
 
 def test_rollback_withholds_ordinals_when_run_dir_not_removed(tmp_path: Path):
-    """If the run directory cannot be deleted (orphan data remains), the
-    rollback must NOT release ordinals — otherwise a new job could reuse the
-    same ordinal and collide with the stale records. The shortfall must be
-    surfaced in the error (P2 fix)."""
+    """v3: truncation marks records format_suspect and keeps them Held.
+    Ordinals are NOT released (no rollback). Run dir is preserved.
+    """
     import json as _json
     from types import SimpleNamespace
 
     from mousevision.jobs import AnalysisJobManager, VideoFormatError
+    from mousevision.upload_queue import UploadQueue
 
     store = JobStore(tmp_path / "jobs.db")
     video = tmp_path / "source.mp4"
@@ -845,53 +844,42 @@ def test_rollback_withholds_ordinals_when_run_dir_not_removed(tmp_path: Path):
         recorded_duration_sec=12,
     )
 
-    released: list[tuple[str, int]] = []
-
-    def release(cage_id: str, ordinal: int) -> None:
-        released.append((cage_id, ordinal))
-
+    queue = UploadQueue(tmp_path / "upload_queue.db")
     manager = AnalysisJobManager(
         store,
         output_root=tmp_path / "output",
         config_path=tmp_path / "config.yaml",
         templates_dir=tmp_path / "templates",
         analysis_fn=lambda _: {"run_id": "r", "record_count": 0, "decoded_frames": 0},
-        release_ordinals=release,
+        reserve_ordinals=lambda *a, **kw: 2,
+        release_ordinals=lambda *a, **kw: None,
+        upload_queue=queue,
     )
 
-    # A run_dir that cannot be removed: make it non-empty and strip write
-    # perms on the PARENT so rmtree cannot unlink it. (Use a nested file.)
-    run_dir = tmp_path / "output" / "run_locked"
+    run_dir = tmp_path / "output" / "run_fake"
     run_dir.mkdir(parents=True)
     d = run_dir / "mouse_001"
     d.mkdir()
-    (d / "record.json").write_text(_json.dumps({"record_id": "r1", "ordinal": 1}), encoding="utf-8")
-    (d / "photo.jpg").write_bytes(b"x")
-    parent = run_dir.parent
-    parent.chmod(0o555)  # remove write/exec from parent -> rmtree cannot remove children
+    rec = {"record_id": "r1", "ordinal": 1, "cage_id": "C57-023"}
+    (d / "record.json").write_text(_json.dumps(rec), encoding="utf-8")
+    queue.enqueue(rec, d / "record.json")
 
     fake_result = SimpleNamespace(
         output_dir=None, states=[], record=None,
-        samples=7, readable=7,
-        records=[{"record_id": "r1", "ordinal": 1}],
-        output_dirs=None, run_dir=run_dir, run_id="run_fake",
+        samples=7, readable=7, records=[rec], output_dirs=None,
+        run_dir=run_dir, run_id="run_fake",
     )
     manager._pipeline = SimpleNamespace(
         config={"frame_stride": 2},
         run_video=lambda *a, **kw: fake_result,
     )
 
-    try:
-        with pytest.raises(VideoFormatError) as exc_info:
-            manager._run_pipeline(job)
-        # Ordinals must NOT have been released (run_dir still present).
-        assert released == [], (
-            f"ordinals released despite run_dir surviving: {released}"
-        )
-        # The shortfall must be recorded in the error message.
-        assert "回滚不完整" in str(exc_info.value)
-        assert "ordinals NOT released" in str(exc_info.value)
-        # And the run_dir must still exist (orphan data, for manual cleanup).
-        assert run_dir.exists()
-    finally:
-        parent.chmod(0o755)  # restore so tmp_path cleanup works
+    with pytest.raises(VideoFormatError):
+        manager._run_pipeline(job)
+
+    # Records stay Held, run_dir preserved with format_suspect flag.
+    assert run_dir.exists()
+    saved = _json.loads((d / "record.json").read_text(encoding="utf-8"))
+    assert saved.get("format_suspect") is True
+    assert queue.list_pending(limit=50) == []  # Held, not Pending
+

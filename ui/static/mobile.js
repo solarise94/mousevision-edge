@@ -381,7 +381,6 @@
     if (!window.MediaRecorder) return "";
     const list = [
       "video/mp4;codecs=avc1.42E01E",
-      "video/mp4",
     ];
     return list.find((t) => MediaRecorder.isTypeSupported(t)) || "";
   }

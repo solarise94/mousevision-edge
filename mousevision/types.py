@@ -18,6 +18,8 @@ class Frame:
     # back to index/fps. Downstream code can check this to know whether
     # timestamps are wall-clock-accurate or uniform-fps estimates.
     timestamp_source: str = "pts"
+    # Original PTS before first-frame normalization (ms), for diagnostics.
+    raw_pts_ms: float | None = None
 
 
 @dataclass

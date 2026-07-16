@@ -32,7 +32,9 @@ def main() -> None:
         raise SystemExit(1)
 
     cfg = get_cfg()
-    # DAMM uses Mask R-CNN R50-FPN; adjust if DAMM specifies a different config.
+    # DAMM uses Mask R-CNN R50-FPN. Check DAMM repo for the exact config
+    # file and model weights path. This scaffold uses COCO config as a
+    # starting point - replace with DAMM's actual config when available.
     cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
     cfg.MODEL.WEIGHTS = str(args.weights)
     cfg.MODEL.DEVICE = args.device

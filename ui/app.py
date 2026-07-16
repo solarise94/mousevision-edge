@@ -263,6 +263,7 @@ class PlaybackEngine:
                 "source_video": s.source_video,
             }
 
+            _validate_video_codec(Path(video_path))
     def _resolve_run_video(self, source_run_id: str) -> Path | None:
         """Resolve and validate the video path recorded in a run manifest."""
         runs = self.registry.list_runs()
@@ -1423,6 +1424,8 @@ def api_record(
     mouse["status"] = meta["status"]
     mouse["verified"] = bool(meta.get("verified"))
     mouse["notes"] = meta.get("notes") or ""
+    mouse["detection_label"] = meta.get("detection_label") or ""
+    mouse["original_weight"] = raw.get("original_weight")
     mouse["strain"] = strain_from_cage(str(mouse.get("cage_id") or "-"))
     return mouse
 
@@ -1527,6 +1530,40 @@ def _reject_if_manual_weight_required(record_id: str) -> None:
         )
 
 
+
+
+def _validate_video_codec(path: Path) -> None:
+    """P1-d: verify uploaded video is H.264 in mp4/mov container."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            [_ffprobe_bin(), "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "v:0", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            raise HTTPException(status_code=400, detail="视频格式无法解析，请重录")
+        import json as _json
+        data = _json.loads(r.stdout)
+        streams = data.get("streams") or []
+        if not streams:
+            raise HTTPException(status_code=400, detail="视频无视频流，请重录")
+        codec = str(streams[0].get("codec_name") or "").lower()
+        if codec != "h264":
+            raise HTTPException(
+                status_code=400,
+                detail=f"视频编码为 {codec}，需 H.264，请更换浏览器重录",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="视频格式校验失败，请重录")
+
+
+def _ffprobe_bin() -> str:
+    import os
+    return os.environ.get("MOUSEVISION_FFPROBE") or "ffprobe"
+
 class ConfirmWeightBody(BaseModel):
     weight: float = Field(..., gt=0, lt=80)
     note: str | None = None
@@ -1539,8 +1576,8 @@ def api_confirm_weight(
     user: dict[str, Any] = Depends(require_write_access),
 ) -> dict[str, Any]:
     mouse, path, raw = _load_mutable_record(record_id)
-    if not bool(raw.get("requires_manual_weight")):
-        raise HTTPException(status_code=400, detail="该记录不需要手填体重")
+    # P2-b: confirm-weight is the universal correction endpoint.
+    # Both manual-required and normal records can be corrected here.
     weight = round(float(body.weight), 2)
     # P2-b: preserve original algorithm weight for training flywheel.
     if raw.get("original_weight") is None and raw.get("weight") is not None:
@@ -1577,6 +1614,7 @@ def api_confirm_weight(
             raw,
             record_path=path,
             photo_path=photo_path if photo_path.is_file() else None,
+            status="Pending",
         )
     _audit(
         actor,

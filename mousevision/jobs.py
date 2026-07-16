@@ -765,34 +765,44 @@ class AnalysisJobManager:
         try:
             self._check_truncation(video_path, decoded_frames, job)
         except VideoFormatError as exc:
-            shortfall = self._rollback_persisted_run(
-                result, cage_id, extra_ordinals, start_ordinal
-            )
-            if shortfall:
-                # Augment the error so the worker's error field records the
-                # rollback shortfall alongside the format-error cause.
-                exc.args = (f"{exc} | 回滚不完整: {shortfall}",)
-            raise
-        # P0-b: postflight passed — release Held queue rows for this run.
-        try:
+            # v3: do NOT rollback/delete. Keep all records Held (already
+            # enqueued as Held during analysis) and mark the run as
+            # format_suspect for manual confirmation.
             run_dir = Path(getattr(result, "run_dir", None) or "")
-            if not run_dir:
-                # PipelineResult may expose run_id only; reconstruct from output.
-                run_dir = Path(getattr(result, "output_root", "") or "")
-            if run_dir and run_dir.is_dir():
-                self._release_held_for_run(run_dir)
-            else:
-                # Fallback: release all Held (single-job worker is single-run).
-                if self.upload_queue is not None:
-                    self.upload_queue.release_held(None)
-        except Exception:
-            pass
+            self._mark_run_format_suspect(run_dir, str(exc))
+            raise
+        # P0-b: postflight passed - release Held queue rows for this run.
+        run_dir = Path(getattr(result, "run_dir", None) or "")
+        if not run_dir:
+            run_dir = Path(getattr(result, "output_root", "") or "")
+        if run_dir and run_dir.is_dir():
+            self._release_held_for_run(run_dir)
+        elif self.upload_queue is not None:
+            self.upload_queue.release_held(None)
         return {
             "run_id": result.run_id,
             "record_count": count,
             "decoded_frames": decoded_frames,
         }
 
+
+    def _mark_run_format_suspect(self, run_dir: Path, reason: str) -> None:
+        """Mark all records under run_dir as format_suspect (stays Held)."""
+        run_dir = Path(run_dir)
+        if not run_dir.is_dir():
+            return
+        import json as _json
+        for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
+            try:
+                raw = _json.loads(rec_path.read_text(encoding="utf-8"))
+                raw["format_suspect"] = True
+                raw["format_suspect_reason"] = reason
+                rec_path.write_text(
+                    _json.dumps(raw, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
 
     def _release_held_for_run(self, run_dir: Path) -> None:
         """Promote Held queue rows for records under run_dir to Pending.

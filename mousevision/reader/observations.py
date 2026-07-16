@@ -20,6 +20,7 @@ class RawWeightObservation:
     confidence: float = 0.0
     raw_text: str = ""
     latency_ms: float = 0.0
+    collection_assets: dict[str, str] | None = None  # base64 JPEGs from OCR service
 
     @property
     def is_readable(self) -> bool:
