@@ -785,24 +785,31 @@ class AnalysisJobManager:
         """Raise VideoFormatError if the clip decodes far less than recorded.
 
         Only consulted when the client sent ``recorded_duration_sec``. The
-        decoded duration is reconstructed as ``decoded_frames * stride / fps``
-        (samples are post-stride). A clip is truncated when its decoded
-        duration is under half the recorded length — the original fragmented
-        MP4 bug typically exposes only the first ~2 s shard, so a 10–15 s
-        recording decoding to ~2 s trips this cleanly.
+        decoded duration is measured from the real first/last showinfo PTS
+        of the decoded source stream (via ``VideoFileSource.decoded_duration_sec``),
+        which is accurate for VFR videos. When PTS is unavailable, falls back
+        to ``decoded_frames / fps`` with a 15fps default. A clip is truncated
+        when its decoded duration is under half the recorded length - the
+        original fragmented MP4 bug typically exposes only the first ~2s
+        shard, so a 10–15s recording decoding to ~2s trips this cleanly.
         """
         recorded = int(job.get("recorded_duration_sec") or 0)
         if recorded <= 0 or decoded_frames <= 0:
             return
-        stride = int(self._pipeline.config.get("frame_stride", 1)) if self._pipeline else 1
-        stride = max(1, stride)
+        # Use real PTS-based duration; fallback to fps estimate inside.
         try:
-            fps = float(VideoFileSource(video_path).probe().get("fps") or 0.0)
+            decoded_duration = VideoFileSource(video_path).decoded_duration_sec()
         except Exception:
-            fps = 0.0
-        if fps <= 1e-3:
-            fps = 15.0  # mobile capture targets 15 fps (mobile.js openBackCamera)
-        decoded_duration = decoded_frames * stride / fps
+            decoded_duration = 0.0
+        if decoded_duration <= 0:
+            # Fallback: decoded_frames / fps (unified 15fps default).
+            try:
+                fps = float(VideoFileSource(video_path).probe().get("fps") or 0.0)
+            except Exception:
+                fps = 0.0
+            if fps <= 1e-3:
+                fps = 15.0
+            decoded_duration = decoded_frames / fps
         # Allow generous slack (variable fps, early stop), but flag a clip that
         # decodes to under half its recorded length.
         if decoded_duration < recorded * 0.5:

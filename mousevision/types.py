@@ -13,6 +13,11 @@ class Frame:
     image: np.ndarray  # BGR
     timestamp_ms: float
     index: int
+    # "pts" when derived from ffmpeg showinfo pts_time (post first-frame
+    # normalization), "fallback_fps" when PTS was unavailable and we fell
+    # back to index/fps. Downstream code can check this to know whether
+    # timestamps are wall-clock-accurate or uniform-fps estimates.
+    timestamp_source: str = "pts"
 
 
 @dataclass

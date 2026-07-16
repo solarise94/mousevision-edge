@@ -113,8 +113,21 @@ class WeighingPipeline:
         fh = int(self.config.get("frame_height") or 0)
         if (crop is not None or normalize_to_reference) and fw > 0 and fh > 0:
             target_size = (fw, fh)
+        # New PTS-based sampling config: analysis_fps or sample_interval_ms
+        # take precedence over legacy frame_stride. When only frame_stride is
+        # configured, pass it through directly to preserve backward-compatible
+        # sampling behaviour (stride-based, not time-based).
+        source_kwargs: dict[str, object] = {"crop": crop, "target_size": target_size}
+        analysis_fps = self.config.get("analysis_fps")
+        sample_interval_ms = self.config.get("sample_interval_ms")
+        if sample_interval_ms is not None:
+            source_kwargs["sample_interval_ms"] = float(sample_interval_ms)
+        elif analysis_fps is not None:
+            source_kwargs["analysis_fps"] = float(analysis_fps)
+        else:
+            source_kwargs["frame_stride"] = stride
         source = VideoFileSource(
-            video_path, frame_stride=stride, crop=crop, target_size=target_size
+            video_path, **source_kwargs  # type: ignore[arg-type]
         )
         preview_saved = False
         try:
