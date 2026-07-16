@@ -177,6 +177,57 @@ class UploadQueue:
             finally:
                 conn.close()
 
+    def find_record_id_by_path(self, record_path: str | Path) -> str | None:
+        """Resolve record_id by matching queued record_path (for corrupt JSON).
+
+        Compares resolved paths when possible; falls back to string equality.
+        """
+        target = Path(record_path)
+        try:
+            target_resolved = target.resolve()
+        except OSError:
+            target_resolved = target
+        candidates = {str(target), str(target_resolved)}
+        # Also match parent mouse dir if given a directory.
+        if target.name != "record.json":
+            candidates.add(str(target / "record.json"))
+            try:
+                candidates.add(str((target / "record.json").resolve()))
+            except OSError:
+                pass
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT record_id, record_path FROM upload_queue "
+                    "WHERE record_id IS NOT NULL AND record_id != ''"
+                ).fetchall()
+            finally:
+                conn.close()
+        for row in rows:
+            rid = str(row["record_id"] or "")
+            rp = str(row["record_path"] or "")
+            if not rid or not rp:
+                continue
+            if rp in candidates:
+                return rid
+            try:
+                if str(Path(rp).resolve()) in candidates:
+                    return rid
+            except OSError:
+                continue
+            # Match when paths point at the same mouse_* directory.
+            try:
+                if Path(rp).parent.resolve() == target_resolved.parent and (
+                    Path(rp).name == "record.json" or target.name == "record.json"
+                ):
+                    return rid
+                if Path(rp).parent.resolve() == target_resolved:
+                    return rid
+            except OSError:
+                continue
+        return None
+
     def list_pending(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.lock:
             conn = self._connect()
@@ -190,6 +241,25 @@ class UploadQueue:
                     LIMIT ?
                     """,
                     (UploadStatus.PENDING.value, UploadStatus.RETRY.value, limit),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+
+    def list_held(self, limit: int = 10000) -> list[dict[str, Any]]:
+        """Return Held rows (startup reconciliation of postflight crash window)."""
+        with self.lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT id, record_id, box_id, record_path, photo_path, status, attempts, created_at
+                    FROM upload_queue
+                    WHERE status = ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (UploadStatus.HELD.value, limit),
                 ).fetchall()
                 return [dict(r) for r in rows]
             finally:

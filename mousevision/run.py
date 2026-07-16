@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +13,43 @@ from typing import Any
 
 def new_run_id() -> str:
     return str(uuid.uuid4())
+
+
+def atomic_write_text(path: str | Path, text: str) -> None:
+    """Write ``text`` so a crash leaves either the old file or a complete new one.
+
+    Writes to a same-directory temp file, fsyncs, then ``os.replace`` onto the
+    target (atomic on POSIX). Best-effort directory fsync makes the rename
+    durable on power loss. Used for transaction markers like postflight_passed.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    # Best-effort: durably record the rename in the parent directory.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def create_run_dir(
@@ -48,9 +87,10 @@ def create_run_dir(
 
 
 def write_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
-    (Path(run_dir) / "manifest.json").write_text(
+    """Atomically persist manifest.json (tmp + fsync + os.replace)."""
+    atomic_write_text(
+        Path(run_dir) / "manifest.json",
         json.dumps(manifest, indent=2, ensure_ascii=False),
-        encoding="utf-8",
     )
 
 

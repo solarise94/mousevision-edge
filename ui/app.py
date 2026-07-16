@@ -35,7 +35,16 @@ from mousevision.detector import WeighingState
 from mousevision.driver import SessionDriver, SessionSavedEvent
 from mousevision.jobs import AnalysisJobManager, JobStore, _parse_preview_crop
 from mousevision.pipeline import load_config
+from mousevision.reject_recovery import (
+    clear_reject_journal,
+    load_reject_journal,
+    new_reject_journal,
+    recover_reject_state,
+    reject_mouse_dir,
+    save_reject_journal,
+)
 from mousevision.run import create_run_dir, finish_run, load_manifest, restore_renumber_temps, write_manifest
+from mousevision.run_lock import RunLockTimeout, run_dir_lock
 from mousevision.source.video import VideoFileSource
 from mousevision.upload_queue import UploadQueue
 from ui.audit import AuditStore
@@ -728,6 +737,19 @@ async def lifespan(_: FastAPI):
     # Repair any half-applied renumber from a crash, then seed box ordinals.
     for run in registry.list_runs():
         restore_renumber_temps(Path(run["path"]))
+    # Finish crash-interrupted reject-suspect (rename/rmtree/queue/meta).
+    # Per-run flock is taken inside recover; prefer journal item actor over system.
+    try:
+        recover_reject_state(
+            DEFAULT_OUTPUT,
+            upload_queue=upload_queue,
+            mark_meta_deleted=lambda rid, operator="system": records_meta.update(
+                rid, status="deleted", operator=operator
+            ),
+            default_actor="system",
+        )
+    except Exception:
+        pass
     box_registry.sync_from_records(DEFAULT_OUTPUT)
     job_manager.start()
     try:
@@ -1766,20 +1788,64 @@ def api_release_suspect(
 ) -> dict[str, Any]:
     """P0-b: Manually release a format_suspect run after operator confirms
     the video is complete. Promotes all Held records to Pending and clears
-    the format_suspect flag."""
-    actor = _actor(user)
-    # Find all records under this run and release them.
-    import glob as _glob
-    # Find run_dir by matching manifest.run_id (directory name uses timestamp+shortid).
+    the format_suspect flag.
+
+    Durable state protocol (shared with startup reconciliation):
+      1. Write manifest.postflight_passed=True FIRST (allow-sync flag)
+      2. Clear format_suspect on each record
+      3. Promote Held queue rows to Pending
+    Reconciliation only re-holds when format_suspect is set OR
+    postflight_passed is missing — so step 1 must not be skipped.
+
+    The full transition runs under a per-run cross-process lock so concurrent
+    release/reject/recovery cannot interleave journal or queue updates.
+    """
+    actor = str(user.get("username") or "unknown")
     run_dir = _find_run_dir_by_id(run_id)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="run not found")
-    released = 0
+
+    try:
+        with run_dir_lock(run_dir):
+            return _release_suspect_locked(run_dir, run_id, actor)
+    except RunLockTimeout as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _release_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, Any]:
+    # Collect suspect records first so we do not write postflight_passed for
+    # an already-clean run (would incorrectly shield incomplete postflight).
+    suspect_paths: list[Path] = []
     for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
         try:
             raw = json.loads(rec_path.read_text(encoding="utf-8"))
-            if not raw.get("format_suspect"):
-                continue
+            if raw.get("format_suspect"):
+                suspect_paths.append(rec_path)
+        except Exception:
+            continue
+    if not suspect_paths:
+        raise HTTPException(status_code=400, detail="该 run 未处于隔离状态，无法释放")
+
+    # 1. Persist allow-sync BEFORE touching the queue (crash-safe).
+    try:
+        manifest = load_manifest(run_dir) or {}
+        manifest["postflight_passed"] = True
+        manifest["suspect_resolution"] = "operator_released"
+        manifest["suspect_resolved_at"] = datetime.now().isoformat(timespec="seconds")
+        manifest["suspect_resolved_by"] = actor
+        write_manifest(run_dir, manifest)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"无法写入 postflight_passed，拒绝释放队列: {exc}",
+        ) from exc
+
+    # 2. Clear format_suspect flags, then 3. release Held → Pending.
+    released = 0
+    errors: list[str] = []
+    for rec_path in suspect_paths:
+        try:
+            raw = json.loads(rec_path.read_text(encoding="utf-8"))
             raw["format_suspect"] = False
             raw["format_suspect_reason"] = ""
             rec_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1787,10 +1853,13 @@ def api_release_suspect(
             if rid:
                 upload_queue.release_held([rid])
                 released += 1
-        except Exception:
-            pass
-    _audit(actor, "run.release_suspect", target_type="run", target_id=run_id, detail={"released": released})
-    return {"ok": True, "run_id": run_id, "released": released}
+        except Exception as exc:
+            errors.append(f"{rec_path.parent.name}: {exc}")
+    detail = {"released": released, "errors": errors}
+    _audit(actor, "run.release_suspect", target_type="run", target_id=run_id, detail=detail)
+    if errors and released == 0:
+        raise HTTPException(status_code=500, detail={"ok": False, **detail})
+    return {"ok": True, "run_id": run_id, "released": released, "errors": errors}
 
 
 @app.post("/api/runs/{run_id}/reject-suspect", dependencies=[Depends(require_write_access)])
@@ -1799,12 +1868,58 @@ def api_reject_suspect(
     user: dict[str, Any] = Depends(require_write_access),
 ) -> dict[str, Any]:
     """P0-b: Manually reject a format_suspect run. Deletes all records
-    and removes them from the upload queue."""
-    actor = _actor(user)
+    and removes them from the upload queue.
+
+    Crash-safe protocol (durable journal + rename quarantine + per-run flock):
+      1. Append item to ``.reject_journal.json`` (phase=planned)
+      2. Rename mouse_* → .rejecting_* (phase=quarantined)
+      3. rmtree quarantine; on failure rename back and drop journal item
+      4. phase=disk_gone → delete queue → phase=queue_gone → meta deleted → done
+    Requires a reliable record_id before any destructive step. Recovery uses
+    the journal's original actor for metadata attribution.
+    """
+    actor = str(user.get("username") or "unknown")
     run_dir = _find_run_dir_by_id(run_id)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="run not found")
-    # Validate that this run actually has format_suspect records.
+
+    try:
+        with run_dir_lock(run_dir):
+            return _reject_suspect_locked(run_dir, run_id, actor)
+    except RunLockTimeout as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _reject_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, Any]:
+    def _mark_meta_deleted(rid: str, operator: str = "system") -> None:
+        records_meta.update(rid, status="deleted", operator=operator)
+
+    # Finish crash-interrupted reject for THIS run only (already under lock;
+    # recover_reject_state will re-lock the same path — fcntl flock is re-entrant
+    # for the same process/fd only, so recover must not re-lock when we already hold it).
+    # Use internal _recover_one_run via run_dirs path that still locks — DEADLOCK RISK.
+    # So recover only for this run without nested lock: call _recover_one_run directly.
+    from mousevision.reject_recovery import _recover_one_run
+
+    stats: dict[str, int] = {
+        "journals": 0,
+        "items_finished": 0,
+        "orphans_removed": 0,
+        "orphans_restored": 0,
+        "errors": 0,
+    }
+    try:
+        _recover_one_run(
+            run_dir,
+            stats,
+            upload_queue=upload_queue,
+            mark_meta_deleted=_mark_meta_deleted,
+            default_actor=actor,
+        )
+    except Exception:
+        pass
+
+    # Validate: still has suspect records, or residual journal/quarantine to finish.
     has_suspect = False
     for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
         try:
@@ -1814,25 +1929,72 @@ def api_reject_suspect(
                 break
         except Exception:
             pass
-    if not has_suspect:
+    journal_existing = load_reject_journal(run_dir)
+    if not has_suspect and not journal_existing and not list(run_dir.glob(".rejecting_*")):
         raise HTTPException(status_code=400, detail="该 run 未处于隔离状态，无法拒绝")
+
+    journal = journal_existing or new_reject_journal(run_id=run_id, actor=actor)
+    if not journal_existing:
+        try:
+            save_reject_journal(run_dir, journal)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"无法写入 reject journal: {exc}"
+            ) from exc
+
     deleted = 0
+    errors: list[str] = []
+
     for mouse_dir in sorted(run_dir.glob("mouse_*")):
         if not mouse_dir.is_dir():
             continue
-        rec_path = mouse_dir / "record.json"
         try:
-            raw = json.loads(rec_path.read_text(encoding="utf-8")) if rec_path.exists() else {}
-            rid = str(raw.get("record_id") or "")
-            if rid:
-                upload_queue.delete_by_record_id(rid)
-                records_meta.update(rid, status="deleted", operator=actor)
-                deleted += 1
-            import shutil as _shutil
-            _shutil.rmtree(mouse_dir, ignore_errors=True)
-        except Exception:
-            pass
-    _audit(actor, "run.reject_suspect", target_type="run", target_id=run_id, detail={"deleted": deleted})
+            reject_mouse_dir(
+                run_dir,
+                mouse_dir,
+                journal=journal,
+                upload_queue=upload_queue,
+                mark_meta_deleted=_mark_meta_deleted,
+            )
+            deleted += 1
+        except Exception as exc:
+            errors.append(str(exc))
+
+    # If journal fully complete, clear it.
+    remaining = [
+        i for i in (journal.get("items") or [])
+        if isinstance(i, dict) and i.get("phase") != "done"
+    ]
+    if remaining:
+        journal["items"] = remaining
+        try:
+            save_reject_journal(run_dir, journal)
+        except Exception as exc:
+            errors.append(f"journal: {exc}")
+    else:
+        try:
+            clear_reject_journal(run_dir)
+        except Exception as exc:
+            errors.append(f"journal clear: {exc}")
+
+    # Mark run-level resolution for audit / future reconciliation.
+    if deleted > 0 and not errors:
+        try:
+            manifest = load_manifest(run_dir) or {}
+            manifest["suspect_resolution"] = "operator_rejected"
+            manifest["suspect_resolved_at"] = datetime.now().isoformat(timespec="seconds")
+            manifest["suspect_resolved_by"] = actor
+            write_manifest(run_dir, manifest)
+        except Exception as exc:
+            errors.append(f"manifest: {exc}")
+
+    detail = {"deleted": deleted, "errors": errors}
+    _audit(actor, "run.reject_suspect", target_type="run", target_id=run_id, detail=detail)
+    if errors:
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "run_id": run_id, "deleted": deleted, "errors": errors},
+        )
     return {"ok": True, "run_id": run_id, "deleted": deleted}
 
 @app.post("/api/records/{record_id}/detection-label", dependencies=[Depends(require_write_access)])
@@ -1845,7 +2007,7 @@ def api_set_detection_label(
     label = str(body.get("label") or "").strip().lower()
     if label not in {"mouse", "glove", "empty", "other"}:
         raise HTTPException(status_code=400, detail="label must be mouse/glove/empty/other")
-    actor = _actor(user)
+    actor = str(user.get("username") or "unknown")
     meta = records_meta.update(record_id, operator=actor, detection_label=label)
     _audit(actor, "record.detection_label", target_type="record", target_id=record_id, detail={"label": label})
     return {"ok": True, "record_id": record_id, "detection_label": label}

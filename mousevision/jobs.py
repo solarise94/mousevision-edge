@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from mousevision.capture_geom import validate_canvas_video_geometry
 from mousevision.pipeline import WeighingPipeline, load_config
-from mousevision.run import renumber_records
+from mousevision.run import load_manifest, renumber_records, write_manifest
 from mousevision.source.video import VideoFileSource, VideoFormatError
 
 
@@ -483,6 +483,19 @@ class AnalysisJobManager:
         self._jobs_since_prune = 0
 
     def start(self) -> None:
+        # Finish crash-interrupted reject ops on the queue side only.
+        # Without mark_meta_deleted, items stay at queue_gone (never fake-done);
+        # app lifespan recovers with the metadata callback.
+        try:
+            from mousevision.reject_recovery import recover_reject_state
+
+            recover_reject_state(
+                self.output_root,
+                upload_queue=self.upload_queue,
+                mark_meta_deleted=None,
+            )
+        except Exception:
+            pass
         self._reconcile_held()
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -547,6 +560,7 @@ class AnalysisJobManager:
             video_path = job.get("video_path")
             cage_id = str(job.get("cage_id") or "")
             requested_ordinal = job.get("requested_ordinal")
+            result: Any = None
             try:
                 self.store.update(
                     job_id,
@@ -601,16 +615,16 @@ class AnalysisJobManager:
                     completed_at=_now(),
                 )
             except Exception as exc:
-                # Analysis failed. Only release ordinal if no records were
-                # persisted (records occupy ordinals; releasing causes conflicts).
-                try:
-                    persisted = bool(result.records) if result else False
-                except Exception:
-                    persisted = False
+                # Only release ordinal when we can prove no records occupy it.
+                # Gaps are acceptable; collisions are not (design §3.5.2).
+                # analysis_fn returns a dict (no .records); if it raised before
+                # returning, fall back to an on-disk occupancy check.
                 if (
                     self.release_ordinals is not None
                     and requested_ordinal is not None
-                    and not persisted
+                    and not self._records_persisted_for_job(
+                        result, cage_id, requested_ordinal
+                    )
                 ):
                     try:
                         self.release_ordinals(cage_id, int(requested_ordinal))
@@ -777,37 +791,186 @@ class AnalysisJobManager:
             run_dir = Path(getattr(result, "run_dir", None) or "")
             self._mark_run_format_suspect(run_dir, str(exc))
             raise
-        # P0-b: postflight passed - release Held queue rows for this run.
+        # P0-b: postflight passed. Durable order matters for restart safety:
+        #   1. Write postflight_passed (allow-sync) FIRST
+        #   2. Only then promote Held → Pending
+        # Crash between 1 and 2 is recovered by _reconcile_held, which also
+        # scans Held rows and releases those with postflight_passed=True.
+        # If step 1 fails we must NOT report success: records would stay Held
+        # without format_suspect, so operator release-suspect is unreachable.
         run_dir = Path(getattr(result, "run_dir", None) or "")
         if not run_dir:
             run_dir = Path(getattr(result, "output_root", "") or "")
         if run_dir and run_dir.is_dir():
-            self._release_held_for_run(run_dir)
-            # Write postflight_passed flag so startup reconciliation can
-            # distinguish "released and safe" from "crashed before release".
             try:
                 manifest = load_manifest(run_dir) or {}
                 manifest["postflight_passed"] = True
                 write_manifest(run_dir, manifest)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Mark suspect so the operator release path remains available,
+                # then fail the job (do not return success with stuck Held).
+                self._mark_run_format_suspect(
+                    run_dir, f"postflight_passed 写入失败: {exc}"
+                )
+                raise RuntimeError(
+                    f"postflight_passed 写入失败，拒绝释放同步队列: {exc}"
+                ) from exc
+            self._release_held_for_run(run_dir)
         elif self.upload_queue is not None:
-            self.upload_queue.release_held(None)
+            # No run_dir to mark — cannot establish durable allow-sync; keep Held.
+            pass
         return {
             "run_id": result.run_id,
             "record_count": count,
             "decoded_frames": decoded_frames,
         }
 
+    def _records_persisted_for_job(
+        self,
+        result: Any,
+        cage_id: str,
+        requested_ordinal: Any,
+    ) -> bool:
+        """True when records may occupy the requested ordinal (fail-closed).
 
+        Generic-exception path may release the ordinal only when this returns
+        False. Prefer explicit result shapes (dict.record_count / .records);
+        when analysis_fn raised before returning, scan output_root for a
+        matching cage+ordinal record. Ordinal gaps are acceptable; collisions
+        are not.
+        """
+        # 1. Explicit positive count / non-empty records → persisted.
+        if isinstance(result, dict):
+            if int(result.get("record_count") or 0) > 0:
+                return True
+        elif result is not None:
+            records = getattr(result, "records", None)
+            if records:
+                return True
+            count = getattr(result, "record_count", None)
+            if count is not None and int(count) > 0:
+                return True
+
+        # 2. On-disk occupancy for this cage + ordinal.
+        if self._ordinal_occupied_on_disk(cage_id, requested_ordinal):
+            return True
+
+        # 3. Proven empty: explicit zero-count return, or raise with empty disk.
+        if isinstance(result, dict) and int(result.get("record_count") or 0) == 0:
+            return False
+        if result is None:
+            return False
+        if getattr(result, "records", None) is not None:
+            return False  # empty list + empty disk
+
+        # 4. Unknown shape without disk evidence → fail closed (do not release).
+        return True
+
+    def _ordinal_occupied_on_disk(self, cage_id: str, requested_ordinal: Any) -> bool:
+        """True if cage+ordinal may already be occupied under output_root.
+
+        Fail-closed: ``Recorder.save`` creates ``mouse_NNN/`` and writes photo/
+        curve before ``record.json``. A crash mid-write leaves a directory
+        (and possibly corrupt JSON) that must still count as occupancy —
+        otherwise generic-exception release reuses the ordinal and collides.
+
+        Evidence:
+          - ``mouse_{ordinal:03d}/`` under a matching-cage (or unknown-cage) run
+          - unreadable ``record.json`` in a matching name slot
+          - readable ``record.json`` with matching cage_id + ordinal
+        """
+        try:
+            ord_val = int(requested_ordinal) if requested_ordinal is not None else None
+        except (TypeError, ValueError):
+            ord_val = None
+        if ord_val is None or not cage_id:
+            return False
+        root = Path(self.output_root) if self.output_root else None
+        if root is None or not root.is_dir():
+            return False
+        cage = str(cage_id)
+        slot_name = f"mouse_{ord_val:03d}"
+
+        for run_dir in root.glob("run_*"):
+            if not run_dir.is_dir():
+                continue
+            manifest = load_manifest(run_dir) or {}
+            run_cage = str(manifest.get("cage_id") or "")
+            same_or_unknown_cage = run_cage in ("", cage)
+
+            # 1) Directory slot for this ordinal — primary fail-closed signal.
+            mouse_dir = run_dir / slot_name
+            if mouse_dir.is_dir():
+                rec_path = mouse_dir / "record.json"
+                if same_or_unknown_cage:
+                    # Missing or corrupt JSON still occupies the slot.
+                    return True
+                # Different cage in manifest: only count if JSON claims our cage.
+                if rec_path.exists():
+                    try:
+                        raw = json.loads(rec_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if str(raw.get("cage_id") or "") == cage:
+                        return True
+
+            # 2) Readable JSON elsewhere under this run may also claim the ordinal
+            #    (name/ordinal mismatch after partial renumber).
+            for sibling in run_dir.glob("mouse_*"):
+                if not sibling.is_dir() or sibling == mouse_dir:
+                    continue
+                rec_path = sibling / "record.json"
+                if not rec_path.exists():
+                    continue
+                try:
+                    raw = json.loads(rec_path.read_text(encoding="utf-8"))
+                except Exception:
+                    # Corrupt sibling: if name encodes our ordinal and run is
+                    # ours/unknown, treat as occupied.
+                    if not same_or_unknown_cage:
+                        continue
+                    try:
+                        name_ord = int(sibling.name.split("_", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    if name_ord == ord_val:
+                        return True
+                    continue
+                if str(raw.get("cage_id") or "") != cage:
+                    continue
+                try:
+                    if int(raw.get("ordinal") or -1) == ord_val:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        return False
+
+    @staticmethod
+    def _load_record_json(record_path: Path) -> dict[str, Any] | None:
+        """Return parsed record dict, or None if missing/unreadable/not an object.
+
+        Fail-closed for reconciliation: callers must NOT promote rows whose
+        record cannot be validated.
+        """
+        if not record_path.exists():
+            return None
+        try:
+            raw = json.loads(record_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return raw if isinstance(raw, dict) else None
 
     def _reconcile_held(self) -> None:
-        """Startup reconciliation: re-hold Pending rows from incomplete runs.
+        """Startup reconciliation for Held/Pending crash windows.
 
-        Covers two crash windows:
-        1. Postflight failed (format_suspect set) -> re-hold.
-        2. Postflight released but job crashed before marking completed ->
-           re-hold ALL Pending from runs whose job is not 'completed'.
+        Covers:
+        1. Pending + missing/corrupt record.json → re-hold (never sync garbage).
+        2. Pending + format_suspect → re-hold.
+        3. Pending + !postflight_passed → re-hold (released before flag written).
+        4. Pending + unreadable/missing postflight_passed (corrupt manifest) → re-hold.
+        5. Held + readable record + !format_suspect + postflight_passed → release
+           (flag written, crash before release_held — otherwise permanent Held).
+           Missing/corrupt record.json on Held must stay Held.
         """
         if self.upload_queue is None:
             return
@@ -815,25 +978,52 @@ class AnalysisJobManager:
             pending = self.upload_queue.list_pending(limit=10000)
             to_hold: list[str] = []
             for row in pending:
+                rid = str(row.get("record_id") or "")
                 record_path = Path(row.get("record_path") or "")
-                if not record_path.exists():
+                raw = self._load_record_json(record_path)
+                if raw is None:
+                    # Case 1: missing or corrupt — re-isolate; never leave Pending.
+                    if rid:
+                        to_hold.append(rid)
                     continue
-                import json as _json
-                raw = _json.loads(record_path.read_text(encoding="utf-8"))
-                rid = str(raw.get("record_id") or "")
-                # Case 1: format_suspect flag set.
+                if not rid:
+                    rid = str(raw.get("record_id") or "")
+                if not rid:
+                    continue
+                # Case 2: format_suspect flag set.
                 if raw.get("format_suspect"):
                     to_hold.append(rid)
                     continue
-                # Case 2: postflight never passed (crashed before release).
+                # Case 3/4: postflight never passed or manifest unreadable.
                 run_dir = record_path.parent.parent  # mouse_NNN -> run_*
-                manifest_path = run_dir / "manifest.json"
-                if manifest_path.exists():
-                    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
-                    if not manifest.get("postflight_passed"):
-                        to_hold.append(rid)
+                manifest = load_manifest(run_dir)
+                if not manifest or not manifest.get("postflight_passed"):
+                    to_hold.append(rid)
             if to_hold:
                 self.upload_queue.hold_pending(to_hold)
+
+            # Case 5: complete the postflight release that crashed mid-way.
+            to_release: list[str] = []
+            for row in self.upload_queue.list_held(limit=10000):
+                record_path = Path(row.get("record_path") or "")
+                rid = str(row.get("record_id") or "")
+                if not rid:
+                    continue
+                raw = self._load_record_json(record_path)
+                if raw is None:
+                    # Missing/corrupt — keep Held; do not release.
+                    continue
+                if raw.get("format_suspect"):
+                    continue
+                run_dir = record_path.parent.parent
+                manifest = load_manifest(run_dir)
+                if not manifest:
+                    # Corrupt/missing manifest — cannot prove allow-sync.
+                    continue
+                if manifest.get("postflight_passed"):
+                    to_release.append(rid)
+            if to_release:
+                self.upload_queue.release_held(to_release)
         except Exception:
             pass
 
