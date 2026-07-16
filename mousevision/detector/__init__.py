@@ -37,6 +37,15 @@ class StateMachineConfig:
     enter_abort_to_analyze: bool = False
     # Active session (ENTER+WEIGHING) hard timeout from enter_ms (ms).
     max_session_ms: float = 30_000.0
+    # ENTER only fires after this many consecutive non-zero fused reads
+    # (a single fused spike no longer opens a session). 1 = legacy behaviour.
+    enter_sustain_frames: int = 1
+    # Consecutive confirmed-zero reads needed to abort ENTER. 1 = legacy
+    # (single zero aborts). >1 tolerates OCR zero flicker during placement.
+    enter_zero_hold_frames: int = 1
+    # Stuck ENTER (never reaches WEIGHING, never sees zero) aborts to ANALYZE
+    # after this many ms from enter_ms. 0 disables (legacy).
+    max_enter_ms: float = 0.0
 
 
 @dataclass
@@ -68,6 +77,9 @@ class WeighingStateMachine:
         self._empty_arm_count = 0
         self._reenter_after_ms: float = 0.0
         self._wait_clear_count = 0
+        self._enter_sustain_count = 0
+        self._enter_sustain_start_ms: float = 0.0
+        self._enter_zero_count = 0
         self.history: list[StateTransition] = []
 
     def reset_session(self) -> None:
@@ -75,6 +87,8 @@ class WeighingStateMachine:
         self._nonzero_count = 0
         self._leave_count = 0
         self._platform_ref = None
+        self._enter_sustain_count = 0
+        self._enter_zero_count = 0
         self.history.clear()
 
     def _set_state(self, new_state: WeighingState, timestamp_ms: float, reason: str) -> None:
@@ -170,25 +184,50 @@ class WeighingStateMachine:
                         self._arming = False
                 else:
                     self._empty_arm_count = 0
-            elif weight is not None and weight >= cfg.enter_min:
+                return self.state
+            if weight is not None and weight >= cfg.enter_min:
+                # Sustained-read ENTER: require N consecutive non-zero reads so
+                # a lone fused spike cannot open a phantom session.
+                if self._enter_sustain_count == 0:
+                    self._enter_sustain_start_ms = timestamp_ms
+                self._enter_sustain_count += 1
+                if self._enter_sustain_count < cfg.enter_sustain_frames:
+                    return self.state
                 if cfg.require_mouse_for_enter and mouse_present is not True:
                     # Phantom non-zero OCR without a mouse — stay EMPTY.
+                    self._enter_sustain_count = 0
                     return self.state
                 self.reset_session()
                 self._append(timestamp_ms, weight, confidence, frame_index)
-                self.session.enter_ms = timestamp_ms
+                self.session.enter_ms = self._enter_sustain_start_ms
                 self._nonzero_count = 1
                 self._leave_count = 0
                 self._set_state(WeighingState.ENTER, timestamp_ms, "weight_above_enter")
+            else:
+                self._enter_sustain_count = 0
 
         elif self.state == WeighingState.ENTER:
-            if weight is not None and weight >= cfg.enter_min:
+            if (
+                cfg.max_enter_ms > 0
+                and self.session.enter_ms is not None
+                and timestamp_ms - float(self.session.enter_ms) >= cfg.max_enter_ms
+            ):
+                # Stuck ENTER (OCR flicker / handling without settlement):
+                # close the session instead of merging the next animal in.
+                self.session.leave_ms = timestamp_ms
+                self.session.end_reason = "enter_timeout"
+                self._set_state(WeighingState.ANALYZE, timestamp_ms, "enter_timeout")
+            elif weight is not None and weight >= cfg.enter_min:
+                self._enter_zero_count = 0
                 self._nonzero_count += 1
                 if self._nonzero_count >= cfg.weighing_min_samples:
                     self._set_state(
                         WeighingState.WEIGHING, timestamp_ms, "sustained_nonzero"
                     )
             elif weight is not None and weight <= cfg.empty_max:
+                self._enter_zero_count += 1
+                if self._enter_zero_count < cfg.enter_zero_hold_frames:
+                    return self.state
                 if cfg.enter_abort_to_analyze:
                     # http_ocr path: mouse detection confirmed entry, so this
                     # is a real short session (not OCR noise). Go ANALYZE.

@@ -26,6 +26,11 @@ class TemporalFusionConfig:
     # Mild stick: suppress tiny plateau jitter (22.72↔22.80) without locking
     # wrong first clusters like 29.x forever.
     stick_tol: float = 0.20
+    # Bound the mouse-on-scale zero hold (re-tare transient). After this many
+    # consecutive held zero frames the zero is emitted anyway — a long zero run
+    # means the animal really left and the mouse detector is stale/false.
+    # 0 disables the bound (legacy behaviour: hold forever).
+    zero_hold_max_frames: int = 0
 
 
 @dataclass
@@ -37,6 +42,7 @@ class TemporalWeightFusion:
     _last_stable: StableWeightObservation | None = None
     last_needs_review: bool = False
     last_review_reason: str = ""
+    _zero_hold_count: int = 0
 
     def __post_init__(self) -> None:
         self._recent = deque(maxlen=self.config.window_size)
@@ -46,6 +52,7 @@ class TemporalWeightFusion:
         self._last_stable = None
         self.last_needs_review = False
         self.last_review_reason = ""
+        self._zero_hold_count = 0
 
     def update(
         self,
@@ -61,8 +68,29 @@ class TemporalWeightFusion:
         self.last_review_reason = ""
 
         # Mouse on scale + zero display → transition, do not emit leave signal.
+        # Bounded: a long zero run is a real empty scale (detector was stale).
         if mouse_present and obs.is_zero_display:
-            return None
+            self._zero_hold_count += 1
+            if (
+                self.config.zero_hold_max_frames <= 0
+                or self._zero_hold_count <= self.config.zero_hold_max_frames
+            ):
+                return None
+        else:
+            self._zero_hold_count = 0
+
+        # Negative display: pan rebounded below tare — unambiguous empty-scale
+        # evidence (a held or partly supported animal still reads positive).
+        # Emit 0.0 directly; never subject to the mouse-on-scale hold.
+        if obs.is_negative_display:
+            self._last_stable = None
+            return StableWeightObservation(
+                weight=0.0,
+                confidence=float(obs.confidence or obs.quality),
+                digits=list(obs.digits),
+                reason="negative_display",
+                screen_quad=obs.screen_quad,
+            )
 
         if obs.status in {"unreadable", "bad_roi", "transition"}:
             return None

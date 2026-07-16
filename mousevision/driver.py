@@ -11,6 +11,11 @@ from typing import Any, Callable
 import numpy as np
 
 from mousevision.analyzer import CurveAnalyzerConfig, WeightCurveAnalyzer, _iqr_keep_mask
+from mousevision.analyzer.raw_cluster import (
+    RawClusterConfig,
+    analyze_raw_samples,
+    sustained_clusters,
+)
 from mousevision.buffer import RingFrameBuffer
 from mousevision.clip import clip_bounds_from_history, export_session_clip
 from mousevision.detect import detect_mouse_box
@@ -21,7 +26,7 @@ from mousevision.reader.observations import RawWeightObservation
 from mousevision.reader.template import TemplateReader
 from mousevision.recorder import Recorder
 from mousevision.run import bump_record_count
-from mousevision.types import AnalysisResult, Frame
+from mousevision.types import AnalysisResult, CurvePoint, Frame
 from mousevision.upload_queue import UploadQueue
 
 
@@ -98,6 +103,11 @@ class SessionDriver:
                 min_weight=float(temporal_cfg.get("min_weight", 0.0)),
                 max_weight=float(temporal_cfg.get("max_weight", 50.0)),
                 stick_tol=float(temporal_cfg.get("stick_tol", 0.20)),
+                zero_hold_max_frames=(
+                    int(temporal_cfg.get("zero_hold_max_frames", 4))
+                    if self.use_http_ocr
+                    else 0
+                ),
             )
         )
         self.buffer = RingFrameBuffer(
@@ -123,9 +133,24 @@ class SessionDriver:
                 weighing_min_samples=int(cfg.get("weighing_min_samples", 5)),
                 empty_arm_frames=empty_arm,
                 reenter_cooldown_ms=cooldown_ms,
-                require_mouse_for_enter=bool(self.use_http_ocr),
+                require_mouse_for_enter=(
+                    bool(cfg.get("require_mouse_for_enter", False))
+                    if self.use_http_ocr
+                    else False
+                ),
                 enter_abort_to_analyze=bool(self.use_http_ocr),
                 max_session_ms=float(cfg.get("max_session_seconds", 30)) * 1000.0,
+                enter_sustain_frames=(
+                    int(cfg.get("enter_sustain_frames", 2)) if self.use_http_ocr else 1
+                ),
+                enter_zero_hold_frames=(
+                    int(cfg.get("enter_zero_hold_frames", 3)) if self.use_http_ocr else 1
+                ),
+                max_enter_ms=(
+                    float(cfg.get("max_enter_seconds", 15)) * 1000.0
+                    if self.use_http_ocr
+                    else 0.0
+                ),
             )
         )
         self.analyzer = WeightCurveAnalyzer(
@@ -163,6 +188,36 @@ class SessionDriver:
             or 0.5
         )
         self._unstable_confidence_cap = float(cfg.get("unstable_confidence_cap", 0.35))
+        # Raw-cluster session analysis (http_ocr path): estimate the session
+        # weight by clustering raw OCR reads over [enter - pre_enter, leave]
+        # instead of relying on the sparse fused curve alone.
+        rc = cfg.get("raw_cluster") or {}
+        self._raw_cluster_enabled = bool(rc.get("enabled", True))
+        self._raw_cluster_cfg = RawClusterConfig(
+            tol=float(rc.get("tol", 0.12)),
+            min_conf=float(rc.get("min_conf", 0.35)),
+            stable_frac=float(rc.get("stable_frac", 0.60)),
+            stable_min_votes=int(rc.get("stable_min_votes", 4)),
+            stable_max_span=float(rc.get("stable_max_span", 0.25)),
+            conflict_min_votes=int(rc.get("conflict_min_votes", 3)),
+            conflict_min_frac=float(rc.get("conflict_min_frac", 0.25)),
+        )
+        self._raw_pre_enter_ms = float(rc.get("pre_enter_ms", 3000.0))
+        # Orphan-session recovery: sustained raw reads between sessions that
+        # never fused into a session → manual record instead of silent loss.
+        oc = cfg.get("orphan_scan") or {}
+        self._orphan_enabled = bool(oc.get("enabled", True))
+        self._orphan_tol = float(oc.get("tol", 0.15))
+        self._orphan_min_votes = int(oc.get("min_votes", 3))
+        self._orphan_min_span_ms = float(oc.get("min_span_ms", 400.0))
+        self._orphan_min_conf = float(oc.get("min_conf", 0.45))
+        # Duplicate re-placement suppression: same weight again right after a
+        # saved session is the same animal being re-adjusted, not a new record.
+        dc = cfg.get("dup_session") or {}
+        self._dup_max_gap_ms = float(dc.get("max_gap_ms", 2000.0))
+        self._dup_weight_tol = float(dc.get("weight_tol", 0.10))
+        self._last_session_end_ms: float | None = None
+        self._last_saved_weight: float | None = None
 
     def _build_reader(self, cfg: dict[str, Any], expected: Any):
         # Env overrides YAML so Quadlet can flip http_ocr without rebuilding config.
@@ -208,6 +263,8 @@ class SessionDriver:
                 aspect_ratio=tuple(md_cfg.get("aspect_ratio", (0.3, 2.0))),
                 pan_roi=md_cfg.get("pan_roi") or md_cfg.get("roi"),
                 use_otsu=bool(md_cfg.get("use_otsu", True)),
+                dark_p05=(float(md_cfg["dark_p05"]) if md_cfg.get("dark_p05") is not None else None),
+                dark_ratio=(float(md_cfg["dark_ratio"]) if md_cfg.get("dark_ratio") is not None else None),
             )
         except Exception:  # noqa: BLE001
             return None
@@ -241,6 +298,10 @@ class SessionDriver:
                 )
             lcd = self.reader.lcd_box()
             mouse_present = self._detect_mouse(frame, lcd)
+            if raw.is_negative_display:
+                # Pan rebound below tare: no animal on the scale, whatever the
+                # blob detector says (glove/stain in frame during removal).
+                mouse_present = False
             stable = self.fusion.update(
                 raw,
                 mouse_present=mouse_present,
@@ -296,12 +357,23 @@ class SessionDriver:
             frame.index,
             mouse_present=mouse_present if self.use_http_ocr else None,
         )
-        # Raw OCR samples for platform-window instability (timestamped).
-        if (
-            pending_raw is not None
-            and state in {WeighingState.ENTER, WeighingState.WEIGHING}
-        ):
-            self._session_raw_samples.append((float(frame.timestamp_ms), float(pending_raw)))
+        # Raw OCR samples for session analysis (timestamped, with conf/digits
+        # for raw-cluster verdicts). Collected in every state so the pre-ENTER
+        # ramp (where the settled display often already shows) is included.
+        if pending_raw is not None:
+            digits = list(getattr(raw, "digits", []) or []) if self.use_http_ocr else []
+            self._session_raw_samples.append(
+                (
+                    float(frame.timestamp_ms),
+                    float(pending_raw),
+                    float(conf),
+                    digits,
+                    int(frame.index),
+                )
+            )
+            # Bound memory on long EMPTY stretches between sessions.
+            if len(self._session_raw_samples) > 900:
+                del self._session_raw_samples[: len(self._session_raw_samples) - 900]
         self.buffer.push(frame, weight=weight, weight_confidence=conf)
 
         if state in {WeighingState.ENTER, WeighingState.WEIGHING} and not self._pinned:
@@ -392,7 +464,7 @@ class SessionDriver:
             t0, t1 = t1, t0
         raws = [
             w
-            for t_ms, w in self._session_raw_samples
+            for t_ms, w, *_ in self._session_raw_samples
             if t0 <= float(t_ms) <= t1 and float(w) > near_zero
         ]
         if len(raws) < 3:
@@ -467,6 +539,8 @@ class SessionDriver:
                 aspect_ratio=tuple(md_cfg.get("aspect_ratio", (0.3, 2.0))),
                 pan_roi=md_cfg.get("pan_roi") or md_cfg.get("roi"),
                 use_otsu=bool(md_cfg.get("use_otsu", True)),
+                dark_p05=(float(md_cfg["dark_p05"]) if md_cfg.get("dark_p05") is not None else None),
+                dark_ratio=(float(md_cfg["dark_ratio"]) if md_cfg.get("dark_ratio") is not None else None),
             )
 
         def _pan_overlap_ok(box, lcd, frame_h: int) -> bool:
@@ -557,9 +631,12 @@ class SessionDriver:
                     round(delta, 3),
                 )
             best = min(candidates, key=lambda it: abs(it.frame.index - analyzer_idx))
-            observed = (
-                float(best.weight) if best.weight is not None else float(analysis.weight)
-            )
+            if best.weight is not None:
+                observed = float(best.weight)
+            elif analysis.weight is not None:
+                observed = float(analysis.weight)
+            else:
+                observed = 0.0
             delta = abs(observed - (analysis.weight if analysis.weight is not None else observed))
             return (
                 best.frame,
@@ -672,6 +749,45 @@ class SessionDriver:
                 f"{analysis.review_reason},{reason}" if analysis.review_reason else reason
             )
 
+        # http_ocr: raw-cluster verdict over the whole session window (incl.
+        # the pre-ENTER ramp). The fused curve starves flickery sessions; the
+        # dominant raw cluster is the robust settlement estimate.
+        verdict = self._raw_session_verdict() if self.use_http_ocr else None
+        verdict_used = verdict is not None and verdict.status in {"stable", "conflict"}
+        if verdict_used:
+            assert verdict is not None
+            analysis.weight = verdict.weight
+            analysis.confidence = verdict.confidence
+            analysis.weight_source = "raw_cluster_median"
+            analysis.guessed_weight = None
+            if verdict.clusters:
+                _m, _v, _c, t_first, t_last = verdict.clusters[0]
+                analysis.platform_start_ms = float(t_first)
+                analysis.platform_end_ms = float(t_last)
+            if end_reason == "session_timeout":
+                # Policy kept: timeout still forces hand-fill, but with the
+                # real dominant cluster as the guess instead of window junk.
+                analysis.requires_manual_weight = True
+                analysis.needs_review = True
+                analysis.guessed_weight = verdict.weight
+                analysis.weight_source = "guessed_unstable"
+                analysis.confidence = min(
+                    float(analysis.confidence), self._unstable_confidence_cap
+                )
+                analysis.review_reason = (
+                    f"{analysis.review_reason},session_timeout"
+                    if analysis.review_reason
+                    else "session_timeout"
+                )
+            else:
+                analysis.requires_manual_weight = False
+                if verdict.status == "stable":
+                    analysis.needs_review = False
+                    analysis.review_reason = ""
+                else:
+                    analysis.needs_review = True
+                    analysis.review_reason = verdict.reason
+
         (
             photo_frame,
             mouse_detected,
@@ -697,7 +813,7 @@ class SessionDriver:
             and analysis.weight is not None
         ):
             analysis.guessed_weight = float(analysis.weight)
-        if analysis.weight is not None:
+        if analysis.weight is not None and not verdict_used:
             self._apply_raw_instability(analysis)
         near_zero = float(self.config.get("near_zero", 0.5))
         photo_tol = float(self.config.get("photo_weight_tol", 0.15))
@@ -732,6 +848,12 @@ class SessionDriver:
             )
             if solid:
                 self._pending_review_reason = ""
+            elif pending.startswith("cluster_conflict") and "cluster_conflict" in str(
+                analysis.review_reason or ""
+            ):
+                # Already covered by the raw-cluster conflict verdict.
+                analysis.needs_review = True
+                self._pending_review_reason = ""
             else:
                 analysis.needs_review = True
                 analysis.review_reason = (
@@ -740,6 +862,26 @@ class SessionDriver:
                     else pending
                 )
                 self._pending_review_reason = ""
+        session_end_ms = (
+            float(self.sm.session.leave_ms)
+            if self.sm.session.leave_ms is not None
+            else (float(curve_snapshot[-1].timestamp_ms) if curve_snapshot else 0.0)
+        )
+        cur_enter_ms = (
+            float(self.sm.session.enter_ms)
+            if self.sm.session.enter_ms is not None
+            else session_end_ms
+        )
+        # Duplicate re-placement: same weight right after the previous record
+        # is the same animal being re-adjusted — drop, don't double-count.
+        is_dup = (
+            self._last_session_end_ms is not None
+            and self._last_saved_weight is not None
+            and analysis.weight is not None
+            and (cur_enter_ms - self._last_session_end_ms) <= self._dup_max_gap_ms
+            and abs(float(analysis.weight) - self._last_saved_weight)
+            <= self._dup_weight_tol
+        )
         history = [
             {
                 "previous": tr.previous.value,
@@ -749,9 +891,24 @@ class SessionDriver:
             }
             for tr in self.sm.history
         ]
+        # Orphan recovery runs before the main save so ordinals stay
+        # chronological (gap sessions precede the current one).
+        if self.persist:
+            self._save_orphan_records(cur_enter_ms)
+
         self.session_index += 1
         ordinal = self.start_ordinal + (self.session_index - 1)
         wait_clear = end_reason == "session_timeout"
+
+        if is_dup:
+            # Same animal re-adjusted right after a saved record: swallow the
+            # duplicate session (no new record, no ordinal consumed).
+            self.session_index -= 1
+            ts = curve_snapshot[-1].timestamp_ms if curve_snapshot else 0.0
+            self.sm.finish_analyze(ts, wait_clear=wait_clear)
+            self.buffer.clear()
+            self._training_obs.clear()
+            return
 
         if not self.persist:
             saved = SessionSavedEvent(
@@ -783,6 +940,9 @@ class SessionDriver:
             self.saved_events.append(saved)
             if self.on_saved is not None:
                 self.on_saved(saved)
+            self._last_session_end_ms = session_end_ms
+            if analysis.weight is not None:
+                self._last_saved_weight = float(analysis.weight)
             ts = curve_snapshot[-1].timestamp_ms if curve_snapshot else 0.0
             self.sm.finish_analyze(ts, wait_clear=wait_clear)
             self.buffer.clear()
@@ -886,9 +1046,186 @@ class SessionDriver:
             )
         if self.on_saved is not None:
             self.on_saved(saved)
+        self._last_session_end_ms = session_end_ms
+        if analysis.weight is not None:
+            self._last_saved_weight = float(analysis.weight)
 
         ts = curve_snapshot[-1].timestamp_ms if curve_snapshot else 0.0
         self.sm.finish_analyze(ts, wait_clear=wait_clear)
         self.buffer.clear()
         self._training_obs.clear()
+
+    # ------------------------------------------------------------------ #
+    # Raw-cluster session verdict + orphan recovery (http_ocr path)
+    # ------------------------------------------------------------------ #
+
+    def _session_window_ms(self) -> tuple[float, float]:
+        """Analysis window: pre-ENTER ramp through leave/last sample."""
+        enter_ms = self.sm.session.enter_ms
+        leave_ms = self.sm.session.leave_ms
+        t1 = float(leave_ms) if leave_ms is not None else float("inf")
+        if self._session_raw_samples:
+            t1 = min(t1, float(self._session_raw_samples[-1][0]))
+        t0 = float(enter_ms) - self._raw_pre_enter_ms if enter_ms is not None else 0.0
+        return t0, t1
+
+    def _raw_session_verdict(self):
+        """Cluster raw OCR reads over the session window into a verdict."""
+        if not self._raw_cluster_enabled or not self._session_raw_samples:
+            return None
+        t0, t1 = self._session_window_ms()
+        near_zero = float(self.config.get("near_zero", 0.5))
+        window = [
+            s for s in self._session_raw_samples if t0 <= float(s[0]) <= t1 and float(s[1]) > near_zero
+        ]
+        if not window:
+            return None
+        return analyze_raw_samples(window, self._raw_cluster_cfg)
+
+    def _save_orphan_records(self, cur_enter_ms: float) -> None:
+        """Save manual records for sustained raw reads in the session gap.
+
+        A restless animal whose OCR never fused into a session must still
+        surface as a hand-fill record (with clip) instead of vanishing.
+        """
+        if not self._orphan_enabled or not self._session_raw_samples:
+            return
+        cutoff = cur_enter_ms - self._raw_pre_enter_ms
+        since = (
+            float(self._last_session_end_ms)
+            if self._last_session_end_ms is not None
+            else float("-inf")
+        )
+        gap_samples = [
+            s
+            for s in self._session_raw_samples
+            if since < float(s[0]) <= cutoff
+        ]
+        if len(gap_samples) < self._orphan_min_votes:
+            return
+        clusters = sustained_clusters(
+            gap_samples,
+            tol=self._orphan_tol,
+            min_votes=self._orphan_min_votes,
+            min_span_ms=self._orphan_min_span_ms,
+            min_conf=self._orphan_min_conf,
+        )
+        for cluster in clusters:
+            if (
+                self._last_saved_weight is not None
+                and self._last_session_end_ms is not None
+                and abs(cluster["median"] - self._last_saved_weight) <= self._dup_weight_tol
+                and (cluster["t_first"] - self._last_session_end_ms) <= self._dup_max_gap_ms
+            ):
+                continue  # re-placement of the animal just recorded
+            self._persist_orphan(cluster)
+
+    def _persist_orphan(self, cluster: dict) -> None:
+        members = cluster.get("members") or []
+        curve = [
+            CurvePoint(
+                timestamp_ms=float(m[0]),
+                weight=float(m[1]),
+                confidence=float(m[2]) if len(m) > 2 else 0.0,
+                frame_index=int(m[4]) if len(m) > 4 and m[4] is not None else 0,
+            )
+            for m in members
+        ]
+        mid = members[len(members) // 2] if members else None
+        photo_idx = int(mid[4]) if mid is not None and len(mid) > 4 and mid[4] is not None else None
+        weight = round(float(cluster["median"]), 2)
+        analysis = AnalysisResult(
+            weight=weight,
+            confidence=round(min(self._unstable_confidence_cap, float(cluster["mean_conf"])), 3),
+            platform_start_ms=float(cluster["t_first"]),
+            platform_end_ms=float(cluster["t_last"]),
+            photo_frame_index=photo_idx,
+            photo_observed_weight=None,
+            photo_weight_delta=None,
+            photo_selection="none",
+            weight_source="orphan_unstable",
+            needs_review=True,
+            review_reason="untracked_session,no_stable_platform",
+            guessed_weight=weight,
+            requires_manual_weight=True,
+        )
+        (
+            photo_frame,
+            mouse_detected,
+            selection_label,
+            photo_idx2,
+            observed_w,
+            weight_delta,
+        ) = self._select_photo_with_mouse(analysis)
+        analysis.photo_mouse_detected = mouse_detected
+        analysis.photo_selection = selection_label
+        analysis.photo_verified = mouse_detected
+        if analysis.photo_frame_index is None:
+            analysis.photo_frame_index = photo_idx2
+        if analysis.photo_observed_weight is None:
+            analysis.photo_observed_weight = observed_w
+        if analysis.photo_weight_delta is None:
+            analysis.photo_weight_delta = weight_delta
+
+        self.session_index += 1
+        ordinal = self.start_ordinal + (self.session_index - 1)
+        out = self.recorder.save(
+            cage_id=self.cage_id,
+            ordinal=ordinal,
+            run_id=self.run_id,
+            analysis=analysis,
+            curve=curve,
+            photo_frame=photo_frame,
+            state_history=[],
+            project_id=self.project_id,
+            requested_ordinal=self.start_ordinal,
+        )
+        record = json.loads((out / "record.json").read_text(encoding="utf-8"))
+        clip_start = max(0.0, float(cluster["t_first"]) - 800.0)
+        clip_end = float(cluster["t_last"]) + 800.0
+        record["clip_start_ms"] = clip_start
+        record["clip_end_ms"] = clip_end
+        if self.source_video:
+            clip_status = export_session_clip(
+                self.source_video,
+                out / "clip.mp4",
+                start_ms=clip_start,
+                end_ms=clip_end,
+            )
+            if clip_status == "ok":
+                record["clip_file"] = "clip.mp4"
+                record["clip_export"] = "ok"
+            else:
+                record["clip_export"] = clip_status
+        (out / "record.json").write_text(
+            json.dumps(record, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        bump_record_count(Path(self.output_root))
+        saved = SessionSavedEvent(
+            record=record,
+            output_dir=out,
+            session_index=ordinal,
+            analysis_weight=analysis.weight,
+            analysis_confidence=analysis.confidence,
+            photo_frame=photo_frame,
+            state_history=[],
+            curve=curve,
+        )
+        self.saved_events.append(saved)
+        if self.on_saved is not None:
+            self.on_saved(saved)
+        self._last_session_end_ms = float(cluster["t_last"])
+        self._last_saved_weight = weight
+
+    def flush_orphans(self) -> None:
+        """EOF: recover orphan sessions after the last saved record.
+
+        Called by the pipeline after the video stream ends (and after any
+        ENTER/WEIGHING EOF flush) so trailing unrest never vanishes.
+        """
+        if not self.persist:
+            return
+        self._save_orphan_records(float("inf"))
+        self._session_raw_samples.clear()
 

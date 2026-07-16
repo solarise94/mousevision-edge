@@ -177,6 +177,13 @@ class WeighingPipeline:
                     import logging
                     logging.getLogger("pipeline").warning("EOF flush failed: %s", e)
                     raise  # propagate to job worker so it records as failure
+            # Trailing unrest after the last session (or a video that ended in
+            # EMPTY) still deserves manual records instead of vanishing.
+            try:
+                driver.flush_orphans()
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger("pipeline").warning("orphan flush failed: %s", e)
             if create_run and persist:
                 finish_run(active_run, status="completed" if driver.saved_events else "empty")
 

@@ -24,6 +24,8 @@ def detect_mouse_box(
     aspect_ratio: tuple[float, float] = (0.3, 2.0),
     pan_roi: dict[str, int] | tuple[int, int, int, int] | None = None,
     use_otsu: bool = True,
+    dark_p05: float | None = None,
+    dark_ratio: float | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Detect a mouse on the scale pan.
 
@@ -39,6 +41,12 @@ def detect_mouse_box(
         pan_roi: absolute pan pixel region ``{x,y,w,h}`` or ``(x,y,w,h)``.
             Must be the scale pan — **not** ``weight_roi`` (LCD screen).
         use_otsu: prefer Otsu adaptive threshold over fixed gray_thr.
+        dark_p05: when set, a candidate blob is accepted only if the 5th
+            percentile gray of its pixels is ``<= dark_p05``. Real mice are
+            near-black (p05 ~0-27); pan stains / reflections stay lighter.
+        dark_ratio: when set, a candidate blob is accepted only if its mean
+            gray is ``<= dark_ratio * median(roi gray)``. Rejects large faint
+            stain blobs that merely sit below the Otsu split.
     """
     h, w = image.shape[:2]
     if pan_roi is not None:
@@ -62,6 +70,7 @@ def detect_mouse_box(
 
     roi = image[y1:y2, x1:x2]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    roi_median = float(np.median(gray)) if dark_ratio is not None else 0.0
     if use_otsu:
         # BINARY_INV: dark mouse on lighter pan becomes white foreground.
         _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -87,6 +96,16 @@ def detect_mouse_box(
         ar = float(bw) / float(bh)
         if ar < ar_lo or ar > ar_hi:
             continue
+        if dark_p05 is not None or dark_ratio is not None:
+            blob_mask = np.zeros_like(mask)
+            cv2.drawContours(blob_mask, [contour], -1, 255, -1)
+            pixels = gray[blob_mask > 0]
+            if pixels.size == 0:
+                continue
+            if dark_p05 is not None and float(np.percentile(pixels, 5)) > float(dark_p05):
+                continue
+            if dark_ratio is not None and float(pixels.mean()) > float(dark_ratio) * roi_median:
+                continue
         candidates.append((area, (x1 + x, y1 + y, bw, bh)))
 
     if not candidates:

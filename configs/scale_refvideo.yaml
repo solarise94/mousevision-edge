@@ -45,9 +45,14 @@ lcd_ocr:
 # Mouse blob detector (UI overlay + leave hold)
 mouse_detect:
   gray_threshold: 70
-  min_area: 800
-  # max_area: leave unset until calibrated; gloves covering whole pan exceed this
-  # max_area: 25000
+  min_area: 3000
+  # Reject pan-sized stain/reflection blobs (empty-pan false positives that
+  # held the fusion zero-hold and merged sessions). Real mice: 20k-100k px.
+  max_area: 130000
+  # Real mice are near-black: blob 5th-percentile gray must be <= 30, and the
+  # blob mean must be clearly darker than the pan (<= 0.62 * ROI median).
+  dark_p05: 30
+  dark_ratio: 0.62
   aspect_ratio: [0.3, 2.0]
   x_ratio: [0.12, 0.88]
   use_otsu: true
@@ -78,6 +83,9 @@ temporal:
   min_weight: 0.0
   max_weight: 50.0
   stick_tol: 0.08
+  # Bound the mouse-on-scale zero hold (re-tare transient): after 4 held zero
+  # frames the zero passes through — a long zero run is a real empty scale.
+  zero_hold_max_frames: 4
 
 # Template matching / OCR confidence floor
 match_threshold: 0.50
@@ -101,6 +109,42 @@ weighing_min_samples: 5
 empty_arm_frames: 3
 # RefVideo turnaround can be ~3–5s; 2500ms was skipping the next real session.
 reenter_cooldown_ms: 1000
+# ENTER fires only after 2 consecutive non-zero fused reads (blocks single
+# fused spikes); ENTER aborts after 3 consecutive confirmed zeros (was: 1) and
+# after 15s stuck (was: never — merged the next animal into the session).
+enter_sustain_frames: 2
+enter_zero_hold_frames: 3
+max_enter_seconds: 15
+# Mouse detector is advisory only (stained pans false-positive, dirty pans
+# never fire) — do not hard-gate ENTER on it.
+require_mouse_for_enter: false
+
+# Session weight from raw-read clustering (http_ocr path). Robust to fused
+# curve starvation: dominant raw cluster over [enter-3s, leave] is the weight.
+raw_cluster:
+  enabled: true
+  tol: 0.12
+  min_conf: 0.35
+  stable_frac: 0.60
+  stable_min_votes: 4
+  stable_max_span: 0.25
+  conflict_min_votes: 3
+  conflict_min_frac: 0.25
+  pre_enter_ms: 3000
+
+# Sustained raw reads BETWEEN sessions that never fused (restless animal)
+# become manual hand-fill records instead of vanishing silently.
+orphan_scan:
+  enabled: true
+  tol: 0.15
+  min_votes: 3
+  min_span_ms: 400
+  min_conf: 0.45
+
+# Same weight again within 2s of a saved record = same animal re-adjusted.
+dup_session:
+  max_gap_ms: 2000
+  weight_tol: 0.10
 
 # Curve analyzer
 platform_window_seconds: 0.8

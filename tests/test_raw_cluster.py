@@ -1,0 +1,102 @@
+"""Raw-cluster session analysis: verdicts, 4/9 confusion, orphan clusters."""
+
+from __future__ import annotations
+
+from mousevision.analyzer.raw_cluster import (
+    RawClusterConfig,
+    analyze_raw_samples,
+    sustained_clusters,
+)
+
+
+def _samples(weights, conf=0.8, t0=1000.0, dt=130.0):
+    return [(t0 + i * dt, w, conf, []) for i, w in enumerate(weights)]
+
+
+def test_stable_dominant_cluster():
+    v = analyze_raw_samples(_samples([17.51, 17.52, 17.50, 17.51, 17.52, 17.51]))
+    assert v.status == "stable"
+    assert v.weight == 17.51
+    assert v.support_frac >= 0.99
+    assert v.confidence >= 0.55
+
+
+def test_spikes_ignored_when_dominant_strong():
+    # settled 15.09 platform + two 37.11 OCR spikes (RefVideo S4 shape)
+    v = analyze_raw_samples(
+        _samples([15.10, 15.09, 37.11, 15.08, 15.10, 37.11, 15.09, 15.10, 15.09])
+    )
+    assert v.status == "stable"
+    assert v.weight == 15.09
+
+
+def test_conflict_keeps_dominant_weight():
+    weights = [17.18, 17.16, 12.71, 13.21, 13.61, 18.11, 17.11, 13.81, 16.81, 16.64, 15.93]
+    v = analyze_raw_samples(_samples(weights))
+    assert v.status == "conflict"
+    assert v.weight is not None
+    assert 16.5 <= v.weight <= 17.5  # dominant 17.1x, not a garbage median
+    assert "cluster_conflict" in v.reason
+
+
+def test_insufficient_when_few_samples():
+    assert analyze_raw_samples(_samples([17.5, 17.5])).status == "insufficient"
+    assert analyze_raw_samples([]).status == "insufficient"
+
+
+def test_no_dominant_still_reports_best_guess_with_review():
+    # three equal-strength clusters: no stable winner, but the conflict
+    # verdict still names a (reviewable) best guess instead of nothing
+    weights = [10.1, 20.2, 30.3, 10.1, 20.2, 30.3, 10.1, 20.2, 30.3]
+    v = analyze_raw_samples(_samples(weights))
+    assert v.status == "conflict"
+    assert v.weight in {10.1, 20.2, 30.3}
+    assert v.support_frac < 0.60
+
+
+def test_low_conf_samples_excluded():
+    v = analyze_raw_samples(_samples([17.5] * 5, conf=0.10))
+    assert v.status == "insufficient"
+
+
+def test_four_nine_prefers_four_cluster():
+    # 24.18 (real, with '4') vs 29.18 (glare) — near-equal votes: prefer 24.18
+    samples = [(1000 + i * 130, 24.18, 0.8, ["2", "4", "1", "8"]) for i in range(4)]
+    samples += [(1600 + i * 130, 29.18, 0.75, ["2", "9", "1", "8"]) for i in range(3)]
+    v = analyze_raw_samples(samples)
+    assert v.weight == 24.18
+
+
+def test_recency_tiebreak_prefers_later_cluster():
+    # equal votes/conf: settlement is the later plateau
+    samples = [(1000 + i * 130, 19.0, 0.8, []) for i in range(4)]
+    samples += [(3000 + i * 130, 10.0, 0.8, []) for i in range(4)]
+    v = analyze_raw_samples(samples)
+    assert v.weight == 10.0
+
+
+def test_two_tuple_samples_accepted():
+    v = analyze_raw_samples([(1000.0, 22.8), (1130.0, 22.8), (1260.0, 22.8)])
+    assert v.status in {"stable", "conflict"}
+    assert v.weight == 22.8
+
+
+def test_stable_span_limit_rejects_wide_cluster():
+    # one wide cluster (drift chain) with span > 0.25 → not "stable"
+    weights = [22.10 + i * 0.05 for i in range(9)]  # span ~0.4
+    v = analyze_raw_samples(_samples(weights))
+    assert v.status != "stable"
+    assert v.weight is not None
+
+
+def test_sustained_clusters_filters_short_and_thin():
+    samples = _samples([17.5] * 4, dt=200.0)  # span 600ms, 4 votes
+    samples += [(9000.0, 30.5, 0.8, []), (9130.0, 30.5, 0.8, [])]  # thin
+    samples += [(20000.0, 12.3, 0.8, []), (20050.0, 12.3, 0.8, []), (20100.0, 12.3, 0.8, [])]  # short span
+    clusters = sustained_clusters(samples, min_votes=3, min_span_ms=400.0)
+    assert [(round(c["median"], 1), c["votes"]) for c in clusters] == [(17.5, 4)]
+
+
+def test_sustained_clusters_respects_min_conf():
+    samples = _samples([17.5] * 4, conf=0.2, dt=200.0)
+    assert sustained_clusters(samples, min_conf=0.45) == []

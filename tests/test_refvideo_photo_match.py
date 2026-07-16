@@ -39,6 +39,7 @@ def test_refvideo_photo_selection_valid(tmp_path: Path):
         assert rec.get("photo_selection") in {
             "platform_midpoint",
             "mouse_on_scale",
+            "platform_weight_match",
         }
         # photo_mouse_detected should be True for most records (mouse was there)
         # but we don't hard-require it - detection may miss on some frames.
