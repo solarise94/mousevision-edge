@@ -38,11 +38,13 @@ class CurvePoint:
 
 @dataclass
 class AnalysisResult:
-    weight: float
+    # weight may be None when analysis produced no usable estimate
+    # (short/aborted/timeout session) — requires_manual_weight should be True.
+    weight: float | None
     confidence: float
     platform_start_ms: float
     platform_end_ms: float
-    photo_frame_index: int
+    photo_frame_index: int | None
     photo_observed_weight: float | None = None
     photo_weight_delta: float | None = None
     photo_selection: str = "platform_midpoint"
@@ -60,7 +62,7 @@ class AnalysisResult:
 @dataclass
 class WeighingRecord:
     box_id: str
-    weight: float
+    weight: float | None
     confidence: float
     timestamp: str
     device: str

@@ -11,7 +11,8 @@ class RawWeightObservation:
     digits: list[str] = field(default_factory=list)
     digit_confidences: list[float] = field(default_factory=list)
     quality: float = 0.0
-    status: str = "unreadable"  # readable | zero_display | transition | unreadable | bad_roi
+    # readable | zero_display | negative_display | transition | unreadable | bad_roi
+    status: str = "unreadable"
     screen_quad: list[list[float]] | None = None
     locator_confidence: float = 0.0
     locator: str | None = None
@@ -27,6 +28,10 @@ class RawWeightObservation:
     @property
     def is_zero_display(self) -> bool:
         return self.status == "zero_display"
+
+    @property
+    def is_negative_display(self) -> bool:
+        return self.status == "negative_display"
 
 
 @dataclass

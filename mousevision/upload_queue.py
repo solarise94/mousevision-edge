@@ -12,6 +12,7 @@ from typing import Any
 
 
 class UploadStatus(str, Enum):
+    HELD = "Held"  # analysis/postflight not yet released for sync
     PENDING = "Pending"
     UPLOADED = "Uploaded"
     RETRY = "Retry"
@@ -63,10 +64,22 @@ class UploadQueue:
             finally:
                 conn.close()
 
-    def enqueue(self, record: dict[str, Any], record_path: Path, photo_path: Path | None = None) -> int:
-        """Insert pending item. Idempotent on record_id: returns existing id if already queued."""
+    def enqueue(
+        self,
+        record: dict[str, Any],
+        record_path: Path,
+        photo_path: Path | None = None,
+        *,
+        status: str | UploadStatus = UploadStatus.HELD,
+    ) -> int:
+        """Insert queue item. Idempotent on record_id: returns existing id if already queued.
+
+        Default status is Held so mid-run analysis cannot be synced until
+        postflight release (P0-b two-phase commit).
+        """
         now = datetime.now().isoformat(timespec="seconds")
         record_id = str(record.get("record_id") or "")
+        status_val = status.value if isinstance(status, UploadStatus) else str(status)
         with self.lock:
             conn = self._connect()
             try:
@@ -89,7 +102,7 @@ class UploadQueue:
                         str(record_path),
                         str(photo_path) if photo_path else None,
                         json.dumps(record, ensure_ascii=False),
-                        UploadStatus.PENDING.value,
+                        status_val,
                         now,
                         now,
                     ),
@@ -229,3 +242,63 @@ class UploadQueue:
                 return {str(r["status"]): int(r["n"]) for r in rows}
             finally:
                 conn.close()
+
+    def release_held(self, record_ids: list[str] | None = None) -> int:
+        """Promote Held rows to Pending. If record_ids is None, release all Held.
+
+        Idempotent: only Held -> Pending. Returns number of rows updated.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.lock:
+            conn = self._connect()
+            try:
+                if record_ids is None:
+                    cur = conn.execute(
+                        """
+                        UPDATE upload_queue
+                        SET status = ?, updated_at = ?
+                        WHERE status = ?
+                        """,
+                        (UploadStatus.PENDING.value, now, UploadStatus.HELD.value),
+                    )
+                else:
+                    ids = [str(r) for r in record_ids if r]
+                    if not ids:
+                        return 0
+                    placeholders = ",".join("?" for _ in ids)
+                    cur = conn.execute(
+                        f"""
+                        UPDATE upload_queue
+                        SET status = ?, updated_at = ?
+                        WHERE status = ? AND record_id IN ({placeholders})
+                        """,
+                        (UploadStatus.PENDING.value, now, UploadStatus.HELD.value, *ids),
+                    )
+                conn.commit()
+                return int(cur.rowcount)
+            finally:
+                conn.close()
+
+    def hold_pending(self, record_ids: list[str]) -> int:
+        """Re-hold Pending rows (startup reconciliation). Returns rows updated."""
+        ids = [str(r) for r in record_ids if r]
+        if not ids:
+            return 0
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.lock:
+            conn = self._connect()
+            try:
+                placeholders = ",".join("?" for _ in ids)
+                cur = conn.execute(
+                    f"""
+                    UPDATE upload_queue
+                    SET status = ?, updated_at = ?
+                    WHERE status = ? AND record_id IN ({placeholders})
+                    """,
+                    (UploadStatus.HELD.value, now, UploadStatus.PENDING.value, *ids),
+                )
+                conn.commit()
+                return int(cur.rowcount)
+            finally:
+                conn.close()
+

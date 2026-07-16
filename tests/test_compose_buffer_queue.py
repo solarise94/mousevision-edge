@@ -45,6 +45,7 @@ def test_upload_queue_enqueue(tmp_path: Path):
         {"box_id": "C57-001", "cage_id": "C57-023", "record_id": "r1", "weight": 16.15},
         record_path=tmp_path / "record.json",
         photo_path=tmp_path / "photo.jpg",
+        status=UploadStatus.PENDING,
     )
     assert rid >= 1
     pending = q.list_pending()
@@ -57,8 +58,8 @@ def test_upload_queue_enqueue(tmp_path: Path):
 def test_upload_queue_idempotent_on_record_id(tmp_path: Path):
     q = UploadQueue(tmp_path / "queue.db")
     payload = {"record_id": "same-uuid", "cage_id": "C57-023", "weight": 16.15}
-    a = q.enqueue(payload, record_path=tmp_path / "a.json")
-    b = q.enqueue(payload, record_path=tmp_path / "b.json")
+    a = q.enqueue(payload, record_path=tmp_path / "a.json", status=UploadStatus.PENDING)
+    b = q.enqueue(payload, record_path=tmp_path / "b.json", status=UploadStatus.PENDING)
     assert a == b
     assert len(q.list_pending()) == 1
 
@@ -72,6 +73,7 @@ def test_upload_queue_update_after_renumber(tmp_path: Path):
         {"record_id": "rec-A", "cage_id": "C57-023", "ordinal": 2, "actual_ordinal": 2},
         record_path=tmp_path / "run" / "mouse_002" / "record.json",
         photo_path=tmp_path / "run" / "mouse_002" / "photo.jpg",
+        status=UploadStatus.PENDING,
     )
     updated = q.update_by_record_id(
         "rec-A",
@@ -94,6 +96,7 @@ def test_upload_queue_delete_by_record_id(tmp_path: Path):
     q.enqueue(
         {"record_id": "rec-D", "cage_id": "C57-023", "weight": 16.0},
         record_path=tmp_path / "r.json",
+        status=UploadStatus.PENDING,
     )
     assert len(q.list_pending()) == 1
     n = q.delete_by_record_id("rec-D")
@@ -108,3 +111,18 @@ def test_create_run_dir_isolated(tmp_path: Path):
     assert ma["run_id"] != mb["run_id"]
     assert (a / "manifest.json").exists()
     assert ma["cage_id"] == "C57-023"
+
+
+def test_upload_queue_default_held(tmp_path: Path):
+    """P0-b: enqueue defaults to Held and is invisible to list_pending."""
+    q = UploadQueue(tmp_path / "queue.db")
+    q.enqueue(
+        {"record_id": "rec-H", "cage_id": "C57-023", "weight": 16.0},
+        record_path=tmp_path / "r.json",
+    )
+    assert len(q.list_pending()) == 0
+    n = q.release_held(["rec-H"])
+    assert n == 1
+    pending = q.list_pending()
+    assert len(pending) == 1
+    assert pending[0]["status"] == UploadStatus.PENDING.value

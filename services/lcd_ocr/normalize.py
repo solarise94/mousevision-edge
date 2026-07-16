@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import cv2
+from binarize import to_binary as _shared_to_binary
 import numpy as np
 
 from locator import quad_to_bbox
@@ -105,20 +106,8 @@ def crop_digit_strip(screen: np.ndarray, cfg: NormalizeConfig | None = None) -> 
     return screen[y0:y1, x0:x1]
 
 
-def _strip_binary(strip: np.ndarray) -> np.ndarray:
-    if strip.ndim == 3:
-        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = strip
-    p92 = float(np.percentile(gray, 92))
-    thr = max(165.0, p92 * 0.88)
-    _, bw = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
-    if float(np.count_nonzero(bw)) < gray.shape[0] * 4:
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        if float(np.mean(bw)) < 127:
-            bw = cv2.bitwise_not(bw)
-    return cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
-
+def _strip_binary(gray_or_bgr):
+    return _shared_to_binary(gray_or_bgr, thr_scale=0.88, thr_floor=165.0)
 
 def ink_trim_strip(strip: np.ndarray, *, pad: float = 0.05) -> np.ndarray:
     """Tighten to first→last ink column. Never split on inter-digit gaps."""

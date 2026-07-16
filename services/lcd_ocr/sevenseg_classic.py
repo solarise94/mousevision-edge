@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import cv2
+
+from binarize import to_binary as _shared_to_binary
 import numpy as np
 
 # Classic 7-seg bitmasks: bits = a b c d e f g (MSB=a)
@@ -30,22 +32,7 @@ class SlotDecode:
 
 
 def _to_binary(patch_bgr_or_gray: np.ndarray, *, thr_scale: float = 0.90) -> np.ndarray:
-    if patch_bgr_or_gray.ndim == 3:
-        gray = cv2.cvtColor(patch_bgr_or_gray, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = patch_bgr_or_gray
-    if gray.size == 0:
-        return np.zeros((1, 1), dtype=np.uint8)
-    p92 = float(np.percentile(gray, 92))
-    thr = max(160.0, p92 * thr_scale)
-    _, bw = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
-    # Digits are bright on blue LCD → keep white-on-black.
-    if float(np.mean(bw)) > 127:
-        ink = float(np.count_nonzero(bw)) / float(bw.size)
-        if ink > 0.55:
-            bw = cv2.bitwise_not(bw)
-    return bw
+    return _shared_to_binary(patch_bgr_or_gray, thr_scale=thr_scale, thr_floor=160.0)
 
 
 def _trim(bw: np.ndarray) -> np.ndarray:

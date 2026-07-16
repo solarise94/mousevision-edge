@@ -773,11 +773,49 @@ class AnalysisJobManager:
                 # rollback shortfall alongside the format-error cause.
                 exc.args = (f"{exc} | 回滚不完整: {shortfall}",)
             raise
+        # P0-b: postflight passed — release Held queue rows for this run.
+        try:
+            run_dir = Path(getattr(result, "run_dir", None) or "")
+            if not run_dir:
+                # PipelineResult may expose run_id only; reconstruct from output.
+                run_dir = Path(getattr(result, "output_root", "") or "")
+            if run_dir and run_dir.is_dir():
+                self._release_held_for_run(run_dir)
+            else:
+                # Fallback: release all Held (single-job worker is single-run).
+                if self.upload_queue is not None:
+                    self.upload_queue.release_held(None)
+        except Exception:
+            pass
         return {
             "run_id": result.run_id,
             "record_count": count,
             "decoded_frames": decoded_frames,
         }
+
+
+    def _release_held_for_run(self, run_dir: Path) -> None:
+        """Promote Held queue rows for records under run_dir to Pending.
+
+        Called after successful postflight (truncation/codec checks). Idempotent.
+        """
+        if self.upload_queue is None:
+            return
+        run_dir = Path(run_dir)
+        if not run_dir.is_dir():
+            return
+        record_ids: list[str] = []
+        for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
+            try:
+                import json as _json
+                raw = _json.loads(rec_path.read_text(encoding="utf-8"))
+                rid = str(raw.get("record_id") or "")
+                if rid:
+                    record_ids.append(rid)
+            except Exception:
+                continue
+        if record_ids:
+            self.upload_queue.release_held(record_ids)
 
     def _check_truncation(
         self, video_path: Path, decoded_frames: int, job: dict[str, Any]

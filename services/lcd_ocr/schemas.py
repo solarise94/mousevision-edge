@@ -12,6 +12,7 @@ STATUS_ZERO = "zero_display"
 STATUS_TRANSITION = "transition"
 STATUS_UNREADABLE = "unreadable"
 STATUS_BAD_ROI = "bad_roi"
+STATUS_NEGATIVE = "negative_display"
 
 
 @dataclass

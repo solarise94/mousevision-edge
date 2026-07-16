@@ -1,10 +1,8 @@
 """Mouse presence detection for photo selection and UI annotation.
 
-This module provides a simple, dependency-light mouse detector used both by
-the photo-selection pipeline (``SessionDriver``) and the live UI preview.
-It operates on grayscale thresholding + morphology + largest-contour area,
-which is sufficient to answer "is there a mouse-sized dark blob on the scale
-platform?" without a trained model.
+Simple, dependency-light detector: grayscale/Otsu thresholding + morphology
++ constrained contour selection. Answers "is there a mouse-sized dark blob
+on the scale pan?" without a trained model.
 """
 
 from __future__ import annotations
@@ -21,39 +19,78 @@ def detect_mouse_box(
     *,
     gray_thr: int = 70,
     min_area: int = 800,
+    max_area: int | None = None,
     x_ratio: tuple[float, float] = (0.12, 0.88),
+    aspect_ratio: tuple[float, float] = (0.3, 2.0),
+    pan_roi: dict[str, int] | tuple[int, int, int, int] | None = None,
+    use_otsu: bool = True,
 ) -> tuple[int, int, int, int] | None:
-    """Detect a mouse on the scale platform.
+    """Detect a mouse on the scale pan.
 
-    Looks for a dark blob in the region between the top of the frame and the
-    LCD box. Returns a bounding box ``(x, y, w, h)`` or ``None`` if no
-    mouse-sized contour is found.
+    Returns bounding box ``(x, y, w, h)`` or ``None``.
 
     Args:
         image: BGR frame.
-        lcd: LCD box (with ``.y`` attribute) or ``None``. When provided, the
-            search region is bounded above the LCD; otherwise a default
-            upper-half crop is used.
-        gray_thr: grayscale threshold (mouse is darker than background).
-        min_area: minimum contour area in pixels to count as a mouse.
-        x_ratio: horizontal crop ratio to exclude frame edges.
+        lcd: LCD box (with ``.y``) or None. Used only when pan_roi is absent.
+        gray_thr: fixed threshold when Otsu is disabled (darker = mouse).
+        min_area / max_area: contour area bounds in pixels.
+        x_ratio: horizontal crop when pan_roi is absent.
+        aspect_ratio: allowed width/height range for a mouse blob.
+        pan_roi: absolute pan pixel region ``{x,y,w,h}`` or ``(x,y,w,h)``.
+            Must be the scale pan — **not** ``weight_roi`` (LCD screen).
+        use_otsu: prefer Otsu adaptive threshold over fixed gray_thr.
     """
     h, w = image.shape[:2]
-    y1 = 40
-    y2 = lcd.y - 10 if lcd is not None else int(h * 0.55)
-    x1, x2 = int(w * x_ratio[0]), int(w * x_ratio[1])
-    if y2 <= y1 + 20:
+    if pan_roi is not None:
+        if isinstance(pan_roi, dict):
+            x1 = int(pan_roi.get("x", 0))
+            y1 = int(pan_roi.get("y", 0))
+            rw = int(pan_roi.get("w", w))
+            rh = int(pan_roi.get("h", h))
+        else:
+            x1, y1, rw, rh = (int(v) for v in pan_roi)
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x1 + rw, w))
+        y2 = max(y1 + 1, min(y1 + rh, h))
+    else:
+        y1 = 40
+        y2 = lcd.y - 10 if lcd is not None else int(h * 0.55)
+        x1, x2 = int(w * x_ratio[0]), int(w * x_ratio[1])
+    if y2 <= y1 + 20 or x2 <= x1 + 20:
         return None
+
     roi = image[y1:y2, x1:x2]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, gray_thr, 255, cv2.THRESH_BINARY_INV)
+    if use_otsu:
+        # BINARY_INV: dark mouse on lighter pan becomes white foreground.
+        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    else:
+        _, mask = cv2.threshold(gray, gray_thr, 255, cv2.THRESH_BINARY_INV)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    contour = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(contour) < min_area:
+
+    ar_lo, ar_hi = float(aspect_ratio[0]), float(aspect_ratio[1])
+    candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < float(min_area):
+            continue
+        if max_area is not None and area > float(max_area):
+            continue
+        x, y, bw, bh = cv2.boundingRect(contour)
+        if bh <= 0:
+            continue
+        ar = float(bw) / float(bh)
+        if ar < ar_lo or ar > ar_hi:
+            continue
+        candidates.append((area, (x1 + x, y1 + y, bw, bh)))
+
+    if not candidates:
         return None
-    x, y, bw, bh = cv2.boundingRect(contour)
-    return x1 + x, y1 + y, bw, bh
+    # Prefer largest legal candidate (not unfiltered max contour).
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return candidates[0][1]

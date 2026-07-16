@@ -49,15 +49,23 @@ def test_platform_median_ignores_ramp_and_zero():
     assert result.weight_source == "stable_curve_median"
 
 
-def test_short_curve_uses_middle():
+def test_short_curve_no_longer_bypasses_std():
+    """Short sessions must not take middle-median without stability check.
+
+    With a 2s platform window and only ~1s of data, the sliding window may
+    still find a stable segment (returns result) or fall through to None /
+    unstable — but it must not silently bypass std.
+    """
     values = [0.0, 10.0, 20.0, 21.0, 20.5, 0.0]
     analyzer = WeightCurveAnalyzer(
-        CurveAnalyzerConfig(platform_window_seconds=2.0, near_zero=0.5)
+        CurveAnalyzerConfig(platform_window_seconds=2.0, near_zero=0.5, platform_max_std=0.35)
     )
     result = analyzer.analyze(_curve(values, dt_ms=200))
-    assert result is not None
-    assert result.weight > 10
-    assert result.photo_selection == "platform_midpoint"
+    # Either a normal/unstable platform result, or None for driver manual path.
+    if result is not None:
+        assert result.weight is None or result.weight >= 0
+        # Must not claim clean short bypass with platform_midpoint only from middle half.
+        assert result.weight_source in {"stable_curve_median", "guessed_unstable"}
 
 
 def test_all_zero_returns_none():

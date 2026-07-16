@@ -43,7 +43,7 @@ class SessionSavedEvent:
     record: dict[str, Any]
     output_dir: Path
     session_index: int  # ordinal within run (1-based)
-    analysis_weight: float
+    analysis_weight: float | None
     analysis_confidence: float
     photo_frame: Frame | None
     state_history: list[dict[str, Any]]
@@ -124,6 +124,7 @@ class SessionDriver:
                 empty_arm_frames=empty_arm,
                 reenter_cooldown_ms=cooldown_ms,
                 require_mouse_for_enter=bool(self.use_http_ocr),
+                max_session_ms=float(cfg.get("max_session_seconds", 30)) * 1000.0,
             )
         )
         self.analyzer = WeightCurveAnalyzer(
@@ -144,6 +145,12 @@ class SessionDriver:
         # Raw OCR samples during ENTER/WEIGHING: (timestamp_ms, weight).
         # Instability is scored only inside the chosen platform window.
         self._session_raw_samples: list[tuple[float, float]] = []
+        # P1-e passive training flywheel (raw OCR observations per session).
+        self._collect_training = bool(
+            (cfg.get("training_collect") if isinstance(cfg, dict) else False)
+            or __import__("os").environ.get("MOUSEVISION_TRAINING_COLLECT", "")
+        )
+        self._training_obs: list[dict[str, object]] = []
         self._unstable_raw_range_g = float(
             (cfg.get("temporal") or {}).get("unstable_raw_range_g")
             or cfg.get("unstable_raw_range_g")
@@ -191,6 +198,10 @@ class SessionDriver:
                 gray_thr=int(md_cfg.get("gray_threshold", 70)),
                 min_area=int(md_cfg.get("min_area", 800)),
                 x_ratio=tuple(md_cfg.get("x_ratio", (0.12, 0.88))),
+                max_area=(int(md_cfg["max_area"]) if md_cfg.get("max_area") is not None else None),
+                aspect_ratio=tuple(md_cfg.get("aspect_ratio", (0.3, 2.0))),
+                pan_roi=md_cfg.get("pan_roi") or md_cfg.get("roi"),
+                use_otsu=bool(md_cfg.get("use_otsu", True)),
             )
         except Exception:  # noqa: BLE001
             return None
@@ -204,6 +215,23 @@ class SessionDriver:
         if self.use_http_ocr:
             assert isinstance(self.reader, HttpOcrReader)
             raw: RawWeightObservation = self.reader.read_observation(frame.image)
+            if self._collect_training:
+                self._training_obs.append(
+                    {
+                        "frame_index": int(frame.index),
+                        "timestamp_ms": float(frame.timestamp_ms),
+                        "timestamp_source": getattr(frame, "timestamp_source", "pts"),
+                        "weight": raw.weight,
+                        "status": raw.status,
+                        "digits": list(raw.digits),
+                        "digit_confidences": list(raw.digit_confidences),
+                        "confidence": float(raw.confidence),
+                        "quality": float(raw.quality),
+                        "screen_quad": raw.screen_quad,
+                        "model_version": raw.model_version,
+                        "collection_scope": "session",
+                    }
+                )
             lcd = self.reader.lcd_box()
             mouse_present = self._detect_mouse(frame, lcd)
             stable = self.fusion.update(
@@ -296,15 +324,11 @@ class SessionDriver:
             self._handle_analyze()
             self._pinned = False
             self._session_raw_samples.clear()
+            # keep _training_obs until after save in _handle_analyze
             self.fusion.reset()
             if self.use_http_ocr and isinstance(self.reader, HttpOcrReader):
                 self.reader.reset_tracking()
 
-        if prev_state == WeighingState.ENTER and state == WeighingState.EMPTY:
-            self.buffer.clear()
-            self._pinned = False
-            self._session_raw_samples.clear()
-            self.fusion.reset()
 
         return event
 
@@ -312,12 +336,18 @@ class SessionDriver:
         self, analysis: AnalysisResult, *, reason: str, guess: float | None = None
     ) -> None:
         """Flag analysis as no-stable-platform; keep weight as display guess."""
-        guessed = round(float(guess if guess is not None else analysis.weight), 2)
+        if guess is not None:
+            guessed = round(float(guess), 2)
+        elif analysis.weight is not None:
+            guessed = round(float(analysis.weight), 2)
+        else:
+            guessed = None
         analysis.weight = guessed
         analysis.guessed_weight = guessed
         analysis.requires_manual_weight = True
         analysis.needs_review = True
         analysis.weight_source = "guessed_unstable"
+
         analysis.confidence = min(
             float(analysis.confidence or 0.0), self._unstable_confidence_cap
         )
@@ -357,11 +387,12 @@ class SessionDriver:
             # Template RefVideo can still settle from the fused curve; HTTP OCR
             # should expose the gap and require experimenter confirmation.
             if self.use_http_ocr:
-                guess = (
-                    float(np.median(np.asarray(raws, dtype=np.float64)))
-                    if raws
-                    else float(analysis.weight)
-                )
+                if raws:
+                    guess = float(np.median(np.asarray(raws, dtype=np.float64)))
+                elif analysis.weight is not None:
+                    guess = float(analysis.weight)
+                else:
+                    guess = None
                 self._mark_unstable(
                     analysis, reason="insufficient_raw_samples", guess=guess
                 )
@@ -383,16 +414,20 @@ class SessionDriver:
     def _select_photo_with_mouse(self, analysis) -> tuple[Any, bool, str, float, float, float]:
         """Choose a photo frame preferring mouse-on-scale + OCR consistency."""
         analyzer_idx = analysis.photo_frame_index
-        analyzer_frame = self.buffer.nearest_frame(analyzer_idx)
         items = list(self.buffer.items())
+        if analyzer_idx is None:
+            analyzer_frame = items[-1].frame if items else None
+            analyzer_idx = int(analyzer_frame.index) if analyzer_frame is not None else None
+        else:
+            analyzer_frame = self.buffer.nearest_frame(analyzer_idx)
         if not items or analyzer_frame is None:
             return (
                 analyzer_frame,
                 False,
-                "platform_midpoint",
-                analyzer_idx,
-                analysis.photo_observed_weight or 0.0,
-                analysis.photo_weight_delta or 0.0,
+                "platform_midpoint" if analyzer_idx is not None else "none",
+                analyzer_idx if analyzer_idx is not None else -1,
+                float(analysis.photo_observed_weight or 0.0),
+                float(analysis.photo_weight_delta or 0.0),
             )
 
         md_cfg = self.config.get("mouse_detect", {})
@@ -401,7 +436,7 @@ class SessionDriver:
         md_xr = tuple(md_cfg.get("x_ratio", (0.12, 0.88)))
         near_zero = float(self.config.get("near_zero", 0.5))
         weight_tol = float(self.config.get("photo_weight_tol", 0.15))
-        target_w = float(analysis.weight)
+        target_w = float(analysis.weight) if analysis.weight is not None else 0.0
 
         def _lcd_for(item):
             if self.use_http_ocr:
@@ -415,6 +450,10 @@ class SessionDriver:
                 gray_thr=md_gray,
                 min_area=md_area,
                 x_ratio=md_xr,
+                max_area=(int(md_cfg["max_area"]) if md_cfg.get("max_area") is not None else None),
+                aspect_ratio=tuple(md_cfg.get("aspect_ratio", (0.3, 2.0))),
+                pan_roi=md_cfg.get("pan_roi") or md_cfg.get("roi"),
+                use_otsu=bool(md_cfg.get("use_otsu", True)),
             )
 
         def _pan_overlap_ok(box, lcd, frame_h: int) -> bool:
@@ -508,7 +547,7 @@ class SessionDriver:
             observed = (
                 float(best.weight) if best.weight is not None else float(analysis.weight)
             )
-            delta = abs(observed - analysis.weight)
+            delta = abs(observed - (analysis.weight if analysis.weight is not None else observed))
             return (
                 best.frame,
                 True,
@@ -545,7 +584,7 @@ class SessionDriver:
                 "platform_weight_match",
                 best.frame.index,
                 round(observed, 2),
-                round(abs(observed - analysis.weight), 3),
+                round(abs(observed - (analysis.weight if analysis.weight is not None else observed)), 3),
             )
 
         return (
@@ -557,15 +596,65 @@ class SessionDriver:
             analysis.photo_weight_delta or 0.0,
         )
 
+
+    def _manual_fallback_result(
+        self,
+        curve: list,
+        *,
+        reason: str,
+        end_reason: str = "",
+    ) -> AnalysisResult:
+        """Build a requires_manual_weight result when analyze() returns None."""
+        if curve:
+            t0 = float(curve[0].timestamp_ms)
+            t1 = float(curve[-1].timestamp_ms)
+            last_idx = int(curve[-1].frame_index)
+        else:
+            t0 = t1 = 0.0
+            last_idx = None
+        reasons = [reason]
+        if end_reason and end_reason not in reasons:
+            reasons.append(end_reason)
+        return AnalysisResult(
+            weight=None,
+            confidence=0.0,
+            platform_start_ms=t0,
+            platform_end_ms=t1,
+            photo_frame_index=last_idx,
+            photo_observed_weight=None,
+            photo_weight_delta=None,
+            photo_selection="none",
+            weight_source="manual_required",
+            needs_review=True,
+            review_reason=",".join(reasons),
+            guessed_weight=None,
+            requires_manual_weight=True,
+        )
+
     def _handle_analyze(self) -> None:
-        analysis = self.analyzer.analyze(self.sm.session.curve)
+        curve_snapshot = list(self.sm.session.curve)
+        end_reason = str(getattr(self.sm.session, "end_reason", "") or "")
+        analysis = self.analyzer.analyze(curve_snapshot)
         if analysis is None:
-            self.sm.finish_analyze(
-                self.sm.session.curve[-1].timestamp_ms if self.sm.session.curve else 0.0
+            reason = "analyze_no_result"
+            if end_reason == "abort_short_session":
+                reason = "abort_short_session"
+            elif end_reason == "session_timeout":
+                reason = "session_timeout"
+            analysis = self._manual_fallback_result(
+                curve_snapshot, reason=reason, end_reason=end_reason
             )
-            self.buffer.clear()
-            self._session_raw_samples.clear()
-            return
+        elif end_reason == "session_timeout":
+            # Timeout always forces manual even if a platform was found.
+            analysis.requires_manual_weight = True
+            analysis.needs_review = True
+            if analysis.guessed_weight is None and analysis.weight is not None:
+                analysis.guessed_weight = float(analysis.weight)
+            analysis.weight_source = "guessed_unstable"
+            reason = "session_timeout"
+            analysis.review_reason = (
+                f"{analysis.review_reason},{reason}" if analysis.review_reason else reason
+            )
 
         (
             photo_frame,
@@ -578,26 +667,34 @@ class SessionDriver:
         analysis.photo_mouse_detected = mouse_detected
         analysis.photo_selection = selection_label
         analysis.photo_verified = mouse_detected
-        analysis.photo_frame_index = photo_idx
-        analysis.photo_observed_weight = observed_w
-        analysis.photo_weight_delta = weight_delta
+        if analysis.photo_frame_index is None:
+            analysis.photo_frame_index = photo_idx
+        if analysis.photo_observed_weight is None:
+            analysis.photo_observed_weight = observed_w
+        if analysis.photo_weight_delta is None:
+            analysis.photo_weight_delta = weight_delta
         # Analyzer may already have marked no_stable_platform; also catch
         # fusion-stuck curves where raw OCR still oscillated.
-        if analysis.requires_manual_weight and analysis.guessed_weight is None:
+        if (
+            analysis.requires_manual_weight
+            and analysis.guessed_weight is None
+            and analysis.weight is not None
+        ):
             analysis.guessed_weight = float(analysis.weight)
-        self._apply_raw_instability(analysis)
+        if analysis.weight is not None:
+            self._apply_raw_instability(analysis)
         near_zero = float(self.config.get("near_zero", 0.5))
         photo_tol = float(self.config.get("photo_weight_tol", 0.15))
-        if mouse_detected and analysis.weight <= near_zero:
+        if mouse_detected and analysis.weight is not None and analysis.weight <= near_zero:
             analysis.needs_review = True
             reason = "mouse_on_scale_zero_weight"
             analysis.review_reason = (
                 f"{analysis.review_reason},{reason}" if analysis.review_reason else reason
             )
         # Only flag mismatch when the photo frame carried a real OCR weight.
-        # Missing buffer weights decode as 0.0 and must not fake a 17.x delta.
         if (
-            analysis.weight > near_zero
+            analysis.weight is not None
+            and analysis.weight > near_zero
             and observed_w > near_zero
             and weight_delta > max(0.35, photo_tol * 3)
             and not analysis.requires_manual_weight
@@ -608,13 +705,12 @@ class SessionDriver:
                 f"{analysis.review_reason},{reason}" if analysis.review_reason else reason
             )
         if self._pending_review_reason:
-            # Transient cluster conflicts often resolve into a clean platform —
-            # don't mark the whole session for review if analysis is solid.
             pending = self._pending_review_reason
             solid = (
                 not analysis.needs_review
                 and not analysis.requires_manual_weight
                 and float(analysis.confidence or 0.0) >= 0.55
+                and analysis.weight is not None
                 and float(analysis.weight) > near_zero
                 and pending.startswith("cluster_conflict")
             )
@@ -630,16 +726,16 @@ class SessionDriver:
                 self._pending_review_reason = ""
         history = [
             {
-                "previous": t.previous.value,
-                "current": t.current.value,
-                "t_ms": t.timestamp_ms,
-                "reason": t.reason,
+                "previous": tr.previous.value,
+                "current": tr.current.value,
+                "t_ms": tr.timestamp_ms,
+                "reason": tr.reason,
             }
-            for t in self.sm.history
+            for tr in self.sm.history
         ]
-        curve_snapshot = list(self.sm.session.curve)
         self.session_index += 1
         ordinal = self.start_ordinal + (self.session_index - 1)
+        wait_clear = end_reason == "session_timeout"
 
         if not self.persist:
             saved = SessionSavedEvent(
@@ -672,8 +768,9 @@ class SessionDriver:
             if self.on_saved is not None:
                 self.on_saved(saved)
             ts = curve_snapshot[-1].timestamp_ms if curve_snapshot else 0.0
-            self.sm.finish_analyze(ts)
+            self.sm.finish_analyze(ts, wait_clear=wait_clear)
             self.buffer.clear()
+            self._training_obs.clear()
             return
 
         out = self.recorder.save(
@@ -709,6 +806,33 @@ class SessionDriver:
             json.dumps(record, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        # P1-e: dump training assets under mouse_NNN/training_assets/ (independent).
+        if self._collect_training and self._training_obs:
+            try:
+                assets = out / "training_assets"
+                assets.mkdir(parents=True, exist_ok=True)
+                import json as _json
+                with (assets / "ocr_observations.jsonl").open("w", encoding="utf-8") as fh:
+                    for row in self._training_obs:
+                        fh.write(_json.dumps(row, ensure_ascii=False) + "\n")
+                (assets / "manifest.json").write_text(
+                    _json.dumps(
+                        {
+                            "schema_version": 1,
+                            "record_id": record.get("record_id"),
+                            "n_observations": len(self._training_obs),
+                            "note": "Passive OCR observation log; crops/strips deferred to full flywheel.",
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            self._training_obs.clear()
+        else:
+            self._training_obs.clear()
         bump_record_count(Path(self.output_root))
         saved = SessionSavedEvent(
             record=record,
@@ -721,17 +845,21 @@ class SessionDriver:
             curve=curve_snapshot,
         )
         self.saved_events.append(saved)
-        # Hold upload until experimenter confirms unstable sessions.
+        # P0-b: non-manual records enqueue as Held until postflight release.
+        # Manual records still skip queue until experimenter confirms weight.
         if self.upload_queue is not None and not analysis.requires_manual_weight:
             photo_file = out / "photo.jpg"
             self.upload_queue.enqueue(
                 record,
                 record_path=out / "record.json",
                 photo_path=photo_file if photo_file.exists() else None,
+                status="Held",
             )
         if self.on_saved is not None:
             self.on_saved(saved)
 
         ts = curve_snapshot[-1].timestamp_ms if curve_snapshot else 0.0
-        self.sm.finish_analyze(ts)
+        self.sm.finish_analyze(ts, wait_clear=wait_clear)
         self.buffer.clear()
+        self._training_obs.clear()
+

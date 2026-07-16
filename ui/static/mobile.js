@@ -377,12 +377,11 @@
   }
 
   function pickMime() {
+    // P1-d: force MP4/H.264 only — no webm fallback.
     if (!window.MediaRecorder) return "";
     const list = [
       "video/mp4;codecs=avc1.42E01E",
       "video/mp4",
-      "video/webm;codecs=vp8",
-      "video/webm",
     ];
     return list.find((t) => MediaRecorder.isTypeSupported(t)) || "";
   }
@@ -1157,24 +1156,25 @@
         return;
       }
       const mime = pickMime();
-      const opts = { videoBitsPerSecond: 1500000 };
-      if (mime) opts.mimeType = mime;
+      if (!mime) {
+        toast("当前浏览器不支持 MP4/H.264 录像，请更换浏览器后重试");
+        disableRecording("当前浏览器不支持 MP4/H.264 录像");
+        return;
+      }
+      const opts = { videoBitsPerSecond: 1500000, mimeType: mime };
       try { recorder = new MediaRecorder(canvasStream, opts); }
-      catch (_) {
-        try { recorder = new MediaRecorder(canvasStream); }
-        catch (err2) {
-          toast("当前浏览器不支持网页录像，请更换浏览器后重试");
-          disableRecording();
-          return;
-        }
+      catch (err2) {
+        toast("无法启动 MP4 录像，请更换浏览器后重试");
+        disableRecording();
+        return;
       }
       recorder.addEventListener("dataavailable", (e) => {
         if (e.data && e.data.size) chunks.push(e.data);
       });
       recorder.addEventListener("stop", () => {
         clearInterval(clockTimer);
-        const type = recorder.mimeType || mime || "video/webm";
-        const ext = type.includes("mp4") ? "mp4" : "webm";
+        const type = recorder.mimeType || mime || "video/mp4";
+        const ext = "mp4";
         const blob = new Blob(chunks, { type });
         const durationSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
         // Freeze meta before stopping the camera track (hdjeldn: never refresh

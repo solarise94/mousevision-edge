@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import cv2
+from binarize import to_binary as _shared_to_binary
 import numpy as np
 
 
@@ -17,22 +18,8 @@ class StripQuality:
     evidence: dict[str, Any]
 
 
-def _strip_binary(strip_bgr: np.ndarray) -> np.ndarray:
-    if strip_bgr.ndim == 3:
-        gray = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = strip_bgr
-    if gray.size == 0:
-        return np.zeros((1, 1), dtype=np.uint8)
-    p92 = float(np.percentile(gray, 92))
-    thr = max(150.0, p92 * 0.88)
-    _, bw = cv2.threshold(gray, thr, 255, cv2.THRESH_BINARY)
-    if float(np.mean(bw)) > 127:
-        ink = float(np.count_nonzero(bw)) / float(bw.size)
-        if ink > 0.55:
-            bw = cv2.bitwise_not(bw)
-    return bw
-
+def _strip_binary(gray_or_bgr):
+    return _shared_to_binary(gray_or_bgr, thr_scale=0.88, thr_floor=150.0)
 
 def tall_glyph_ranges(strip_bgr: np.ndarray) -> list[tuple[int, int]]:
     """Return full-height digit components without assuming a digit count.

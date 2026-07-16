@@ -46,7 +46,13 @@ lcd_ocr:
 mouse_detect:
   gray_threshold: 70
   min_area: 800
+  # max_area: leave unset until calibrated; gloves covering whole pan exceed this
+  # max_area: 25000
+  aspect_ratio: [0.3, 2.0]
   x_ratio: [0.12, 0.88]
+  use_otsu: true
+  # pan_roi: absolute scale-pan pixels (NOT weight_roi / LCD). Calibrate on device.
+  # pan_roi: {x: 80, y: 120, w: 560, h: 520}
 
 templates_dir: assets/templates
 
@@ -100,6 +106,7 @@ reenter_cooldown_ms: 1000
 platform_window_seconds: 0.8
 platform_max_std: 0.35
 near_zero: 0.5
+max_session_seconds: 30
 photo_match_tol: 0.02
 photo_min_confidence: 0.45
 

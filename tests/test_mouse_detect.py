@@ -59,3 +59,25 @@ def test_detect_mouse_small_blob_below_threshold():
     frame = _blank_frame()
     frame[100:110, 100:110, :] = 30  # 10x10 = 100px, below min_area 800
     assert detect_mouse_box(frame, _FakeLCD()) is None
+
+
+def test_detect_mouse_rejects_huge_blob():
+    """max_area rejects pan-filling gloves."""
+    frame = _blank_frame()
+    frame[50:400, 50:650, :] = 20  # huge dark region
+    assert detect_mouse_box(frame, _FakeLCD(), max_area=5000) is None
+
+
+def test_detect_mouse_rejects_extreme_aspect():
+    frame = _blank_frame()
+    # very wide thin bar
+    frame[200:220, 100:600, :] = 20
+    assert detect_mouse_box(frame, _FakeLCD(), aspect_ratio=(0.5, 1.5)) is None
+
+
+def test_detect_mouse_pan_roi_limits_search():
+    frame = _blank_frame()
+    # blob only in upper area outside pan_roi
+    frame[50:120, 200:400, :] = 20
+    # pan_roi is lower
+    assert detect_mouse_box(frame, None, pan_roi={"x": 0, "y": 400, "w": 720, "h": 300}) is None

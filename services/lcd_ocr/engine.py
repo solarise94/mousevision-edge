@@ -20,6 +20,7 @@ from schemas import (
     STATUS_TRANSITION,
     STATUS_UNREADABLE,
     STATUS_ZERO,
+    STATUS_NEGATIVE,
     LatencyBreakdown,
     ReadResult,
 )
@@ -33,6 +34,8 @@ def _map_status(status: str) -> str:
         return STATUS_READABLE
     if status == "zero_display":
         return STATUS_ZERO
+    if status == "negative_display":
+        return STATUS_NEGATIVE
     if status == "transition":
         return STATUS_TRANSITION
     return STATUS_UNREADABLE

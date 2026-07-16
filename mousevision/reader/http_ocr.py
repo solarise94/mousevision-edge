@@ -143,6 +143,11 @@ class HttpOcrReader:
 
         conf = float(payload.get("confidence") or payload.get("quality") or 0.0)
         status = str(payload.get("status") or "unreadable")
+        if weight_f is not None and weight_f < 0:
+            status = "negative_display"
+            weight_f = None
+        elif status == "negative_display":
+            weight_f = None
         digits = [str(d) for d in (payload.get("digits") or [])]
         digit_confs = [float(c) for c in (payload.get("digit_confidences") or [])]
         quad = payload.get("screen_quad")

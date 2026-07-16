@@ -156,13 +156,8 @@ class WeightCurveAnalyzer:
 
         duration_ms = float(times[-1] - times[0])
         window_ms = self.config.platform_window_seconds * 1000.0
-        if duration_ms < window_ms * 0.5:
-            # Short session: use median of middle half as the platform.
-            mid0 = len(weights) // 4
-            mid1 = max(mid0 + 1, (3 * len(weights)) // 4)
-            return self._result_from_platform(
-                times, weights, confs, indices, mid0, mid1
-            )
+        # Short sessions no longer bypass std stability: they fall through to
+        # the normal sliding-window search (and to unstable/None if none fit).
 
         candidates: list[tuple[float, int, int, float, float]] = []
         for i in range(len(weights)):

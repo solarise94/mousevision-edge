@@ -14,6 +14,8 @@ class WeighingState(str, Enum):
     WEIGHING = "WEIGHING"
     LEAVE = "LEAVE"
     ANALYZE = "ANALYZE"
+    # After session_timeout: wait for continuous near-zero before re-arming.
+    WAIT_CLEAR = "WAIT_CLEAR"
 
 
 @dataclass
@@ -30,6 +32,8 @@ class StateMachineConfig:
     reenter_cooldown_ms: float = 2500.0
     # HTTP OCR: require mouse on scale before ENTER (blocks phantom 10.11 opens).
     require_mouse_for_enter: bool = False
+    # Active session (ENTER+WEIGHING) hard timeout from enter_ms (ms).
+    max_session_ms: float = 30_000.0
 
 
 @dataclass
@@ -37,6 +41,8 @@ class SessionData:
     curve: list[CurvePoint] = field(default_factory=list)
     enter_ms: float | None = None
     leave_ms: float | None = None
+    # Optional end reason for driver: session_timeout | abort_short_session | ...
+    end_reason: str = ""
 
 
 @dataclass
@@ -58,6 +64,7 @@ class WeighingStateMachine:
         self._arming = False
         self._empty_arm_count = 0
         self._reenter_after_ms: float = 0.0
+        self._wait_clear_count = 0
         self.history: list[StateTransition] = []
 
     def reset_session(self) -> None:
@@ -95,6 +102,25 @@ class WeighingStateMachine:
             elif abs(float(weight) - self._platform_ref) <= 1.0:
                 self._platform_ref = 0.85 * self._platform_ref + 0.15 * float(weight)
 
+    def _check_session_timeout(self, timestamp_ms: float) -> bool:
+        """If ENTER/WEIGHING exceeded max_session_ms, force ANALYZE once.
+
+        Returns True if timeout was triggered (caller should return immediately).
+        """
+        cfg = self.config
+        if self.state not in {WeighingState.ENTER, WeighingState.WEIGHING}:
+            return False
+        if self.session.enter_ms is None:
+            return False
+        if float(cfg.max_session_ms) <= 0:
+            return False
+        if timestamp_ms - float(self.session.enter_ms) < float(cfg.max_session_ms):
+            return False
+        self.session.leave_ms = timestamp_ms
+        self.session.end_reason = "session_timeout"
+        self._set_state(WeighingState.ANALYZE, timestamp_ms, "session_timeout")
+        return True
+
     def update(
         self,
         timestamp_ms: float,
@@ -108,12 +134,17 @@ class WeighingStateMachine:
 
         Confirmed 0g with mouse still detected holds leave. Unreadable frames
         still count toward leave. After ANALYZE→EMPTY, require empty_arm_frames
-        of near-empty before the next ENTER.
+        of near-empty before the next ENTER. Active sessions (ENTER+WEIGHING)
+        hard-timeout after max_session_ms from enter_ms.
         """
         cfg = self.config
         # Only ENTER/WEIGHING contribute to the weighing curve (not LEAVE).
         if self.state in {WeighingState.ENTER, WeighingState.WEIGHING} and weight is not None:
             self._append(timestamp_ms, weight, confidence, frame_index)
+
+        # Active-session hard timeout covers ENTER + WEIGHING.
+        if self._check_session_timeout(timestamp_ms):
+            return self.state
 
         if self.state == WeighingState.EMPTY:
             near_empty = weight is None or weight <= cfg.leave_max
@@ -155,8 +186,13 @@ class WeighingStateMachine:
                         WeighingState.WEIGHING, timestamp_ms, "sustained_nonzero"
                     )
             elif weight is not None and weight <= cfg.empty_max:
-                self._set_state(WeighingState.EMPTY, timestamp_ms, "abort_to_empty")
-                self.reset_session()
+                # Short abort: keep curve/history and go ANALYZE so driver can
+                # emit a manual record instead of silently discarding.
+                self.session.leave_ms = timestamp_ms
+                self.session.end_reason = "abort_short_session"
+                self._set_state(
+                    WeighingState.ANALYZE, timestamp_ms, "abort_short_session"
+                )
 
         elif self.state == WeighingState.WEIGHING:
             confirmed_zero = weight is not None and weight <= cfg.leave_max
@@ -178,11 +214,40 @@ class WeighingStateMachine:
         elif self.state == WeighingState.ANALYZE:
             pass
 
+        elif self.state == WeighingState.WAIT_CLEAR:
+            # After timeout: require continuous near-zero before re-arming.
+            # mouse_present=False is auxiliary only — do not re-arm on a single
+            # false mouse detection while weight is still non-zero.
+            near_empty = weight is not None and weight <= cfg.leave_max
+            if near_empty:
+                self._wait_clear_count += 1
+                if self._wait_clear_count >= max(1, cfg.empty_arm_frames):
+                    self._wait_clear_count = 0
+                    self._arming = False
+                    self._empty_arm_count = 0
+                    self._set_state(WeighingState.EMPTY, timestamp_ms, "scale_cleared")
+            else:
+                self._wait_clear_count = 0
+
         return self.state
 
-    def finish_analyze(self, timestamp_ms: float) -> None:
+    def finish_analyze(self, timestamp_ms: float, *, wait_clear: bool = False) -> None:
+        """End ANALYZE. If wait_clear, enter WAIT_CLEAR instead of EMPTY.
+
+        wait_clear is used after session_timeout so a mouse still on the scale
+        cannot immediately open a second session.
+        """
+        if wait_clear:
+            self._set_state(WeighingState.WAIT_CLEAR, timestamp_ms, "record_saved_wait_clear")
+            self.reset_session()
+            self._arming = True
+            self._empty_arm_count = 0
+            self._wait_clear_count = 0
+            self._reenter_after_ms = float(timestamp_ms) + float(self.config.reenter_cooldown_ms)
+            return
         self._set_state(WeighingState.EMPTY, timestamp_ms, "record_saved")
         self.reset_session()
         self._arming = True
         self._empty_arm_count = 0
+        self._wait_clear_count = 0
         self._reenter_after_ms = float(timestamp_ms) + float(self.config.reenter_cooldown_ms)

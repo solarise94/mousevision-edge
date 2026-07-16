@@ -36,11 +36,14 @@ def test_full_cycle_empty_to_analyze():
 
 
 def test_abort_false_enter():
+    """Short abort after ENTER keeps curve and goes ANALYZE (manual path)."""
     sm = WeighingStateMachine(
         StateMachineConfig(enter_min=1.0, weighing_min_samples=5, empty_max=0.15)
     )
     _feed(sm, [0.0, 2.0, 0.0, 0.0])
-    assert sm.state == WeighingState.EMPTY
+    assert sm.state == WeighingState.ANALYZE
+    assert sm.session.end_reason == "abort_short_session"
+    assert len(sm.session.curve) >= 1
 
 
 def test_history_cleared_between_sessions():
@@ -241,3 +244,31 @@ def test_leave_state_not_appended_to_curve():
     assert len(sm.session.curve) == curve_len
     sm.update(600, 0.0, 0.9, 100)
     assert len(sm.session.curve) == curve_len
+
+
+def test_session_timeout_forces_analyze_and_wait_clear():
+    sm = WeighingStateMachine(
+        StateMachineConfig(
+            enter_min=1.0,
+            weighing_min_samples=2,
+            leave_hold_frames=50,
+            max_session_ms=1000.0,
+            empty_arm_frames=2,
+            reenter_cooldown_ms=0.0,
+        )
+    )
+    # Enter and stay non-zero beyond timeout without leave.
+    sm.update(0, 10.0, 0.9, 0)
+    sm.update(100, 12.0, 0.9, 1)
+    assert sm.state == WeighingState.WEIGHING
+    sm.update(1200, 12.0, 0.9, 2)
+    assert sm.state == WeighingState.ANALYZE
+    assert sm.session.end_reason == "session_timeout"
+    sm.finish_analyze(1200, wait_clear=True)
+    assert sm.state == WeighingState.WAIT_CLEAR
+    # Non-empty weight does not re-arm.
+    sm.update(1300, 5.0, 0.9, 3)
+    assert sm.state == WeighingState.WAIT_CLEAR
+    sm.update(1400, 0.0, 0.9, 4)
+    sm.update(1500, 0.0, 0.9, 5)
+    assert sm.state == WeighingState.EMPTY
