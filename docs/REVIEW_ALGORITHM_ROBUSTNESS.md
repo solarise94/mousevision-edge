@@ -1,8 +1,12 @@
 # 后端算法鲁棒性 Review（上称检测 / OCR 光影 / 读数稳定 / 视频帧率）
 
-> 状态：**review 完成，决策已确认，待落代码**。本文档梳理现有判断逻辑的薄弱点并记录最终决策（见第 7 节）。
+> 状态：**review 完成，决策已确认，待落代码**。本文档梳理现有判断逻辑的薄弱点并记录最终决策（见第 6/7 节）。
 > 范围：`mousevision/`、`services/lcd_ocr/`、`ui/static/mobile.js`、`ui/app.py`。
 > 行号对应当前 `main` 分支（`ee9fa63`）工作区状态。
+>
+> **修订记录**：
+> - v1（2026-07-16）：初版决策。
+> - v2（2026-07-16）：经第二轮 review 发现 v1 存在事实性错误，已修正 3 个阻断项 + 5 个 P1/P2 设计缺口（见第 6 节各决策的"v2 修正"子项）。**v1 的若干结论不成立，以 v2 为准。**
 
 ---
 
@@ -267,40 +271,61 @@ if decoded_duration < recorded * 0.5:   # jobs.py:808
 经过逐项讨论，所有待定问题已拍板。下面是最终决策，作为落代码的依据。
 
 ### 决策 1：上称检测 —— 几何约束 + 状态机兜底，模型留作 P3 评估
-- **现在做（P1）**：给 `detect.py` 加 `max_area`（小鼠斑块面积上限）+ 长宽比约束；ROI 收窄到秤盘像素区（复用 yaml 已有的 `weight_roi`）；二值化改自适应阈值（Otsu）；给状态机加 WEIGHING 最大时长、归零优先于 `mouse_present`。所有阈值做成 yaml 可调，部署后用真实数据调。
-- **后续评估（P3）**：若几何约束在真实数据不够稳，评估开源模型。**首选 DAMM（Detect Any Mouse Model）**——为"复杂环境下定位小鼠"设计的预训练检测器，许可兼容；但需先用本项目的称重视频（含手套）验证其对手套的区分能力，不达标则用 Roboflow mouse 数据集 + 自有 clip.mp4 标注微调，导出 ONNX 在边缘 CPU 跑，只对灰度检出的大块做二次确认。项目可开源，绕开 YOLOv8 AGPL 顾虑（但 DAMM 基于 detectron2/Apache-2.0，无传染风险）。
+- **现在做（P1）**：给 `detect.py` 加 `max_area`（小鼠斑块面积上限）+ 长宽比约束；二值化改自适应阈值（Otsu）。所有阈值做成 yaml 可调，部署后用真实数据调。
+- **后续评估（P3）**：若几何约束在真实数据不够稳，评估开源模型。候选 DAMM（Detect Any Mouse Model）——为"复杂环境下定位小鼠"设计的预训练检测器；但需先用本项目的称重视频（含手套）验证其对手套的区分能力，不达标则用 Roboflow mouse 数据集 + 自有 clip.mp4 标注微调，导出 ONNX 在边缘 CPU 跑，只对灰度检出的大块做二次确认。
 - **理由**：几何约束改动局部、不需训练数据、能消除绝大多数手套误判和卡死；模型工程量大（标注+训练+集成+回归），先用低成本方案验证，不够再上。
 
-### 决策 2：读数稳定 —— 负数显式标记 + WEIGHING 30s 超时 + 短会话一律产人工记录
-- **负数（2A）**：给 `RawWeightObservation` 加负数标记，每个会话统计负数帧占比；超阈值（如 >30%）在记录标"称状态异常"。负数仍不进聚类（过滤行为不变），但留痕可追溯，能区分是秤硬件问题还是 OCR 问题。
-- **WEIGHING 超时（2B）**：设 **30s** 最大时长。小鼠正常称重 5~10s 就稳，30s 还没稳基本是卡住/抖动。超时强制 LEAVE → ANALYZE → 走人工兜底。
-- **短会话（2C）**：不管多短，只要触发过称重就产出一条 `requires_manual_weight=True` 的记录（带原因：会话过短/点数不足）并导出 clip.mp4。同时短会话也走 std 判定，不再用中段中位数绕过（`analyzer/__init__.py:159-165` 的放宽逻辑移除）。
+> **v2 修正（阻断项，必读）**：
+> 1. **ROI 不能复用 `weight_roi`。** v1 计划"复用 yaml 已有的 weight_roi 收窄鼠检测范围"是**错误的**——已核实 `configs/scale_refvideo.yaml:18-22` 的 `weight_roi: {x:145,y:780,w:430,h:110}` 是 **LCD 显示屏定位区**（`find_lcd_box` 的 `fixed_roi`，见 `template.py:365-366`、`http_ocr.py:74-80`），而鼠检测当前搜索的是 LCD **上方**区域（`detect.py:47` 的 `y2=lcd.y-10`）。直接复用会让检测器盯着显示屏。**正确做法**：在 `mouse_detect:` 下新增独立的 `mouse_detect.roi` / `pan_roi`（秤盘像素坐标），需用实际视频标定，不可与 `weight_roi` 共用。
+> 2. **DAMM 许可证措辞修正。** v1 称"许可兼容、基于 detectron2/Apache-2.0 无传染风险"**不能成立**——已查证 [DAMM 仓库](https://github.com/backprop64/DAMM) 根目录未提供 LICENSE 文件；Detectron2 的 Apache-2.0 只覆盖 Detectron2 本身，**不会自动授权 DAMM 自身代码或模型权重**。正确表述：**DAMM 许可证待作者确认，未确认前仅做内部评估，不集成、不分发。**
 
-### 决策 3：视频帧率 —— 后端读 PTS 治本 + 截断误判转人工不回滚
-- **治本**：改 `video.py` 用 ffprobe/ffmpeg 读逐帧真实 PTS 作为 `timestamp_ms`，替代 `index/fps` 恒定帧率假设。帧率裁切 `frame_stride` 改为按时间间隔采样，或保留帧号 stride 但用 PTS 修正时间戳。需更新 `test_video_ffmpeg_backend.py` 断言。
-- **截断回滚**：`jobs.py:_check_truncation` 判异常时**不自动回滚**已写盘的 run 目录/上传队列/序号，改为标记待人工确认。避免正常录制因 VFR 误判而结果丢失。
-- **附带的统一兜底**：`video.py`（解码）和 `jobs.py`（截断校验）的 fps 兜底值统一为 15.0（前端目标就是 15fps）。
-- **理由**：后端是对所有视频的最后一道防线，PTS 对任何设备/来源的 VFR 视频都有效，且截断误判导致的结果回滚只有改后端能根治。
+### 决策 2：读数稳定 —— 负数端到端支持 + WEIGHING 30s 超时（含清秤等待）+ 短会话统一转人工
+- **WEIGHING 超时（2B）**：设 **30s** 最大时长。小鼠正常称重 5~10s 就稳，30s 还没稳基本是卡住/抖动。超时强制进入人工兜底。
+- **短会话（2C）**：不管多短，只要触发过称重就产出一条 `requires_manual_weight=True` 的记录并导出 clip.mp4。同时短会话也走 std 判定，不再用中段中位数绕过（`analyzer/__init__.py:159-165` 的放宽逻辑移除）。
 
-### 决策 4：录制格式 —— 前端强制 MP4，不支持就报错
-- 前端 `pickMime()`（`mobile.js:379-388`）改为：检测到不支持 MP4/H.264 时**直接报错提示用户换设备/浏览器**，不回退 webm。强制单一 MP4/H.264 格式。
-- **理由**：在已选 PTS 治本的前提下，webm 兜底的实际必要性降低；单一格式更好维护，且既然要动前端录制逻辑，顺手收紧格式门槛值得。牺牲部分旧设备兼容性换取一致性。
+> **v2 修正（阻断项，必读）**：
+> 1. **负数不能只加字段——OCR 根本不识别负号（2A）。** v1 计划"给 `RawWeightObservation` 加 `negative` 字段统计占比"是**无效的**——已核实经典七段解码的字符类别只有 `blank | 0-9 | invalid`（`sevenseg_classic.py:27`），没有负号类别；且文本解析 `parse.py:20` 的 `re.sub(r"[^0-9.,]", "", text)` 会**主动删除 `-`**。也就是说当前 OCR **根本无法产出负数观测**，加字段永远收不到数据。**正确做法（端到端，前置依赖）**：
+>    - 先在 OCR **服务端**（`services/lcd_ocr/`）增加负号区域检测（秤显示屏左侧/数字前的符号位），新增 `negative_display` 状态到 `schemas.py` 的 status 枚举；
+>    - `RawWeightObservation` 透传该状态到主程序；
+>    - **再**做占比统计。占比分母需明确定义：用"会话期间 OCR 可读帧总数"而非"所有帧"；并定义"全程负数、从未 ENTER"的归属（建议计为会话级秤异常标记，不产出重量记录）。
+> 2. **WEIGHING 超时必须配套清秤等待，否则会拆会话（2B 阻断）。** v1"超时强制 LEAVE→ANALYZE"不完整——已核实 `finish_analyze()`（`detector/__init__.py:183-188`）会 `_set_state(EMPTY)` 并 `_arming=True`；若超时时鼠**仍在秤上**，冷却结束（`reenter_cooldown_ms`）后会再次 ENTER，把同一只鼠拆成多个会话/多条记录。**正确做法**：新增 `WAIT_CLEAR`/`TIMED_OUT` 状态——超时只生成**一次**人工记录，然后**等待连续归零或确认鼠离开**才重新武装（`_arming=True`），而非无脑回 EMPTY。
+> 3. **短会话不能只修 `len(curve)<5`（2C 阻断）。** v1 只提到这一处 `None` 路径，但 `analyzer.analyze` 返回 `None` 的路径有多条：过滤后不足 5 点（`analyzer/__init__.py:129`）、全零、非零段过短、找不到候选窗等。**正确做法**：在 **`SessionDriver` 边界**统一拦截——凡"触发过会话（曾进入 ENTER/WEIGHING）但 `analyze` 返回 `None`"，一律转为人工记录，而不依赖 analyzer 内部各 `None` 分支分别处理。同时需定义无合理猜测时的字段表示：`weight=None`、`guessed_weight=None`、`photo_frame_index` 取最后一次有效帧或 `None`，`review_reason` 标明"分析无结果/会话过短"。
 
-### 决策 5：数据飞轮 —— 两阶段，全量收集，带保留策略
+### 决策 3：视频帧率 —— 后端读 PTS 治本（实现需收敛）+ 截断可疑记录隔离闭环
+- **治本方向**：改 `video.py` 用逐帧真实 PTS 作为 `timestamp_ms`，替代 `index/fps` 恒定帧率假设。
+- **截断方向**：`jobs.py:_check_truncation` 判异常时不自动销毁数据，改为隔离待人工确认。
+- **附带的统一兜底**：`video.py`（解码）和 `jobs.py`（截断校验）的 fps 兜底值统一为 15.0。
+- **理由**：后端是对所有视频的最后一道防线，PTS 对任何设备/来源的 VFR 视频都有效。
+
+> **v2 修正（阻断项，必读）**：
+> 1. **PTS 实现必须收敛为一种，且不能用 packet PTS（P1）。** v1 笼统说"用 ffprobe/ffmpeg 读逐帧 PTS"，但已核实当前 `video.py:343-357` 的 ffmpeg 命令只输出裸 `rawvideo` 管道，**完全丢弃了时间戳元数据**，packet PTS 无法和 rawvideo 帧按序对应（B-frame 下 packet 顺序 ≠ 展示顺序）。**正确做法**：明确选用以下之一，且整库统一：
+>    - **方案 a（推荐）**：ffmpeg 加 `-vf showinfo`，解析 stderr 每帧的 `pts_time`（与解码输出严格同步）；
+>    - **方案 b**：ffprobe `-show_frames -select_streams v` 读 `best_effort_timestamp_time`。
+>    **禁止**用 packet `-show_packets` 直接按序映射 rawvideo 帧。必须处理：非零/负起始 PTS 的归一化、缺失 PTS 的回退（退回 `index/fps` 并标记）、非单调时间戳。**截断判断随后应基于首尾解码 PTS 的真实时长**，不再用 `frames × stride / fps`。**验收测试必须包含真实 VFR fixture**（非合成 CFR 视频改个标称 fps）。
+> 2. **"截断不回滚"必须配套隔离机制，否则可疑记录会继续同步（阻断）。** v1 说"不回滚、标记待人工"不完整——已核实调用顺序：driver 在 `_run_pipeline`（`jobs.py:629`）里已跑完分析并让记录**入队**（`driver.py:724-731`），`_check_truncation`（`jobs.py:766`）是**之后**才跑的。仅"保留文件+标记人工"会让可疑的部分记录仍在队列里作为正常数据被上传/核对/发布。**必须定义完整隔离闭环**：
+>    - job/run 级标记 `format_suspect`；
+>    - 该 run 的所有记录进入 **Held/Quarantined 状态**：禁止上传、禁止核对通过、禁止发布；
+>    - 人工确认"视频完整"→ 统一释放（Held→正常，放行上传）；
+>    - 人工确认"确实截断"→ 删除记录，并处理已占用序号（释放或标记跳过，避免后续编号冲突）。
+
+### 决策 4：录制格式 —— 前端强制 MP4/H.264（移除所有回退）+ 后端校验 codec
+- 目标：强制单一 MP4/H.264 格式，去掉 webm 兜底。
+
+> **v2 修正（P1，必读）**：v1 只说"改 `pickMime()`"**不够**。已核实 `mobile.js:380-388` 的 `pickMime()` 在无 MP4 支持时返回 `""`，而 `mobile.js:1162` 的 `new MediaRecorder(canvasStream, opts)` 在 `mimeType` 为空时**仍会创建 recorder**（浏览器默认容器，通常 `video/webm`）；`mobile.js:1164` 还有 `catch` 后无 MIME 重试。**正确做法**：
+> - 前端：`pickMime()` 无 H.264 MP4 支持时**抛错**而非返回 `""`；移除 `mobile.js:1162-1164` 的无 MIME 构造和 catch 回退，构造失败直接终止录制并提示用户。
+> - 后端：上传后用 ffprobe 校验 `codec_name=h264` 且容器为 mov/mp4——**`video/mp4` 这个 MIME 本身不严格保证 H.264**（可能是 HEVC/H.265 的 mp4），必须显式校验 codec。校验失败转人工/要求重录。
+
+### 决策 5：数据飞轮 —— 两阶段，全量收集，保存真实 OCR 输入，训练资产独立隔离
 背景：人工修正流程已存在（`requires_manual_weight` → clip.mp4 → 回放确认 → 补值），但流程产出数据**不足以喂训练**——单帧 OCR 原始观测只在内存（`driver.py:567` clear）、LCD 裁剪图不存、检测框 bbox 不落盘、正常记录无修正入口、无误检标签。好消息是 `tools/explain_session_replay.py` 已证明这些数据技术上都能产出，只需接到生产流程。
 
-**阶段一（P1，纯被动收集，零打扰）**：每次称重自动额外保存训练原材料：
-- 单帧 OCR 原始观测（`RawWeightObservation`：逐位数字+置信度+原始文本）追加写到 `mouse_NNN/ocr_observations.jsonl`；
-- LCD strip 裁剪图（喂给 OCR 的那块，复用 `explain_session_replay._crop_quad` 现成实现）；
-- 检测框 bbox 写入 record.json + ROI 裁剪图保存。
-- 不改变任何现有流程，实验员完全无感。
+**阶段一（P1，纯被动收集，零打扰）**：每次称重自动额外保存训练原材料。
+**阶段二（P2，主动标注，小幅前端改动）**：放开修正入口 + 误检标签。
+**收集范围**：全量收集（所有会话），带保留策略，加 env/yaml 开关默认开。
 
-**阶段二（P2，主动标注，小幅前端改动）**：
-- 放开正常记录的修正入口（前端出修正框 + 后端 `confirm-weight` 允许非手填记录），修正时同时保留原始值到 `original_weight` / `ocr_predicted_weight`；
-- 加"标记误检"按钮 + `detection_label`(mouse/glove/empty/other) 字段，供检测模型攒负样本标签；
-- 修正事件与具体 frame_index + 该帧 LCD crop + bbox 绑定存储。
-
-**收集范围**：**全量收集（所有会话，含正常记录）**，覆盖"模型预测对/错"全光谱。带保留策略（yaml 可配保留天数/磁盘限额，超额自动清理旧的），避免边缘设备磁盘撑爆。收集行为加 env/yaml 开关，默认开。
+> **v2 修正（P1，必读）**：
+> 1. **保存的必须是 OCR 实际输入，不是原图轴对齐裁剪（阻断）。** v1 说"复用 `explain_session_replay._crop_quad()` 保存 LCD crop"是**错误的**——已核实 `_crop_quad()` 只是对原图 LCD bbox 做轴对齐裁剪；而生产 OCR 真正使用的是经过**规范化（warp/裁切）、digit ROI 截取、raw/CLAHE 变体选择后的 strip**。保存 `_crop_quad` 的产物训练不出对生产有用的 OCR 模型。**正确做法**：让 OCR 服务在响应中**返回或可选落盘实际选中的 normalized strip**（以及 digit slot patches），主程序保存这个真实输入。需扩展 lcd-ocr 服务的响应 schema 增加可选的 strip 图（base64 或路径）。
+> 2. **建立逐帧 manifest，绑定全部上下文（P1）。** 每个会话产出一个逐帧 manifest（jsonl 或 parquet），每行包含：`frame_index, pts_ms, raw_observation(digits/conf/status), screen_quad, mouse_bbox, strip_crop_path, digit_slot_paths, model_version, config_hash, schema_version`。这样修正/标注事件才能精确关联到具体帧和具体模型输入。
+> 3. **训练资产必须独立子目录，保留策略只能清训练资产（P1）。** v1 说"保留策略清理旧的"有风险——可能误删 `record.json`、photo.jpg、待人工确认的 clip.mp4 或已标注样本。**正确做法**：训练资产（ocr_observations.jsonl、crops、strips、slots、manifest）统一放 `mouse_NNN/training_assets/` 子目录；保留策略（按天数/限额）**只扫描该子目录**清理，绝不触碰 record.json/photo.jpg/clip.mp4。已人工标注（有 detection_label 或修正过的）样本应排除在自动清理外或单独长期保留。
 
 ---
 
@@ -311,22 +336,25 @@ if decoded_duration < recorded * 0.5:   # jobs.py:808
 
 ---
 
-## 7. 落地优先级（最终版）
+## 7. 落地优先级（v2，经第二轮 review 调整）
 
-| 优先级 | 修改项 | 对应决策 | 模块 |
-|---|---|---|---|
-| **P0** | 后端读逐帧 PTS，替代 `index/fps`；统一 fps 兜底为 15.0 | 决策 3 | `video.py`、`test_video_ffmpeg_backend.py` |
-| **P0** | 截断误判转人工不回滚 | 决策 3 | `jobs.py:_check_truncation` |
-| **P0** | WEIGHING 加 30s 最大时长；曲线 <5 点产人工记录而非 None | 决策 2 | `detector/`、`analyzer/` |
-| **P1** | 上称检测加 max_area + 长宽比 + ROI 收窄 + 自适应阈值 | 决策 1 | `detect.py`、yaml |
-| **P1** | 负数显式标记 + 会话负数占比统计 | 决策 2 | `http_ocr.py`、`observations.py` |
-| **P1** | 二值化前 mask 反光高光斑；统一 `_to_binary` | §2.3 | `sevenseg_classic.py` 等 |
-| **P1** | 前端强制 MP4，不支持报错 | 决策 4 | `mobile.js:pickMime` |
-| **P1** | 短会话移除中段中位数放宽，统一走 std 判定 | 决策 2 | `analyzer/__init__.py:159-165` |
-| **P1** | 数据飞轮阶段一：被动收集（OCR 观测 jsonl + LCD crop + 检测框 ROI），全量+保留策略 | 决策 5 | `driver.py`、`recorder.py` |
-| **P2** | 定位层 HSV 范围自适应 | §2.3 | `locator.py` |
-| **P2** | 数据飞轮阶段二：放开正常记录修正入口 + 误检标签 + 事件帧绑定 | 决策 5 | `pc.js`、`app.py`、`records_meta.py` |
-| **P3** | 评估/集成小鼠检测模型（DAMM 优先） | 决策 1 | 新模块 |
+> 顺序遵循第二轮 review 认可的总体顺序：**PTS / 隔离机制 / 超时状态机 → 短会话 → 独立 pan ROI → 负号端到端 → 数据飞轮 P1**。
+> "依赖"列标注前置项；有依赖的项必须在其前置完成后才能开始。
+
+| 批次 | 修改项 | 对应决策 | 模块 | 依赖 |
+|---|---|---|---|---|
+| **P0-a** | 后端 PTS：用 `-vf showinfo` 解析 `pts_time`（或 `best_effort_timestamp_time`），替代 `index/fps`；处理非零/负起始 PTS、缺失/非单调 PTS 回退；统一 fps 兜底 15.0 | 决策 3 | `video.py`、`test_video_ffmpeg_backend.py` | 无；**验收须含真实 VFR fixture** |
+| **P0-b** | 截断隔离闭环：`format_suspect` 标记 + Held/Quarantined 状态（禁上传/核对/发布）+ 人工确认释放/拒绝；截断时长改用首尾 PTS；处理已占序号 | 决策 3 | `jobs.py`、`upload_queue.py`、`records_meta.py`、UI | P0-a（依赖真实 PTS 算截断） |
+| **P0-c** | WEIGHING 30s 超时 + 新增 `WAIT_CLEAR`/`TIMED_OUT` 状态（只产一次人工记录，等清秤才重新武装） | 决策 2 | `detector/__init__.py` | 无 |
+| **P1-a** | 短会话统一转人工：在 `SessionDriver` 边界拦截"曾进入会话但 analyze 返回 None"的所有路径；定义无猜测时字段表示 | 决策 2 | `driver.py`、`analyzer/__init__.py` | 无 |
+| **P1-b** | 新增独立 `mouse_detect.roi`/`pan_roi`（秤盘像素，实际视频标定，不复用 `weight_roi`）+ `max_area` + 长宽比 + 自适应阈值(Otsu) | 决策 1 | `detect.py`、yaml | 无 |
+| **P1-c** | 负号端到端：OCR 服务端负号区域检测 + `negative_display` 状态 → 透传 → 占比统计（定义分母=可读帧，定义全程负数归属） | 决策 2 | `services/lcd_ocr/`、`observations.py`、`http_ocr.py` | 无（但须先于依赖它的统计逻辑） |
+| **P1-d** | 前端强制 MP4/H.264：`pickMime` 无 H.264 抛错、移除无 MIME 回退；后端 ffprobe 校验 `codec_name=h264` | 决策 4 | `mobile.js`、`app.py` | 无 |
+| **P1-e** | 数据飞轮 P1 被动收集：OCR 服务返回真实 chosen strip（扩展 schema）+ 逐帧 manifest + 训练资产独立子目录 + 仅清训练资产的保留策略 | 决策 5 | `services/lcd_ocr/`、`driver.py`、`recorder.py` | P1-c（strip 含负号信息后才有意义） |
+| **P1-f** | OCR 光影：二值化前 mask 反光高光斑；统一 4 处 `_to_binary` | §2.3 | `sevenseg_classic.py` 等 | 无 |
+| **P2-a** | 定位层 HSV 范围自适应 | §2.3 | `locator.py` | 无 |
+| **P2-b** | 数据飞轮 P2 主动标注：放开正常记录修正入口（留 `original_weight`）+ `detection_label` + 事件帧绑定 | 决策 5 | `pc.js`、`app.py`、`records_meta.py` | P1-e |
+| **P3** | 评估/集成小鼠检测模型（DAMM 候选，**许可证未确认前仅内部评估**） | 决策 1 | 新模块 | P1-b 数据沉淀后 |
 
 ---
 
