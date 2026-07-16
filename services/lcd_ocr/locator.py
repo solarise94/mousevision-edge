@@ -66,6 +66,42 @@ def _quad_aspect(quad: list[tuple[float, float]]) -> float:
     return width / height
 
 
+
+def _adapt_hsv_range(
+    image: np.ndarray,
+    hsv_low: tuple[int, int, int],
+    hsv_high: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Widen HSV V/S bounds based on the image's blue-pixel statistics.
+
+    The LCD blue background can shift in saturation/brightness under different
+    lighting. If the fixed range finds too few blue pixels, relax V and S
+    bounds toward the median of pixels in the blue hue band.
+    """
+    if image.size == 0:
+        return hsv_low, hsv_high
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    # Pixels in the configured hue band (blue ~90-130).
+    hue_mask = (h >= hsv_low[0]) & (h <= hsv_high[0])
+    n_blue = int(np.count_nonzero(hue_mask))
+    if n_blue < 200:
+        # Too few blue pixels: relax S/V downward to catch dim/desaturated LCD.
+        med_s = float(np.median(s)) if s.size else 40.0
+        med_v = float(np.median(v)) if v.size else 80.0
+        new_s_low = max(15, int(min(hsv_low[1], med_s * 0.6)))
+        new_v_low = max(30, int(min(hsv_low[2], med_v * 0.6)))
+        return (hsv_low[0], new_s_low, new_v_low), hsv_high
+    # Enough blue pixels: use their median S/V to tighten or relax bounds.
+    s_blue = s[hue_mask]
+    v_blue = v[hue_mask]
+    med_s = float(np.median(s_blue))
+    med_v = float(np.median(v_blue))
+    # Relax lower bounds if the median is below the configured floor.
+    new_s_low = min(hsv_low[1], max(15, int(med_s * 0.5)))
+    new_v_low = min(hsv_low[2], max(30, int(med_v * 0.5)))
+    return (hsv_low[0], new_s_low, new_v_low), hsv_high
+
 def _blue_coverage(
     image: np.ndarray,
     quad: list[tuple[float, float]],
@@ -78,7 +114,8 @@ def _blue_coverage(
     pts = np.asarray(quad, dtype=np.int32).reshape(-1, 1, 2)
     cv2.fillConvexPoly(mask, pts, 255)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    blue = cv2.inRange(hsv, np.array(hsv_low), np.array(hsv_high))
+    adapted_low, adapted_high = _adapt_hsv_range(image, hsv_low, hsv_high)
+    blue = cv2.inRange(hsv, np.array(adapted_low), np.array(adapted_high))
     inside = cv2.bitwise_and(blue, blue, mask=mask)
     area = float(np.count_nonzero(mask))
     if area < 1:
@@ -155,7 +192,8 @@ def locate_hsv_quad(
     prefer_axis_bbox: bool = True,
 ) -> LocateResult | None:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array(hsv_low), np.array(hsv_high))
+    adapted_low, adapted_high = _adapt_hsv_range(image, hsv_low, hsv_high)
+    mask = cv2.inRange(hsv, np.array(adapted_low), np.array(adapted_high))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

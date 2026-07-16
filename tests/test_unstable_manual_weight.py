@@ -316,6 +316,11 @@ def test_confirm_weight_api_enqueues_manual_confirmed(tmp_path: Path, monkeypatc
 
     saved["requires_manual_weight"] = True
     (mouse_dir / "record.json").write_text(json.dumps(saved), encoding="utf-8")
+    # P2-b: requires_manual_weight alone no longer blocks if weight is filled.
+    app_mod._reject_if_manual_weight_required(record_id)  # should NOT raise
+
+    saved["weight"] = None
+    (mouse_dir / "record.json").write_text(json.dumps(saved), encoding="utf-8")
     with pytest.raises(Exception) as exc:
         app_mod._reject_if_manual_weight_required(record_id)
     assert "手填" in str(exc.value.detail)

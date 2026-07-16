@@ -41,6 +41,8 @@ class RecordsMetaStore:
                         operator TEXT,
                         notes TEXT NOT NULL DEFAULT '',
                         tags TEXT NOT NULL DEFAULT '',
+                        detection_label TEXT,
+                        original_weight REAL,
                         updated_at TEXT NOT NULL
                     )
                     """
@@ -51,6 +53,12 @@ class RecordsMetaStore:
                     ON records_meta(status)
                     """
                 )
+                # P2-b: add detection_label / original_weight columns (idempotent).
+                for col, decl in [("detection_label", "TEXT"), ("original_weight", "REAL")]:
+                    try:
+                        conn.execute(f"ALTER TABLE records_meta ADD COLUMN {col} {decl}")
+                    except sqlite3.OperationalError:
+                        pass  # column already exists
             finally:
                 conn.close()
 
@@ -88,7 +96,7 @@ class RecordsMetaStore:
         return row
 
     def update(self, record_id: str, *, operator: str | None = None, **changes: Any) -> dict[str, Any]:
-        allowed = {"status", "verified", "published_at", "deleted_at", "operator", "notes", "tags"}
+        allowed = {"status", "verified", "published_at", "deleted_at", "operator", "notes", "tags", "detection_label", "original_weight"}
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError(f"unsupported meta fields: {sorted(unknown)}")

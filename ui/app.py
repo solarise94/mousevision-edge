@@ -1519,7 +1519,8 @@ def _load_mutable_record(record_id: str) -> tuple[dict[str, Any], Path, dict[str
 
 def _reject_if_manual_weight_required(record_id: str) -> None:
     _, _, raw = _load_mutable_record(record_id)
-    if bool(raw.get("requires_manual_weight")):
+    # P2-b: only block when weight is still None (genuinely unresolved).
+    if bool(raw.get("requires_manual_weight")) and raw.get("weight") is None:
         raise HTTPException(
             status_code=400,
             detail="无稳定帧：请先手填确认体重后再核对/发布",
@@ -1541,6 +1542,9 @@ def api_confirm_weight(
     if not bool(raw.get("requires_manual_weight")):
         raise HTTPException(status_code=400, detail="该记录不需要手填体重")
     weight = round(float(body.weight), 2)
+    # P2-b: preserve original algorithm weight for training flywheel.
+    if raw.get("original_weight") is None and raw.get("weight") is not None:
+        raw["original_weight"] = raw.get("weight")
     if raw.get("guessed_weight") is None and raw.get("weight") is not None:
         raw["guessed_weight"] = raw.get("weight")
     raw["weight"] = weight
@@ -1685,6 +1689,23 @@ def api_reject_record(record_id: str, user: dict[str, Any] = Depends(require_wri
 class BatchRecordAction(BaseModel):
     record_ids: list[str]
     action: str = Field(..., pattern="^(publish|unpublish|delete|restore|verify|reject)$")
+
+
+
+@app.post("/api/records/{record_id}/detection-label", dependencies=[Depends(require_write_access)])
+def api_set_detection_label(
+    record_id: str,
+    body: dict[str, Any] = Body(...),
+    user: dict[str, Any] = Depends(require_write_access),
+) -> dict[str, Any]:
+    """P2-b: Set detection_label (mouse / glove / empty / other) for training flywheel."""
+    label = str(body.get("label") or "").strip().lower()
+    if label not in {"mouse", "glove", "empty", "other"}:
+        raise HTTPException(status_code=400, detail="label must be mouse/glove/empty/other")
+    actor = _actor(user)
+    meta = records_meta.update(record_id, operator=actor, detection_label=label)
+    _audit(actor, "record.detection_label", target_type="record", target_id=record_id, detail={"label": label})
+    return {"ok": True, "record_id": record_id, "detection_label": label}
 
 
 @app.post("/api/records/batch", dependencies=[Depends(require_write_access)])

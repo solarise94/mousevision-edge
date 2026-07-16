@@ -653,16 +653,17 @@
       );
     }
 
+    // P2-b: correction input for ALL records (universal endpoint).
     let manualBlock = null;
-    if (needsManual && canWrite()) {
+    if (canWrite()) {
       const input = h("input", {
         type: "number",
         step: "0.01",
         min: "0.1",
         max: "79.9",
         class: "manual-weight-input",
-        placeholder: "手填体重 (g)",
-        value: rec.guessed_weight != null ? String(rec.guessed_weight) : "",
+        placeholder: "修正体重 (g)",
+        value: rec.weight != null ? String(rec.weight) : (rec.guessed_weight != null ? String(rec.guessed_weight) : ""),
       });
       const confirmBtn = h(
         "button",
@@ -691,21 +692,57 @@
             }
           },
         },
-        "确认体重"
+        needsManual ? "确认体重" : "修正体重",
       );
+      const hint = needsManual
+        ? "无稳定帧：算法未找到可靠平台。请回看片段后手填实际体重；未确认前不可核对/发布。"
+        : "如算法体重与实际不符，可在此修正（原始值保留用于训练飞轮）。";
       manualBlock = h("div", { class: "manual-weight-panel" }, [
-        h("p", { class: "manual-weight-hint" },
-          "无稳定帧：算法未找到可靠平台。请回看片段后手填实际体重；未确认前不可核对/发布。"
-        ),
+        h("p", { class: "manual-weight-hint" }, hint),
         h("div", { class: "manual-weight-row" }, input, confirmBtn),
+      ]);
+    }
+
+    // P2-b: detection label buttons for training flywheel.
+    let detectionBlock = null;
+    if (canWrite()) {
+      const labels = ["mouse", "glove", "empty", "other"];
+      const currentLabel = rec.detection_label || "";
+      const labelBtns = labels.map((lab) => {
+        const props = {
+          class: `btn ${lab === currentLabel ? "primary" : ""}`.trim(),
+          title: `标记为 ${lab}`,
+          onClick: async () => {
+            try {
+              await api(`/api/records/${rec.record_id}/detection-label`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ label: lab }),
+              });
+              await loadRecords();
+              try {
+                state.selected = await api(`/api/records/${rec.record_id}`);
+                state.selectedId = rec.record_id;
+              } catch (_) {}
+              render();
+            } catch (err) {
+              alert(err.message || String(err));
+            }
+          },
+        };
+        return h("button", props, lab);
+      });
+      detectionBlock = h("div", { class: "detection-label-panel" }, [
+        h("span", { class: "muted", style: "font-size:11px;margin-right:6px" }, "检测标注:"),
+        ...labelBtns,
       ]);
     }
 
     const actions = h("div", { class: "actions" });
     if (canWrite()) {
       const btns = [
-        ["核对通过", "primary", () => act(rec.record_id, "verify"), needsManual],
-        ["发布", "primary", () => act(rec.record_id, "publish"), needsManual],
+        ["核对通过", "primary", () => act(rec.record_id, "verify"), needsManual && rec.weight == null],
+        ["发布", "primary", () => act(rec.record_id, "publish"), needsManual && rec.weight == null],
         ["撤回发布", "", () => act(rec.record_id, "unpublish"), false],
         ["删除", "danger", () => act(rec.record_id, "delete"), false],
         ["恢复", "", () => act(rec.record_id, "restore"), false],
@@ -733,6 +770,7 @@
       h("div", { class: "media" }, ...mediaKids),
       dl,
       manualBlock,
+      detectionBlock,
       h("p", { class: "muted", style: "font-size:11px;line-height:1.5" }, helpText),
       rec.notes ? h("p", { class: "muted", style: "font-size:12px" }, `备注: ${rec.notes}`) : null,
       actions
