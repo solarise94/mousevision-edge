@@ -50,7 +50,6 @@ class HttpOcrReader:
         self._last_quad = None
         self._last_box = None
         self._hint_age = 0
-        self._collect_assets = False
 
     def lcd_box(self, image: np.ndarray | None = None) -> LcdBox | None:
         """Return last known LCD bbox (from service screen_quad)."""
@@ -72,7 +71,6 @@ class HttpOcrReader:
             if self._hint_age >= self.force_relocate_every:
                 use_hint = False
                 self._hint_age = 0
-        self._collect_assets = False
         if use_hint and self._last_quad is not None:
             data["quad_hint"] = json.dumps(self._last_quad)
         if self.weight_roi is not None and self._last_quad is None:

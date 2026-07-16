@@ -32,6 +32,9 @@ class StateMachineConfig:
     reenter_cooldown_ms: float = 2500.0
     # HTTP OCR: require mouse on scale before ENTER (blocks phantom 10.11 opens).
     require_mouse_for_enter: bool = False
+    # When True, ENTER abort goes to ANALYZE (manual path) instead of EMPTY.
+    # Used for http_ocr where mouse detection confirmed entry.
+    enter_abort_to_analyze: bool = False
     # Active session (ENTER+WEIGHING) hard timeout from enter_ms (ms).
     max_session_ms: float = 30_000.0
 
@@ -186,12 +189,18 @@ class WeighingStateMachine:
                         WeighingState.WEIGHING, timestamp_ms, "sustained_nonzero"
                     )
             elif weight is not None and weight <= cfg.empty_max:
-                # ENTER abort: reset to EMPTY (not ANALYZE). This is OCR noise
-                # during entry, not a real session. The P1-a short-session
-                # guarantee is handled by analyze() returning None -> driver
-                # manual fallback, not by aborting ENTER to ANALYZE.
-                self._set_state(WeighingState.EMPTY, timestamp_ms, "abort_to_empty")
-                self.reset_session()
+                if cfg.enter_abort_to_analyze:
+                    # http_ocr path: mouse detection confirmed entry, so this
+                    # is a real short session (not OCR noise). Go ANALYZE.
+                    self.session.leave_ms = timestamp_ms
+                    self.session.end_reason = "abort_short_session"
+                    self._set_state(
+                        WeighingState.ANALYZE, timestamp_ms, "abort_short_session"
+                    )
+                else:
+                    # Template/RefVideo path: likely OCR noise, reset to EMPTY.
+                    self._set_state(WeighingState.EMPTY, timestamp_ms, "abort_to_empty")
+                    self.reset_session()
 
         elif self.state == WeighingState.WEIGHING:
             confirmed_zero = weight is not None and weight <= cfg.leave_max

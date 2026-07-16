@@ -789,8 +789,12 @@ class AnalysisJobManager:
 
 
     def _reconcile_held(self) -> None:
-        """Startup reconciliation: if any Pending queue rows belong to runs
-        that never passed postflight (format_suspect or crashed), re-hold them.
+        """Startup reconciliation: re-hold Pending rows from incomplete runs.
+
+        Covers two crash windows:
+        1. Postflight failed (format_suspect set) -> re-hold.
+        2. Postflight released but job crashed before marking completed ->
+           re-hold ALL Pending from runs whose job is not 'completed'.
         """
         if self.upload_queue is None:
             return
@@ -803,8 +807,18 @@ class AnalysisJobManager:
                     continue
                 import json as _json
                 raw = _json.loads(record_path.read_text(encoding="utf-8"))
+                rid = str(raw.get("record_id") or "")
+                # Case 1: format_suspect flag set.
                 if raw.get("format_suspect"):
-                    to_hold.append(str(raw.get("record_id") or ""))
+                    to_hold.append(rid)
+                    continue
+                # Case 2: run manifest status is not 'completed'.
+                run_dir = record_path.parent.parent  # mouse_NNN -> run_*
+                manifest_path = run_dir / "manifest.json"
+                if manifest_path.exists():
+                    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if str(manifest.get("status") or "") not in {"completed", "empty"}:
+                        to_hold.append(rid)
             if to_hold:
                 self.upload_queue.hold_pending(to_hold)
         except Exception:

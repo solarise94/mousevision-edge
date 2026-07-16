@@ -1427,6 +1427,8 @@ def api_record(
     mouse["notes"] = meta.get("notes") or ""
     mouse["detection_label"] = meta.get("detection_label") or ""
     mouse["original_weight"] = raw.get("original_weight")
+    mouse["format_suspect"] = bool(raw.get("format_suspect") or False)
+    mouse["format_suspect_reason"] = raw.get("format_suspect_reason") or ""
     mouse["strain"] = strain_from_cage(str(mouse.get("cage_id") or "-"))
     return mouse
 
@@ -1523,7 +1525,12 @@ def _load_mutable_record(record_id: str) -> tuple[dict[str, Any], Path, dict[str
 
 def _reject_if_manual_weight_required(record_id: str) -> None:
     _, _, raw = _load_mutable_record(record_id)
-    # P2-b: only block when weight is still None (genuinely unresolved).
+    # Block suspect records from verify/publish.
+    if bool(raw.get("format_suspect")):
+        raise HTTPException(
+            status_code=400,
+            detail="视频格式可疑：请先确认完整或拒绝后再操作",
+        )
     if bool(raw.get("requires_manual_weight")) and raw.get("weight") is None:
         raise HTTPException(
             status_code=400,
@@ -1744,12 +1751,8 @@ def api_release_suspect(
     actor = _actor(user)
     # Find all records under this run and release them.
     import glob as _glob
-    output_root = Path(DEFAULT_OUTPUT)
-    run_dir = None
-    for d in sorted(output_root.glob(f"run_{run_id}*")):
-        if d.is_dir():
-            run_dir = d
-            break
+    # Find run_dir by matching manifest.run_id (directory name uses timestamp+shortid).
+    run_dir = _find_run_dir_by_id(run_id)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="run not found")
     released = 0
@@ -1779,22 +1782,24 @@ def api_reject_suspect(
     """P0-b: Manually reject a format_suspect run. Deletes all records
     and removes them from the upload queue."""
     actor = _actor(user)
-    output_root = Path(DEFAULT_OUTPUT)
-    run_dir = None
-    for d in sorted(output_root.glob(f"run_{run_id}*")):
-        if d.is_dir():
-            run_dir = d
-            break
+    run_dir = _find_run_dir_by_id(run_id)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="run not found")
     deleted = 0
-    for rec_path in sorted(run_dir.glob("mouse_*/record.json")):
+    for mouse_dir in sorted(run_dir.glob("mouse_*")):
+        if not mouse_dir.is_dir():
+            continue
+        rec_path = mouse_dir / "record.json"
         try:
-            raw = json.loads(rec_path.read_text(encoding="utf-8"))
+            raw = json.loads(rec_path.read_text(encoding="utf-8")) if rec_path.exists() else {}
             rid = str(raw.get("record_id") or "")
             if rid:
                 upload_queue.delete_by_record_id(rid)
+                records_meta.update(rid, status="deleted", operator=actor)
                 deleted += 1
+            # Delete the mouse directory entirely.
+            import shutil as _shutil
+            _shutil.rmtree(mouse_dir, ignore_errors=True)
         except Exception:
             pass
     _audit(actor, "run.reject_suspect", target_type="run", target_id=run_id, detail={"deleted": deleted})

@@ -176,6 +176,7 @@ class WeighingPipeline:
                 except Exception as e:
                     import logging
                     logging.getLogger("pipeline").warning("EOF flush failed: %s", e)
+                    raise  # propagate to job worker so it records as failure
             if create_run and persist:
                 finish_run(active_run, status="completed" if driver.saved_events else "empty")
 

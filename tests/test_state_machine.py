@@ -35,15 +35,26 @@ def test_full_cycle_empty_to_analyze():
     assert len(sm.session.curve) >= 5
 
 
-def test_abort_false_enter():
-    """ENTER abort resets to EMPTY (OCR noise during entry, not a real session)."""
+def test_abort_false_enter_template():
+    """Template path: ENTER abort resets to EMPTY (OCR noise)."""
     sm = WeighingStateMachine(
-        StateMachineConfig(enter_min=1.0, weighing_min_samples=5, empty_max=0.15)
+        StateMachineConfig(enter_min=1.0, weighing_min_samples=5, empty_max=0.15,
+                           enter_abort_to_analyze=False)
     )
     _feed(sm, [0.0, 2.0, 0.0, 0.0])
     assert sm.state == WeighingState.EMPTY
-    # Session is reset (no curve retained).
     assert len(sm.session.curve) == 0
+
+def test_abort_false_enter_http_ocr():
+    """HTTP OCR path: ENTER abort goes ANALYZE (mouse was detected, real session)."""
+    sm = WeighingStateMachine(
+        StateMachineConfig(enter_min=1.0, weighing_min_samples=5, empty_max=0.15,
+                           enter_abort_to_analyze=True)
+    )
+    _feed(sm, [0.0, 2.0, 0.0, 0.0])
+    assert sm.state == WeighingState.ANALYZE
+    assert sm.session.end_reason == "abort_short_session"
+    assert len(sm.session.curve) >= 1
 
 
 def test_history_cleared_between_sessions():

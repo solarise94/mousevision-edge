@@ -124,6 +124,7 @@ class SessionDriver:
                 empty_arm_frames=empty_arm,
                 reenter_cooldown_ms=cooldown_ms,
                 require_mouse_for_enter=bool(self.use_http_ocr),
+                enter_abort_to_analyze=bool(self.use_http_ocr),
                 max_session_ms=float(cfg.get("max_session_seconds", 30)) * 1000.0,
             )
         )
