@@ -123,7 +123,71 @@ def _build_clusters(
                 "members": g,
             }
         )
-    return clusters
+    return _fold_four_nine(clusters)
+
+
+def _fold_four_nine(clusters: list[dict]) -> list[dict]:
+    """Merge classic seven-seg 4<->9 glare-confusion pairs (~5g apart).
+
+    Glare fills segments, so a real '4' can read as '9' (24.18 -> 29.18);
+    the reverse is implausible. When two clusters sit 4.5-5.5g apart and
+    their modal digits differ only by '4' vs '9' at one position, fold the
+    higher cluster's votes into the lower one (the '4' reading is real).
+    Without folding, a glare-split plateau (24.1x / 29.1x) can fall below
+    the vote threshold on both sides and vanish.
+    """
+    if len(clusters) < 2:
+        return clusters
+    used = [False] * len(clusters)
+    out: list[dict] = []
+    for i, lo in enumerate(clusters):
+        if used[i]:
+            continue
+        for j in range(i + 1, len(clusters)):
+            hi = clusters[j]
+            if used[j]:
+                continue
+            gap = float(hi["median"]) - float(lo["median"])
+            if not (4.5 <= gap <= 5.5):
+                continue
+            lo_d, hi_d = lo["digits"], hi["digits"]
+            if not lo_d or not hi_d or len(lo_d) != len(hi_d):
+                continue
+            # Classic confusion sits in one slot (usually the grams place):
+            # '4' in lo vs '9' in hi, same prefix; decimals may differ freely.
+            folded = False
+            for k, (a, b) in enumerate(zip(lo_d, hi_d)):
+                if a == b:
+                    continue
+                if a == "4" and b == "9" and lo_d[:k] == hi_d[:k]:
+                    folded = True
+                break
+            if not folded:
+                continue
+            # Fold hi into lo: votes join, weight stays with the '4' reads.
+            lo["members"] = list(lo["members"]) + [
+                (t, w - 5.0, c, d) for (t, w, c, d) in hi["members"]
+            ]
+            ws = [x[1] for x in lo["members"]]
+            confs = [x[2] for x in lo["members"]]
+            ts = [x[0] for x in lo["members"]]
+            lo["median"] = float(np.median(ws))
+            lo["votes"] = len(lo["members"])
+            lo["mean_conf"] = float(np.mean(confs))
+            lo["score"] = float(lo["votes"] * lo["mean_conf"])
+            lo["t_first"] = float(min(ts))
+            lo["t_last"] = float(max(ts))
+            lo["t_center"] = 0.5 * (lo["t_first"] + lo["t_last"])
+            lo["span"] = (
+                float(np.percentile(ws, 90) - np.percentile(ws, 10))
+                if len(ws) >= 2
+                else 0.0
+            )
+            lo["folded_49"] = True
+            used[j] = True
+        used[i] = True
+        out.append(lo)
+    return out
 
 
 def sustained_clusters(

@@ -89,6 +89,35 @@ def test_stable_span_limit_rejects_wide_cluster():
     assert v.weight is not None
 
 
+def test_four_nine_fold_recovers_split_plateau():
+    # 0001 S6 server-decode shape: 24.1x real reads + 29.1x glare reads,
+    # neither side reaching 3 votes alone -> folded into one 24.1x cluster
+    samples = [
+        (45265.5, 29.10, 0.80, ["2", "9", "1", "0"]),
+        (45405.5, 24.14, 0.79, ["2", "4", "1", "4"]),
+        (45564.4, 29.81, 0.72, ["2", "9", "8", "1"]),
+        (45725.2, 29.11, 0.76, ["2", "9", "1", "1"]),
+        (45921.0, 24.01, 0.65, ["2", "4", "0", "1"]),
+    ]
+    v = analyze_raw_samples(samples)
+    assert v.weight is not None
+    assert 23.9 <= v.weight <= 24.3  # folded toward the '4' reads
+    # orphan scanner sees one 4-vote cluster instead of two 2-vote ones;
+    # the lone 29.81 read folds to 24.81, 0.7g off the plateau, and stays out
+    clusters = sustained_clusters(samples, min_votes=3, min_span_ms=250.0)
+    assert len(clusters) == 1
+    assert clusters[0]["votes"] == 4
+    assert 23.9 <= clusters[0]["median"] <= 24.5
+
+
+def test_four_nine_no_fold_when_digits_missing():
+    samples = [(1000.0 + i * 200, 24.1, 0.8, []) for i in range(2)]
+    samples += [(3000.0 + i * 200, 29.1, 0.8, []) for i in range(3)]
+    clusters = sustained_clusters(samples, min_votes=2, min_span_ms=100.0)
+    # without digit evidence the conservative path keeps both clusters
+    assert len(clusters) == 2
+
+
 def test_sustained_clusters_filters_short_and_thin():
     samples = _samples([17.5] * 4, dt=200.0)  # span 600ms, 4 votes
     samples += [(9000.0, 30.5, 0.8, []), (9130.0, 30.5, 0.8, [])]  # thin
