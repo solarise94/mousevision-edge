@@ -25,6 +25,11 @@ output/
 tmp_frames/
 tmp_ocr_acceptance/
 tmp_lcd_debug/
+tmp_eval/
+tmp_gemini_weigh/
+
+# 误落在仓库根目录的本地 manifest 碎片（正式产物在 run_*/manifest.json）
+/manifest.json
 
 # 工具本地缓存
 .zcode/
