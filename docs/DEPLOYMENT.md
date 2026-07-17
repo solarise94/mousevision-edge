@@ -77,6 +77,25 @@ uvicorn app（python -m ui.app）
 
 主分析容器访问 OCR 必须用**同一网络的服务名**（例如 `http://mousevision-lcd-ocr:8768`），不要用主容器内的 `127.0.0.1:8768`。
 
+### 称重主路径：Agent（推荐）
+
+生产优先用 **整段视频** `gemini-3-flash-agent`（CPA / homePC `http://agent.invalid:46450`），不再依赖七段硬匹配作为唯一读数源：
+
+```bash
+# 写入 ~/.config/containers/systemd/mousevision.container 的 Environment=
+Environment=MOUSEVISION_WEIGHT_READER=agent
+Environment=MOUSEVISION_AGENT_BASE_URL=http://agent.invalid:46450
+Environment=MOUSEVISION_AGENT_API_KEY=<cpa-key>
+Environment=MOUSEVISION_AGENT_MODEL=gemini-3-flash-agent
+Environment=MOUSEVISION_RETAIN_SOURCE_VIDEO=1
+Environment=MOUSEVISION_VIDEO_BACKEND=ffmpeg
+```
+
+- 默认 **原片** 送 agent；仅超 `max_upload_bytes` 时轻压（≥8fps，禁止默认 1fps）。
+- 分析后在 `run_*/source.*` **硬链/复制**完整源视频，供训练长留存；`job_uploads` 仍 14 天 prune，**不会**删 `run_*/source.*`。
+- 七段 `http_ocr` 仅作可选 fallback（yaml `agent.fallback`）或离线对照。
+- 参考：`deploy/quadlet/mousevision-edge.env.snippet`。
+
 ```bash
 # 状态
 systemctl --user status mousevision.service

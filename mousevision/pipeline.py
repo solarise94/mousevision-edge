@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,10 +11,20 @@ from typing import Any
 import cv2
 import yaml
 
+from mousevision.agent_weigh import (
+    AgentWeighClient,
+    AgentWeighError,
+    persist_agent_sessions,
+    resolve_agent_config,
+    retain_source_video,
+    should_retain_source,
+)
 from mousevision.driver import SessionDriver
-from mousevision.run import create_run_dir, finish_run
+from mousevision.run import create_run_dir, finish_run, load_manifest, write_manifest
 from mousevision.source.video import VideoFileSource
 from mousevision.upload_queue import UploadQueue
+
+log = logging.getLogger("pipeline")
 
 
 @dataclass
@@ -31,6 +43,15 @@ class PipelineResult:
 def load_config(path: str | Path) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _resolved_weight_reader(cfg: dict[str, Any]) -> str:
+    """Env overrides YAML (same rule as SessionDriver)."""
+    return str(
+        os.environ.get("MOUSEVISION_WEIGHT_READER")
+        or cfg.get("weight_reader")
+        or "template"
+    ).strip().lower()
 
 
 class WeighingPipeline:
@@ -89,6 +110,34 @@ class WeighingPipeline:
         queue = upload_queue
         if queue is None and persist:
             queue = UploadQueue(Path(output_root) / "upload_queue.db")
+
+        # Long-lived training copy under run/ (independent of job_uploads prune).
+        retained = None
+        if persist and create_run and should_retain_source(self.config):
+            retained = retain_source_video(
+                video_path, active_run, enabled=True
+            )
+            if retained is not None:
+                man = load_manifest(active_run) or {}
+                man["source_retained"] = True
+                man["source_path"] = str(retained)
+                write_manifest(active_run, man)
+
+        reader_kind = _resolved_weight_reader(self.config)
+        if reader_kind in {"agent", "vlm", "gemini", "agent_full"}:
+            return self._run_agent_video(
+                video_path,
+                cage_id=cage_id,
+                active_run=active_run,
+                rid=str(rid or ""),
+                queue=queue if persist else None,
+                persist=persist,
+                create_run=create_run,
+                start_ordinal=start_ordinal,
+                project_id=project_id,
+                stop_after_first=stop_after_first,
+                retained_source=retained,
+            )
 
         driver = SessionDriver(
             config=self.config,
@@ -197,6 +246,129 @@ class WeighingPipeline:
             readable=readable,
             records=records,
             output_dirs=dirs,
+            run_dir=active_run,
+            run_id=rid,
+        )
+
+    def _run_agent_video(
+        self,
+        video_path: str | Path,
+        *,
+        cage_id: str,
+        active_run: Path,
+        rid: str,
+        queue: UploadQueue | None,
+        persist: bool,
+        create_run: bool,
+        start_ordinal: int,
+        project_id: str,
+        stop_after_first: bool,
+        retained_source: Path | None,
+    ) -> PipelineResult:
+        """Full-video agent path: no frame SM; sessions → mouse_NNN records."""
+        agent_cfg = resolve_agent_config(self.config)
+        client = AgentWeighClient(self.config)
+        label = f"{cage_id}:{Path(video_path).name}"
+        try:
+            result = client.weigh_video(video_path, label=label)
+        except AgentWeighError as exc:
+            fallback = agent_cfg.get("fallback") or "none"
+            if fallback in {"http_ocr", "ocr", "template"}:
+                log.warning(
+                    "agent failed (%s); fallback weight_reader=%s",
+                    exc,
+                    fallback,
+                )
+                # Re-enter classic path with temporary reader override.
+                saved = os.environ.get("MOUSEVISION_WEIGHT_READER")
+                os.environ["MOUSEVISION_WEIGHT_READER"] = fallback
+                try:
+                    # Avoid re-entering agent branch: force non-agent reader.
+                    cfg = dict(self.config)
+                    cfg["weight_reader"] = fallback
+                    alt = WeighingPipeline(cfg, self.templates_dir)
+                    return alt.run_video(
+                        video_path,
+                        cage_id=cage_id,
+                        output_root=active_run.parent,
+                        stop_after_first=stop_after_first,
+                        upload_queue=queue,
+                        create_run=False,
+                        run_dir=active_run,
+                        run_id=rid,
+                        persist=persist,
+                        start_ordinal=start_ordinal,
+                        project_id=project_id,
+                    )
+                finally:
+                    if saved is None:
+                        os.environ.pop("MOUSEVISION_WEIGHT_READER", None)
+                    else:
+                        os.environ["MOUSEVISION_WEIGHT_READER"] = saved
+            if create_run and persist:
+                finish_run(active_run, status="failed")
+            raise
+
+        sessions = list(result.sessions)
+        if stop_after_first and sessions:
+            sessions = sessions[:1]
+            result.sessions = sessions
+
+        records: list[dict[str, Any]] = []
+        dirs: list[Path] = []
+        if persist:
+            records = persist_agent_sessions(
+                result=result,
+                run_dir=active_run,
+                cage_id=cage_id,
+                run_id=rid,
+                device_id=self.device_id,
+                project_id=project_id,
+                start_ordinal=start_ordinal,
+                review_confidence=float(agent_cfg["review_confidence"]),
+                upload_queue=queue,
+                source_video=retained_source or video_path,
+            )
+            for i, _ in enumerate(records):
+                dirs.append(active_run / f"mouse_{start_ordinal + i:03d}")
+            man = load_manifest(active_run) or {}
+            man["weight_reader"] = "agent"
+            man["agent_model"] = result.model
+            man["agent_input_mode"] = result.input_mode
+            man["agent_latency_s"] = result.latency_s
+            man["agent_summary"] = result.summary
+            write_manifest(active_run, man)
+            if create_run:
+                finish_run(
+                    active_run,
+                    status="completed" if records else "empty",
+                )
+        else:
+            # Non-persist: synthesize in-memory records only.
+            for i, sess in enumerate(sessions):
+                records.append(
+                    {
+                        "cage_id": cage_id,
+                        "ordinal": start_ordinal + i,
+                        "weight": sess.weight_g,
+                        "confidence": sess.confidence,
+                        "weight_source": "agent_full_video",
+                        "needs_review": sess.weight_g is None
+                        or sess.confidence < float(agent_cfg["review_confidence"]),
+                        "agent_note": sess.note,
+                        "persisted": False,
+                    }
+                )
+
+        readable = sum(1 for r in records if r.get("weight") is not None)
+        return PipelineResult(
+            output_dir=dirs[-1] if dirs else None,
+            states=["AGENT"],
+            record=records[-1] if records else None,
+            samples=len(sessions),
+            readable=readable,
+            records=records,
+            output_dirs=dirs or None,
             run_dir=active_run,
             run_id=rid,
         )

@@ -61,13 +61,34 @@ mouse_detect:
 
 templates_dir: assets/templates
 
-# Weight reader: template (default) | http_ocr (after lcd-ocr acceptance gate)
-# Production: set MOUSEVISION_WEIGHT_READER=http_ocr and MOUSEVISION_OCR_URL=
-# to the lcd-ocr service DNS name (NOT 127.0.0.1 inside the main container).
+# Weight reader:
+#   agent     — full-video gemini-3-flash-agent (production preferred)
+#   http_ocr  — classic seven-seg lcd-ocr service (fallback / lab)
+#   template  — offline template PoC
+# Env MOUSEVISION_WEIGHT_READER overrides this value.
 weight_reader: template
 ocr_api:
   base_url: http://mousevision-lcd-ocr:8768
   timeout_ms: 2000
+
+# Full-video agent (CPA / CLIProxy). Prefer original file; light-transcode only
+# when over max_upload_bytes. Never default to 1fps.
+agent:
+  model: gemini-3-flash-agent
+  # base_url / api_key: prefer env MOUSEVISION_AGENT_BASE_URL / MOUSEVISION_AGENT_API_KEY
+  prefer_original: true
+  max_upload_bytes: 12000000
+  timeout_s: 420
+  review_confidence: 0.7
+  fallback: none   # none | http_ocr | template
+  light_transcode:
+    max_width: 720
+    min_fps: 8
+    crf: 28
+
+# Keep full source under run_*/source.* for training (not pruned with job_uploads).
+retain_source_video: true
+training_collect: true
 
 # Temporal fusion (http_ocr path)
 # window must be large enough for two sustained clusters to coexist (conflict detect).
