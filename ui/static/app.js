@@ -481,5 +481,160 @@ $("btnStop").addEventListener("click", async () => {
   poll();
 });
 
+// ---- Agent compare lab ----
+function showLabView(name) {
+  const isCompare = name === "compare";
+  $("viewCompare").hidden = !isCompare;
+  $("viewList").hidden = isCompare;
+  $("viewDetail").hidden = true;
+  $("listControls").hidden = isCompare;
+  $("detailControls").hidden = true;
+  $("tabBatch").classList.toggle("active", !isCompare);
+  $("tabCompare").classList.toggle("active", isCompare);
+  if (!isCompare) {
+    showList();
+  } else {
+    // stop polling stream UI noise while comparing
+    playbackActive = false;
+  }
+}
+
+function fmtDelta(d) {
+  if (d == null || Number.isNaN(Number(d))) return "—";
+  return Number(d).toFixed(2);
+}
+
+function renderCompareResult(data) {
+  const sum = data.summary || {};
+  const el = $("cmpSummary");
+  el.hidden = false;
+  el.innerHTML = "";
+  const stats = [
+    ["Agent 只数", sum.n_agent ?? "—"],
+    ["经典 只数", sum.n_classic ?? "—"],
+    ["可对比", sum.n_comparable ?? "—"],
+    ["|Δ|≤0.1", sum.match_0_1 != null ? `${sum.match_0_1}/${sum.n_comparable || 0}` : "—"],
+    ["|Δ|≤0.5", sum.match_0_5 != null ? `${sum.match_0_5}/${sum.n_comparable || 0}` : "—"],
+    ["mean|Δ|", sum.mean_delta != null ? Number(sum.mean_delta).toFixed(3) : "—"],
+  ];
+  stats.forEach(([k, v]) => {
+    const card = document.createElement("div");
+    card.className = "compare-stat";
+    card.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
+    el.appendChild(card);
+  });
+
+  const agentRecs = ((data.branches || {}).agent || {}).records || [];
+  const classicRecs = ((data.branches || {}).classic || {}).records || [];
+  const agentNotes = Object.fromEntries(
+    agentRecs.map((r) => [r.ordinal, r.agent_note || r.review_reason || ""])
+  );
+  const classicNotes = Object.fromEntries(
+    classicRecs.map((r) => [
+      r.ordinal,
+      r.review_reason || (r.needs_review ? "needs_review" : "") || "",
+    ])
+  );
+
+  const tbody = $("cmpTable").querySelector("tbody");
+  tbody.innerHTML = "";
+  const rows = data.alignment || [];
+  // If only one branch, still show its weights
+  if (!rows.length) {
+    const only =
+      agentRecs.length
+        ? agentRecs.map((r) => ({
+            ordinal: r.ordinal,
+            agent_weight: r.weight,
+            classic_weight: null,
+            delta: null,
+          }))
+        : classicRecs.map((r) => ({
+            ordinal: r.ordinal,
+            agent_weight: null,
+            classic_weight: r.weight,
+            delta: null,
+          }));
+    only.forEach((r) => rows.push(r));
+  }
+  rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    const d = r.delta;
+    if (d != null && d <= 0.1) tr.className = "match-good";
+    else if (d != null && d <= 0.5) tr.className = "match-mid";
+    else if (d != null) tr.className = "match-bad";
+    const ord = r.ordinal;
+    tr.innerHTML = `
+      <td>${ord ?? ""}</td>
+      <td>${r.agent_weight != null ? Number(r.agent_weight).toFixed(2) : "—"}</td>
+      <td>${r.classic_weight != null ? Number(r.classic_weight).toFixed(2) : "—"}</td>
+      <td>${fmtDelta(d)}</td>
+      <td class="note">${agentNotes[ord] || ""}</td>
+      <td class="note">${classicNotes[ord] || ""}</td>`;
+    tbody.appendChild(tr);
+  });
+  $("cmpTableWrap").hidden = !rows.length;
+
+  const br = $("cmpBranches");
+  br.hidden = false;
+  br.innerHTML = "";
+  ["agent", "classic"].forEach((key) => {
+    const b = (data.branches || {})[key];
+    if (!b) return;
+    const card = document.createElement("div");
+    card.className = "compare-branch";
+    const w = (b.weights || [])
+      .map((x) => (x == null ? "null" : Number(x).toFixed(2)))
+      .join(", ");
+    card.innerHTML = `
+      <h3>${key === "agent" ? "Agent" : "经典 " + (b.reader || "")}</h3>
+      <div>耗时 <b>${b.elapsed_s ?? "—"}s</b> · n=<b>${b.n ?? 0}</b></div>
+      <div>error: ${b.error || "—"}</div>
+      <div>run: <code>${b.run_dir || "—"}</code></div>
+      <div>weights: ${w || "—"}</div>`;
+    br.appendChild(card);
+  });
+}
+
+$("tabBatch")?.addEventListener("click", () => showLabView("batch"));
+$("tabCompare")?.addEventListener("click", () => showLabView("compare"));
+
+$("btnCompare")?.addEventListener("click", async () => {
+  const file = $("cmpVideo").files?.[0];
+  if (!file) {
+    $("cmpStatus").textContent = "请先选择视频文件";
+    $("cmpStatus").className = "compare-status err";
+    return;
+  }
+  const fd = new FormData();
+  fd.append("video", file);
+  fd.append("cage_id", $("cmpCage").value || "compare");
+  fd.append("classic_reader", $("cmpClassic").value || "http_ocr");
+  fd.append("run_agent", $("cmpRunAgent").checked ? "true" : "false");
+  fd.append("run_classic", $("cmpRunClassic").checked ? "true" : "false");
+
+  $("btnCompare").disabled = true;
+  $("cmpStatus").className = "compare-status busy";
+  $("cmpStatus").textContent = "对照分析中… agent 原片可能需要 1–3 分钟，请勿关闭页面";
+  $("cmpSummary").hidden = true;
+  $("cmpTableWrap").hidden = true;
+  $("cmpBranches").hidden = true;
+  try {
+    const res = await apiFetch("/api/lab/compare", { method: "POST", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || res.statusText || "compare failed");
+    }
+    $("cmpStatus").className = "compare-status ok";
+    $("cmpStatus").textContent = `完成 · compare_id=${data.compare_id} · ${file.name}`;
+    renderCompareResult(data);
+  } catch (e) {
+    $("cmpStatus").className = "compare-status err";
+    $("cmpStatus").textContent = `失败: ${e.message || e}`;
+  } finally {
+    $("btnCompare").disabled = false;
+  }
+});
+
 pollTimer = setInterval(poll, 400);
 showList();

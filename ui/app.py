@@ -2580,6 +2580,222 @@ def api_photo():
     return FileResponse(path)
 
 
+# ---------------------------------------------------------------------------
+# Algorithm lab: side-by-side agent vs classic (http_ocr/template) compare
+# ---------------------------------------------------------------------------
+
+COMPARE_ROOT = DEFAULT_OUTPUT / "compare_runs"
+_COMPARE_LOCK = threading.Lock()
+
+
+def _align_weight_lists(
+    left: list[float | None],
+    right: list[float | None],
+) -> list[dict[str, Any]]:
+    """Pad to max length and compute per-row deltas."""
+    n = max(len(left), len(right))
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        a = left[i] if i < len(left) else None
+        b = right[i] if i < len(right) else None
+        delta = None
+        if a is not None and b is not None:
+            try:
+                delta = round(abs(float(a) - float(b)), 4)
+            except (TypeError, ValueError):
+                delta = None
+        rows.append(
+            {
+                "ordinal": i + 1,
+                "agent_weight": a,
+                "classic_weight": b,
+                "delta": delta,
+                "match_0_1": delta is not None and delta <= 0.1,
+                "match_0_5": delta is not None and delta <= 0.5,
+            }
+        )
+    return rows
+
+
+def _run_pipeline_branch(
+    *,
+    video_path: Path,
+    cage_id: str,
+    output_root: Path,
+    weight_reader: str,
+    project_id: str,
+) -> dict[str, Any]:
+    """Run WeighingPipeline once with a forced weight_reader (env scoped)."""
+    from mousevision.pipeline import WeighingPipeline
+
+    cfg = load_config(DEFAULT_CONFIG)
+    cfg = dict(cfg)
+    cfg["weight_reader"] = weight_reader
+    # Compare runs should not spam upload queue; still persist records for audit.
+    saved_env = os.environ.get("MOUSEVISION_WEIGHT_READER")
+    os.environ["MOUSEVISION_WEIGHT_READER"] = weight_reader
+    t0 = time.time()
+    err: str | None = None
+    result = None
+    try:
+        pipe = WeighingPipeline(cfg, DEFAULT_TEMPLATES)
+        result = pipe.run_video(
+            video_path,
+            cage_id=cage_id,
+            output_root=output_root,
+            stop_after_first=False,
+            create_run=True,
+            persist=True,
+            start_ordinal=1,
+            project_id=project_id,
+            upload_queue=None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+    finally:
+        if saved_env is None:
+            os.environ.pop("MOUSEVISION_WEIGHT_READER", None)
+        else:
+            os.environ["MOUSEVISION_WEIGHT_READER"] = saved_env
+    elapsed = round(time.time() - t0, 2)
+    records: list[dict[str, Any]] = []
+    if result is not None and result.records:
+        for r in result.records:
+            records.append(
+                {
+                    "ordinal": r.get("ordinal") or r.get("actual_ordinal"),
+                    "weight": r.get("weight"),
+                    "confidence": r.get("confidence"),
+                    "needs_review": r.get("needs_review"),
+                    "review_reason": r.get("review_reason") or "",
+                    "weight_source": r.get("weight_source"),
+                    "agent_note": r.get("agent_note") or "",
+                }
+            )
+    return {
+        "reader": weight_reader,
+        "elapsed_s": elapsed,
+        "error": err,
+        "run_dir": str(result.run_dir) if result and result.run_dir else None,
+        "run_id": result.run_id if result else None,
+        "n": len(records),
+        "records": records,
+        "weights": [r.get("weight") for r in records],
+    }
+
+
+@app.post("/api/lab/compare", dependencies=[Depends(require_token_or_operator)])
+async def api_lab_compare(
+    video: UploadFile = File(...),
+    cage_id: str = Form("compare"),
+    classic_reader: str = Form("http_ocr"),
+    run_agent: bool = Form(True),
+    run_classic: bool = Form(True),
+) -> JSONResponse:
+    """Upload one video; run agent and/or classic pipeline; return side-by-side.
+
+    Used by the legacy algorithm lab UI for A/B evaluation. Does not touch the
+    production job queue ordinal allocator.
+    """
+    classic = (classic_reader or "http_ocr").strip().lower()
+    if classic not in {"http_ocr", "template", "ocr"}:
+        raise HTTPException(status_code=422, detail="classic_reader 仅支持 http_ocr|template")
+    if classic == "ocr":
+        classic = "http_ocr"
+    if not run_agent and not run_classic:
+        raise HTTPException(status_code=422, detail="至少选择一条路径")
+
+    suffix = _upload_suffix(video.filename, video.content_type)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    compare_id = f"cmp_{stamp}_{uuid.uuid4().hex[:8]}"
+    work = COMPARE_ROOT / compare_id
+    work.mkdir(parents=True, exist_ok=False)
+    video_path = work / f"source{suffix}"
+    size = 0
+    with video_path.open("wb") as fh:
+        while True:
+            chunk = await video.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                fh.close()
+                shutil.rmtree(work, ignore_errors=True)
+                raise HTTPException(status_code=413, detail="视频过大")
+            fh.write(chunk)
+    if size == 0:
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(status_code=422, detail="空视频")
+
+    cage = _clean_id(cage_id or "compare", field_name="cage_id")
+    branches: dict[str, Any] = {}
+
+    # Serialize heavy CPA/OCR work so concurrent lab clicks do not thrash.
+    with _COMPARE_LOCK:
+        if run_agent:
+            agent_out = work / "agent"
+            agent_out.mkdir(exist_ok=True)
+            branches["agent"] = _run_pipeline_branch(
+                video_path=video_path,
+                cage_id=cage,
+                output_root=agent_out,
+                weight_reader="agent",
+                project_id=f"lab-compare-agent",
+            )
+        if run_classic:
+            classic_out = work / "classic"
+            classic_out.mkdir(exist_ok=True)
+            branches["classic"] = _run_pipeline_branch(
+                video_path=video_path,
+                cage_id=cage,
+                output_root=classic_out,
+                weight_reader=classic,
+                project_id=f"lab-compare-{classic}",
+            )
+
+    agent_w = (branches.get("agent") or {}).get("weights") or []
+    classic_w = (branches.get("classic") or {}).get("weights") or []
+    alignment = _align_weight_lists(list(agent_w), list(classic_w)) if (run_agent and run_classic) else []
+    comparable = [r for r in alignment if r.get("delta") is not None]
+    summary = {
+        "n_agent": len(agent_w),
+        "n_classic": len(classic_w),
+        "n_comparable": len(comparable),
+        "match_0_1": sum(1 for r in comparable if r["match_0_1"]),
+        "match_0_5": sum(1 for r in comparable if r["match_0_5"]),
+        "mean_delta": (
+            round(sum(float(r["delta"]) for r in comparable) / len(comparable), 4)
+            if comparable
+            else None
+        ),
+    }
+    payload = {
+        "ok": True,
+        "compare_id": compare_id,
+        "video_name": video.filename,
+        "video_bytes": size,
+        "cage_id": cage,
+        "branches": branches,
+        "alignment": alignment,
+        "summary": summary,
+        "work_dir": str(work),
+    }
+    (work / "compare_result.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return JSONResponse(payload)
+
+
+@app.get("/api/lab/compare/{compare_id}")
+def api_lab_compare_get(compare_id: str) -> Any:
+    cleaned = _clean_id(compare_id, field_name="compare_id")
+    path = COMPARE_ROOT / cleaned / "compare_result.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="compare not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def main() -> None:
     import uvicorn
 
