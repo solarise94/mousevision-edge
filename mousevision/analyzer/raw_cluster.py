@@ -89,7 +89,7 @@ def _filter_usable(samples: list[tuple], min_conf: float) -> list[tuple[float, f
 
 
 def _build_clusters(
-    usable: list[tuple[float, float, float, list[str]]], tol: float
+    usable: list[tuple[float, float, float, list[str]]], tol: float, min_votes: int = 3
 ) -> list[dict]:
     """Greedy value clustering on sorted weights (merge within tol)."""
     ordered = sorted(usable, key=lambda s: s[1])
@@ -123,10 +123,10 @@ def _build_clusters(
                 "members": g,
             }
         )
-    return _fold_four_nine(clusters)
+    return _fold_four_nine(clusters, min_votes)
 
 
-def _fold_four_nine(clusters: list[dict]) -> list[dict]:
+def _fold_four_nine(clusters: list[dict], min_votes: int = 3) -> list[dict]:
     """Merge classic seven-seg 4<->9 glare-confusion pairs (~5g apart).
 
     Glare fills segments, so a real '4' can read as '9' (24.18 -> 29.18);
@@ -135,6 +135,12 @@ def _fold_four_nine(clusters: list[dict]) -> list[dict]:
     higher cluster's votes into the lower one (the '4' reading is real).
     Without folding, a glare-split plateau (24.1x / 29.1x) can fall below
     the vote threshold on both sides and vanish.
+
+    Guard: folding rescues weak evidence, it must not overturn a strong
+    plateau — the '9' side is folded only when it cannot stand on its own
+    (``hi votes < min_votes``) or the '4' side is at least as strong
+    (``hi votes <= lo votes``). A lone 9->4 misread next to an 8-vote
+    plateau would otherwise steal the plateau's votes.
     """
     if len(clusters) < 2:
         return clusters
@@ -149,6 +155,11 @@ def _fold_four_nine(clusters: list[dict]) -> list[dict]:
                 continue
             gap = float(hi["median"]) - float(lo["median"])
             if not (4.5 <= gap <= 5.5):
+                continue
+            # Never let a weak '4' cluster steal votes from a strong '9'
+            # plateau (a lone 9->4 misread): fold only when the '9' side is
+            # sub-threshold or no stronger than the '4' side.
+            if not (hi["votes"] < min_votes or hi["votes"] <= lo["votes"]):
                 continue
             lo_d, hi_d = lo["digits"], hi["digits"]
             if not lo_d or not hi_d or len(lo_d) != len(hi_d):
@@ -204,7 +215,7 @@ def sustained_clusters(
     state-machine session (e.g. a restless animal whose OCR never fused).
     """
     usable = _filter_usable(samples, min_conf)
-    clusters = _build_clusters(usable, tol)
+    clusters = _build_clusters(usable, tol, min_votes)
     out = [
         c
         for c in clusters
@@ -230,7 +241,7 @@ def analyze_raw_samples(
     if n < cfg.conflict_min_votes:
         return RawClusterVerdict(status="insufficient", n_samples=n)
 
-    clusters = _build_clusters(usable, cfg.tol)
+    clusters = _build_clusters(usable, cfg.tol, cfg.stable_min_votes)
 
     # 4<->9 (~5g) confusion: when two clusters sit ~5g apart, the lower '4'
     # reading is usually real (glare fills the 4 into a 9). Swap preference

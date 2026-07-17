@@ -118,6 +118,31 @@ def test_four_nine_no_fold_when_digits_missing():
     assert len(clusters) == 2
 
 
+def test_four_nine_fold_never_steals_strong_plateau():
+    # mobile_0716_wang S2 shape: solid 19.0x plateau + one 9->4 glare misread;
+    # the lone '4' cluster must not absorb the plateau's 8 votes
+    samples = [(1000.0 + i * 130, 19.02, 0.8, ["1", "9", "0", "2"]) for i in range(8)]
+    samples += [(2300.0 + i * 130, 10.93, 0.7, ["1", "0", "9", "3"]) for i in range(2)]
+    samples += [(2600.0, 14.02, 0.75, ["1", "4", "0", "2"])]
+    v = analyze_raw_samples(samples)
+    assert v.status == "stable"
+    assert 18.9 <= v.weight <= 19.1
+    clusters = sustained_clusters(samples, min_votes=3, min_span_ms=250.0)
+    assert len(clusters) == 1
+    assert clusters[0]["votes"] == 8
+    assert 18.9 <= clusters[0]["median"] <= 19.1
+
+
+def test_four_nine_fold_when_four_side_at_least_as_strong():
+    # 3x '4' votes vs 2x '9' votes: the majority '4' side absorbs glare reads
+    samples = [(1000.0 + i * 130, 24.10, 0.8, ["2", "4", "1", "0"]) for i in range(3)]
+    samples += [(2000.0 + i * 130, 29.10, 0.75, ["2", "9", "1", "0"]) for i in range(2)]
+    clusters = sustained_clusters(samples, min_votes=2, min_span_ms=250.0)
+    assert len(clusters) == 1
+    assert clusters[0]["votes"] == 5
+    assert 23.9 <= clusters[0]["median"] <= 24.3
+
+
 def test_sustained_clusters_filters_short_and_thin():
     samples = _samples([17.5] * 4, dt=200.0)  # span 600ms, 4 votes
     samples += [(9000.0, 30.5, 0.8, []), (9130.0, 30.5, 0.8, [])]  # thin
