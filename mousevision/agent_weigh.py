@@ -32,6 +32,12 @@ DEFAULT_MAX_WIDTH = 720
 DEFAULT_CRF = 28
 DEFAULT_TIMEOUT_S = 420
 DEFAULT_REVIEW_CONF = 0.7
+# Local evidence attachment defaults (agent path).
+DEFAULT_ATTACH_PHOTOS = True
+DEFAULT_PHOTO_SAMPLE_INTERVAL_MS = 200
+DEFAULT_PHOTO_PAD_S = 1.5
+DEFAULT_PHOTO_WEIGHT_TOL = 0.25
+DEFAULT_PHOTO_WINDOW_S = 5.0
 
 FULL_VIDEO_PROMPT = """你是实验室小鼠称重视频分析助手。整段视频里有电子秤 LCD 和多只小鼠依次上称/下称。
 
@@ -43,12 +49,25 @@ FULL_VIDEO_PROMPT = """你是实验室小鼠称重视频分析助手。整段视
 3. ordinal 从 1 递增；看不清则 weight_g=null 并说明。
 4. 不要编造不存在的读数。
 5. 若你认为一共有 N 只，sessions 长度应为 N。
+6. 尽量给出该次称重在视频中的时间锚点（秒，相对于视频起点，允许近似）：
+   - t_start_s：小鼠上称开始
+   - t_end_s：小鼠下称结束
+   - t_stable_s：读数最稳定的瞬间（用于抽取照片证据）
+   看不准就填 null，不要编造精确时间。
 
 只输出 JSON（不要 markdown）：
 {
   "video": "label",
   "sessions": [
-    {"ordinal": 1, "weight_g": 16.15, "confidence": 0.0到1.0, "note": "简短依据"}
+    {
+      "ordinal": 1,
+      "weight_g": 16.15,
+      "confidence": 0.0到1.0,
+      "note": "简短依据",
+      "t_start_s": 3.2,
+      "t_end_s": 7.8,
+      "t_stable_s": 5.0
+    }
   ],
   "summary": "一句话：共几只、读数是否清晰"
 }
@@ -65,6 +84,10 @@ class AgentSession:
     weight_g: float | None
     confidence: float
     note: str = ""
+    # Time anchors in seconds from video start (nullable — agent may omit).
+    t_start_s: float | None = None
+    t_end_s: float | None = None
+    t_stable_s: float | None = None
 
 
 @dataclass
@@ -128,6 +151,15 @@ def resolve_agent_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
             "min_fps": int(lt.get("min_fps") or DEFAULT_MIN_FPS),
             "crf": int(lt.get("crf") or DEFAULT_CRF),
         },
+        "attach_photos": bool(block.get("attach_photos", DEFAULT_ATTACH_PHOTOS)),
+        "photo_sample_interval_ms": float(
+            block.get("photo_sample_interval_ms") or DEFAULT_PHOTO_SAMPLE_INTERVAL_MS
+        ),
+        "photo_pad_s": float(block.get("photo_pad_s") or DEFAULT_PHOTO_PAD_S),
+        "photo_weight_tol": float(
+            block.get("photo_weight_tol") or DEFAULT_PHOTO_WEIGHT_TOL
+        ),
+        "photo_window_s": float(block.get("photo_window_s") or DEFAULT_PHOTO_WINDOW_S),
     }
 
 
@@ -259,12 +291,28 @@ def _sessions_from_payload(payload: dict[str, Any]) -> list[AgentSession]:
             ord_ = int(row.get("ordinal") or i)
         except (TypeError, ValueError):
             ord_ = i
+
+        def _float_or_none(*keys: str) -> float | None:
+            for k in keys:
+                if k in row and row[k] is not None:
+                    try:
+                        return float(row[k])
+                    except (TypeError, ValueError):
+                        return None
+            return None
+
+        t_start = _float_or_none("t_start_s", "start_s")
+        t_end = _float_or_none("t_end_s", "end_s")
+        t_stable = _float_or_none("t_stable_s", "stable_s")
         out.append(
             AgentSession(
                 ordinal=ord_,
                 weight_g=weight,
                 confidence=conf,
                 note=str(row.get("note") or ""),
+                t_start_s=t_start,
+                t_end_s=t_end,
+                t_stable_s=t_stable,
             )
         )
     return out
@@ -475,6 +523,12 @@ def persist_agent_sessions(
         record["agent_input_mode"] = result.input_mode
         record["agent_summary"] = result.summary
         record["agent_latency_s"] = result.latency_s
+        if sess.t_start_s is not None:
+            record["agent_t_start_s"] = float(sess.t_start_s)
+        if sess.t_end_s is not None:
+            record["agent_t_end_s"] = float(sess.t_end_s)
+        if sess.t_stable_s is not None:
+            record["agent_t_stable_s"] = float(sess.t_stable_s)
         if source_video is not None:
             record["source_video"] = str(source_video)
         (out / "record.json").write_text(

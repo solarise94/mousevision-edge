@@ -11,6 +11,7 @@ from typing import Any
 import cv2
 import yaml
 
+from mousevision.agent_evidence import attach_agent_evidence
 from mousevision.agent_weigh import (
     AgentWeighClient,
     AgentWeighError,
@@ -331,12 +332,40 @@ class WeighingPipeline:
             )
             for i, _ in enumerate(records):
                 dirs.append(active_run / f"mouse_{start_ordinal + i:03d}")
+            # Attach local evidence (sample video frames → photo.jpg + platform
+            # times) when enabled and the source video is readable.
+            attach_source: Path | None = None
+            if agent_cfg.get("attach_photos", True):
+                if retained_source is not None and Path(retained_source).is_file():
+                    attach_source = Path(retained_source)
+                elif Path(video_path).is_file():
+                    attach_source = Path(video_path)
+            if attach_source is not None:
+                templates_path = (
+                    Path(self.templates_dir)
+                    if self.templates_dir
+                    else None
+                )
+                try:
+                    records = attach_agent_evidence(
+                        records=records,
+                        sessions=result.sessions,
+                        video_path=attach_source,
+                        run_dir=active_run,
+                        config=self.config,
+                        templates_dir=templates_path,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("attach_agent_evidence failed: %s", exc)
             man = load_manifest(active_run) or {}
             man["weight_reader"] = "agent"
             man["agent_model"] = result.model
             man["agent_input_mode"] = result.input_mode
             man["agent_latency_s"] = result.latency_s
             man["agent_summary"] = result.summary
+            man["agent_photos_attached"] = sum(
+                1 for r in records if r.get("photo_saved")
+            )
             write_manifest(active_run, man)
             if create_run:
                 finish_run(

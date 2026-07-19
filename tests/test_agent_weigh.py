@@ -14,6 +14,7 @@ from mousevision.agent_weigh import (
     AgentWeighClient,
     AgentWeighError,
     AgentWeighResult,
+    _sessions_from_payload,
     persist_agent_sessions,
     resolve_agent_config,
     retain_source_video,
@@ -147,6 +148,56 @@ def test_pipeline_agent_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 def test_resolved_weight_reader_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MOUSEVISION_WEIGHT_READER", "agent")
     assert _resolved_weight_reader({"weight_reader": "template"}) == "agent"
+
+
+def test_sessions_from_payload_parses_time_anchors() -> None:
+    payload = {
+        "sessions": [
+            {
+                "ordinal": 1,
+                "weight_g": 16.15,
+                "confidence": 0.9,
+                "note": "ok",
+                "t_start_s": 3.2,
+                "t_end_s": 7.8,
+                "t_stable_s": 5.0,
+            },
+            {
+                "ordinal": 2,
+                "weight_g": None,
+                "confidence": 0.0,
+                "note": "blur",
+                "t_start_s": "not-a-number",
+                "start_s": 12.5,  # alias
+                "end_s": 15.0,  # alias
+            },
+            {"ordinal": 3, "weight_g": 17.5, "confidence": 0.5, "note": "n"},
+        ]
+    }
+    sessions = _sessions_from_payload(payload)
+    assert len(sessions) == 3
+    assert sessions[0].t_start_s == 3.2
+    assert sessions[0].t_end_s == 7.8
+    assert sessions[0].t_stable_s == 5.0
+    # Bad t_start_s -> None; aliases parsed.
+    assert sessions[1].t_start_s is None
+    assert sessions[1].t_end_s == 15.0
+    assert sessions[1].t_stable_s is None
+    # No time fields -> all None
+    assert sessions[2].t_start_s is None
+    assert sessions[2].t_end_s is None
+
+
+def test_resolve_agent_config_attach_defaults() -> None:
+    cfg = resolve_agent_config({})
+    assert cfg["attach_photos"] is True
+    assert cfg["photo_sample_interval_ms"] == 200.0
+    assert cfg["photo_pad_s"] == 1.5
+    assert cfg["photo_weight_tol"] == 0.25
+    assert cfg["photo_window_s"] == 5.0
+    cfg2 = resolve_agent_config({"agent": {"attach_photos": False, "photo_window_s": 9.0}})
+    assert cfg2["attach_photos"] is False
+    assert cfg2["photo_window_s"] == 9.0
 
 
 def test_agent_client_requires_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

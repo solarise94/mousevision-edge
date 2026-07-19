@@ -85,6 +85,13 @@ agent:
     max_width: 720
     min_fps: 8
     crf: 28
+  # Local evidence attachment: sample video frames, pick best photo per
+  # session, write mouse_NNN/photo.jpg + platform_* into record.json.
+  attach_photos: true
+  photo_sample_interval_ms: 200
+  photo_pad_s: 1.5
+  photo_weight_tol: 0.25
+  photo_window_s: 5.0
 
 # Keep full source under run_*/source.* for training (not pruned with job_uploads).
 retain_source_video: true
