@@ -79,14 +79,14 @@ uvicorn app（python -m ui.app）
 
 ### 称重主路径：Agent（推荐）
 
-生产优先用 **整段视频** `gemini-3-flash-agent`（CPA / homePC `http://agent.invalid:46450`），不再依赖七段硬匹配作为唯一读数源：
+生产优先用 **整段视频** `gemini-3-flash`（CPA / homePC `http://agent.invalid:46450`），不再依赖七段硬匹配作为唯一读数源：
 
 ```bash
 # 写入 ~/.config/containers/systemd/mousevision.container 的 Environment=
 Environment=MOUSEVISION_WEIGHT_READER=agent
 Environment=MOUSEVISION_AGENT_BASE_URL=http://agent.invalid:46450
 Environment=MOUSEVISION_AGENT_API_KEY=<cpa-key>
-Environment=MOUSEVISION_AGENT_MODEL=gemini-3-flash-agent
+Environment=MOUSEVISION_AGENT_MODEL=gemini-3-flash
 Environment=MOUSEVISION_RETAIN_SOURCE_VIDEO=1
 Environment=MOUSEVISION_VIDEO_BACKEND=ffmpeg
 ```

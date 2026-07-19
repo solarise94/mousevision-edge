@@ -25,11 +25,11 @@ from mousevision.pipeline import WeighingPipeline, _resolved_weight_reader
 
 def test_resolve_agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MOUSEVISION_AGENT_BASE_URL", "http://example:9")
-    monkeypatch.setenv("MOUSEVISION_AGENT_MODEL", "gemini-3-flash-agent")
+    monkeypatch.setenv("MOUSEVISION_AGENT_MODEL", "gemini-3-flash")
     monkeypatch.setenv("MOUSEVISION_AGENT_API_KEY", "k" * 8)
     cfg = resolve_agent_config({"agent": {"max_upload_bytes": 1000}})
     assert cfg["base_url"] == "http://example:9"
-    assert cfg["model"] == "gemini-3-flash-agent"
+    assert cfg["model"] == "gemini-3-flash"
     assert cfg["api_key"] == "k" * 8
     assert cfg["max_upload_bytes"] == 1000
     assert cfg["light_transcode"]["min_fps"] >= 8
@@ -62,7 +62,7 @@ def test_persist_agent_sessions(tmp_path: Path) -> None:
             AgentSession(3, 17.57, 0.5, "low"),
         ],
         summary="3 sessions",
-        model="gemini-3-flash-agent",
+        model="gemini-3-flash",
         input_mode="original",
         latency_s=1.2,
     )
@@ -106,7 +106,7 @@ def test_pipeline_agent_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
             AgentSession(2, 17.22, 0.9, "b"),
         ],
         summary="ok",
-        model="gemini-3-flash-agent",
+        model="gemini-3-flash",
         input_mode="original",
         latency_s=0.5,
     )

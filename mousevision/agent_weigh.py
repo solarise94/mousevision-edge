@@ -25,7 +25,7 @@ from typing import Any
 log = logging.getLogger("mousevision.agent_weigh")
 
 DEFAULT_BASE_URL = "http://agent.invalid:46450"
-DEFAULT_MODEL = "gemini-3-flash-agent"
+DEFAULT_MODEL = "gemini-3-flash"
 DEFAULT_MAX_BYTES = 12_000_000  # light-transcode threshold
 DEFAULT_MIN_FPS = 8
 DEFAULT_MAX_WIDTH = 720

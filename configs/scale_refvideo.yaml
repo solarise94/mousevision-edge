@@ -62,7 +62,7 @@ mouse_detect:
 templates_dir: assets/templates
 
 # Weight reader:
-#   agent     — full-video gemini-3-flash-agent (production preferred)
+#   agent     — full-video gemini-3-flash (production preferred; CPA)
 #   http_ocr  — classic seven-seg lcd-ocr service (fallback / lab)
 #   template  — offline template PoC
 # Env MOUSEVISION_WEIGHT_READER overrides this value.
@@ -74,7 +74,7 @@ ocr_api:
 # Full-video agent (CPA / CLIProxy). Prefer original file; light-transcode only
 # when over max_upload_bytes. Never default to 1fps.
 agent:
-  model: gemini-3-flash-agent
+  model: gemini-3-flash
   # base_url / api_key: prefer env MOUSEVISION_AGENT_BASE_URL / MOUSEVISION_AGENT_API_KEY
   prefer_original: true
   max_upload_bytes: 12000000
