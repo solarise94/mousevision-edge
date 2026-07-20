@@ -1,0 +1,8 @@
+torch>=2.0
+torchvision
+onnx
+onnxruntime
+numpy
+opencv-python
+scikit-learn
+matplotlib

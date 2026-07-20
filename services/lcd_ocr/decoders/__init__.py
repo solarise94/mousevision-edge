@@ -1,4 +1,4 @@
-"""Decoder factory: LCD_OCR_DECODER = classic_v2 | ssocr | segodec | classic."""
+"""Decoder factory: LCD_OCR_DECODER = classic_v2 | ssocr | segodec | cnn | classic."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Any
 
 from .base import DecoderResult, DigitDecoder
 from .classic_v2 import ClassicV2Decoder
+from .cnn_adapter import CnnDecoder
 from .segodec_adapter import SegoDecAdapter
 from .ssocr_adapter import SsocrAdapter
 
@@ -15,7 +16,7 @@ _LEGACY_NAMES = {"classic", "classic_v1"}
 
 
 def available_decoders() -> list[str]:
-    names = ["classic_v2", "segodec", "ssocr"]
+    names = ["classic_v2", "segodec", "ssocr", "cnn"]
     return names
 
 
@@ -28,6 +29,8 @@ def get_decoder(name: str | None = None) -> Any:
         return SegoDecAdapter()
     if chosen == "ssocr":
         return SsocrAdapter()
+    if chosen == "cnn":
+        return CnnDecoder()
     if chosen in _LEGACY_NAMES:
         # Use classic_v2 path; genuine v1 is sevenseg_classic.read_fixed_slots via engine fallback.
         return ClassicV2Decoder()
@@ -40,6 +43,7 @@ __all__ = [
     "available_decoders",
     "get_decoder",
     "ClassicV2Decoder",
+    "CnnDecoder",
     "SegoDecAdapter",
     "SsocrAdapter",
 ]
