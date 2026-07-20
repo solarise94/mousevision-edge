@@ -79,60 +79,136 @@
 
     <!-- AGENT COMPARE VIEW -->
     <section id="viewCompare" hidden>
-      <div class="compare-wrap">
-        <div class="compare-card">
-          <h2>Agent ↔ 经典路径对照</h2>
-          <p class="muted">
-            上传同一段称重视频，并排跑 <code>gemini-3-flash</code>（整段）与
-            经典 <code>http_ocr</code>/<code>template</code> 状态机路径，方便看只数与体重差。
-            结果写入 <code>output/compare_runs/</code>，不占用箱子序号。
-          </p>
-          <div class="compare-form">
-            <label class="field grow">
-              <span>视频文件</span>
-              <input type="file" id="cmpVideo" accept="video/*,.mp4,.mov,.webm" />
-            </label>
-            <label class="field">
-              <span>箱号标签</span>
-              <input id="cmpCage" value="compare" />
-            </label>
-            <label class="field">
-              <span>经典路径</span>
-              <select id="cmpClassic">
-                <option value="http_ocr" selected>http_ocr</option>
-                <option value="template">template</option>
-              </select>
-            </label>
-            <label class="chk">
-              <input type="checkbox" id="cmpRunAgent" checked /> Agent
-            </label>
-            <label class="chk">
-              <input type="checkbox" id="cmpRunClassic" checked /> 经典
-            </label>
-            <button id="btnCompare" class="btn primary">开始对照</button>
+      <div class="cmp-wrap">
+        <!-- SOURCE CARD -->
+        <div class="cmp-glass cmp-source-card">
+          <div class="cmp-source-head">
+            <h2>Agent ↔ 经典路径对照</h2>
+            <div class="cmp-seg" id="cmpSourceSeg" role="tablist">
+              <button type="button" class="cmp-seg-btn active" data-src="local" role="tab" aria-selected="true">本地视频</button>
+              <button type="button" class="cmp-seg-btn" data-src="platform" role="tab" aria-selected="false">平台视频</button>
+            </div>
           </div>
-          <div class="compare-status" id="cmpStatus">就绪 · 大视频可能需要 1–3 分钟</div>
+
+          <!-- LOCAL PANEL -->
+          <div class="cmp-src-panel" id="cmpLocalPanel">
+            <div class="cmp-dropzone" id="cmpDropzone" tabindex="0">
+              <div class="cmp-dropzone-inner">
+                <svg class="cmp-drop-icon" width="46" height="46" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 16V4m0 0l-4 4m4-4l4 4M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"
+                    stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <div class="cmp-drop-title">拖入本地视频</div>
+                <div class="cmp-drop-sub">或点击选择 · mp4 / mov / webm</div>
+                <input type="file" id="cmpFileInput" accept="video/*,.mp4,.mov,.webm,.m4v" hidden />
+              </div>
+            </div>
+            <div class="cmp-file-chip" id="cmpFileChip" hidden>
+              <span class="cmp-chip-name" id="cmpChipName"></span>
+              <span class="cmp-chip-meta" id="cmpChipMeta"></span>
+              <button type="button" class="cmp-chip-x" id="cmpChipX" aria-label="移除">✕</button>
+            </div>
+            <video class="cmp-preview-video" id="cmpPreviewVideo" controls hidden muted></video>
+          </div>
+
+          <!-- PLATFORM PANEL -->
+          <div class="cmp-src-panel" id="cmpPlatformPanel" hidden>
+            <div class="cmp-platform-toolbar">
+              <input type="search" id="cmpVideoSearch" class="cmp-search" placeholder="按箱号 / run_id 过滤…" />
+              <span class="cmp-platform-count" id="cmpPlatformCount"></span>
+            </div>
+            <div class="cmp-video-grid" id="cmpVideoGrid"></div>
+            <div class="cmp-empty-state" id="cmpVideoEmpty" hidden>
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M10 9l5 3-5 3V9z" fill="currentColor"/>
+              </svg>
+              <div>暂无平台视频</div>
+              <small>跑完批次分析后会保留源视频到 run 目录</small>
+            </div>
+          </div>
         </div>
 
-        <div class="compare-summary" id="cmpSummary" hidden></div>
-        <div class="compare-table-wrap" id="cmpTableWrap" hidden>
-          <table class="compare-table" id="cmpTable">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Agent (g)</th>
-                <th>经典 (g)</th>
-                <th>|Δ|</th>
-                <th>Agent note</th>
-                <th>经典 reason</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
+        <!-- PARAMS CARD -->
+        <div class="cmp-glass cmp-params">
+          <label class="cmp-field">
+            <span>箱号标签</span>
+            <input id="cmpCage" value="compare" />
+          </label>
+          <label class="cmp-field">
+            <span>经典读数器</span>
+            <select id="cmpClassic">
+              <option value="http_ocr" selected>http_ocr</option>
+              <option value="template">template</option>
+            </select>
+          </label>
+          <label class="cmp-switch">
+            <input type="checkbox" id="cmpRunAgent" checked />
+            <span class="cmp-track"><span class="cmp-thumb"></span></span>
+            <span class="cmp-switch-label cmp-agent">Agent 路径</span>
+          </label>
+          <label class="cmp-switch">
+            <input type="checkbox" id="cmpRunClassic" checked />
+            <span class="cmp-track"><span class="cmp-thumb"></span></span>
+            <span class="cmp-switch-label cmp-classic">经典路径</span>
+          </label>
+          <div class="cmp-params-right">
+            <select id="cmpHistory" class="cmp-history" title="最近对照">
+              <option value="">最近对照…</option>
+            </select>
+            <button id="btnCompare" class="cmp-btn-primary">开始对照</button>
+          </div>
         </div>
-        <div class="compare-branches" id="cmpBranches" hidden></div>
+
+        <!-- STATUS -->
+        <div class="cmp-status ready" id="cmpStatus">就绪 · 大视频可能需要 1–3 分钟</div>
+
+        <!-- PROGRESS -->
+        <div class="cmp-glass cmp-progress" id="cmpProgress" hidden>
+          <ol class="cmp-steps" id="cmpSteps"></ol>
+          <div class="cmp-progress-foot">
+            <span class="cmp-stopwatch" id="cmpStopwatch">0.0s</span>
+            <span class="cmp-progress-hint">大视频可能需要 1–3 分钟，请勿关闭页面</span>
+          </div>
+        </div>
+
+        <!-- RESULT -->
+        <div id="cmpResult" hidden>
+          <div class="cmp-result-head">
+            <div class="cmp-cmp-id" id="cmpIdWrap">
+              <span class="cmp-id-label">compare_id</span>
+              <code id="cmpIdText"></code>
+              <button type="button" class="cmp-copy" id="cmpCopy">复制</button>
+            </div>
+          </div>
+          <div class="cmp-kpis" id="cmpKpis"></div>
+          <div class="cmp-glass cmp-table-card">
+            <div class="cmp-table-title">对照明细 · 点击行定位</div>
+            <div class="cmp-table-wrap">
+              <table class="cmp-table" id="cmpTable">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Agent (g)</th>
+                    <th>经典 (g)</th>
+                    <th>|Δ|</th>
+                    <th>Agent note</th>
+                    <th>经典 reason</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="cmp-branches2" id="cmpBranches"></div>
+        </div>
       </div>
     </section>
+
+    <!-- Lightbox for compare photos -->
+    <div class="cmp-lightbox" id="cmpLightbox" hidden>
+      <img id="cmpLightboxImg" alt="" />
+    </div>
 
     <!-- DETAIL / PLAYBACK VIEW -->
     <section id="viewDetail" hidden>

@@ -2586,6 +2586,109 @@ def api_photo():
 
 COMPARE_ROOT = DEFAULT_OUTPUT / "compare_runs"
 _COMPARE_LOCK = threading.Lock()
+_COMPARE_BRANCHES = ("agent", "classic")
+_COMPARE_SOURCE_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv")
+
+
+def _find_run_source(run_dir: Path) -> Path | None:
+    """Return the persisted source video for a run dir, if any."""
+    for ext in _COMPARE_SOURCE_EXTS:
+        cand = run_dir / f"source{ext}"
+        if cand.exists():
+            return cand
+    # Any source.* glob fallback.
+    for cand in sorted(run_dir.glob("source.*")):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _resolve_run_dir_for_source(source_run_id: str) -> Path:
+    """Resolve a registry run_id to its run dir, enforcing path-traversal safety.
+
+    Used by compare to reuse a platform video in place (read-only, no copy).
+    """
+    cleaned = _clean_id(source_run_id, field_name="source_run_id")
+    target: Path | None = None
+    for run in registry.list_runs():
+        if run.get("run_id") == cleaned:
+            target = Path(run["path"])
+            break
+    if target is None:
+        # Allow matching by directory name as a fallback.
+        candidate = DEFAULT_OUTPUT / cleaned
+        if candidate.is_dir():
+            target = candidate
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"未找到 run: {cleaned}")
+    try:
+        target.resolve().relative_to(DEFAULT_OUTPUT.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="非法 run 路径") from exc
+    return target
+
+
+def _compare_result_path(compare_id: str) -> Path:
+    return COMPARE_ROOT / compare_id / "compare_result.json"
+
+
+def _resolve_compare_branch_dir(compare_id: str, branch: str) -> Path:
+    """Locate the run_dir recorded for a compare branch.
+
+    Validates the path lies under COMPARE_ROOT to prevent traversal. Falls back
+    to globbing `COMPARE_ROOT/<cmp>/<branch>/run_*` if compare_result.json is
+    missing or malformed.
+    """
+    if branch not in _COMPARE_BRANCHES:
+        raise HTTPException(status_code=422, detail="branch 仅支持 agent|classic")
+    cmp_root = COMPARE_ROOT / compare_id
+    if not cmp_root.is_dir():
+        raise HTTPException(status_code=404, detail="compare not found")
+    run_dir: Path | None = None
+    result_path = _compare_result_path(compare_id)
+    if result_path.is_file():
+        try:
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+            rd = (data.get("branches") or {}).get(branch, {}).get("run_dir")
+            if rd:
+                cand = Path(rd)
+                try:
+                    cand.resolve().relative_to(COMPARE_ROOT.resolve())
+                    run_dir = cand
+                except ValueError:
+                    run_dir = None
+        except Exception:
+            run_dir = None
+    if run_dir is None:
+        # Fallback: glob the branch subdir for a run directory.
+        for cand in sorted((cmp_root / branch).glob("run_*")):
+            if cand.is_dir():
+                run_dir = cand
+                break
+    if run_dir is None or not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="分支产物不存在")
+    return run_dir
+
+
+def _resolve_compare_mouse_dir(run_dir: Path, ordinal: int) -> Path:
+    """Find mouse_NNN directory by ordinal; prefer direct path, then record.json."""
+    direct = run_dir / f"mouse_{int(ordinal):03d}"
+    if direct.is_dir():
+        return direct
+    for cand in sorted(run_dir.glob("mouse_*")):
+        if not cand.is_dir():
+            continue
+        rec_path = cand / "record.json"
+        if not rec_path.is_file():
+            continue
+        try:
+            rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rec_ord = rec.get("ordinal") or rec.get("actual_ordinal")
+        if rec_ord is not None and int(rec_ord) == int(ordinal):
+            return cand
+    raise HTTPException(status_code=404, detail=f"未找到 ordinal={ordinal} 的产物")
 
 
 def _align_weight_lists(
@@ -2661,17 +2764,20 @@ def _run_pipeline_branch(
     records: list[dict[str, Any]] = []
     if result is not None and result.records:
         for r in result.records:
-            records.append(
-                {
-                    "ordinal": r.get("ordinal") or r.get("actual_ordinal"),
-                    "weight": r.get("weight"),
-                    "confidence": r.get("confidence"),
-                    "needs_review": r.get("needs_review"),
-                    "review_reason": r.get("review_reason") or "",
-                    "weight_source": r.get("weight_source"),
-                    "agent_note": r.get("agent_note") or "",
-                }
-            )
+            # Promote evidence time-window fields if present (agent clips).
+            rec: dict[str, Any] = {
+                "ordinal": r.get("ordinal") or r.get("actual_ordinal"),
+                "weight": r.get("weight"),
+                "confidence": r.get("confidence"),
+                "needs_review": r.get("needs_review"),
+                "review_reason": r.get("review_reason") or "",
+                "weight_source": r.get("weight_source"),
+                "agent_note": r.get("agent_note") or "",
+            }
+            for key in ("clip_start_ms", "clip_end_ms", "platform_start_ms", "platform_end_ms"):
+                if r.get(key) is not None:
+                    rec[key] = r.get(key)
+            records.append(rec)
     return {
         "reader": weight_reader,
         "elapsed_s": elapsed,
@@ -2686,15 +2792,20 @@ def _run_pipeline_branch(
 
 @app.post("/api/lab/compare", dependencies=[Depends(require_token_or_operator)])
 async def api_lab_compare(
-    video: UploadFile = File(...),
+    video: UploadFile | None = File(None),
+    source_run_id: str = Form(""),
     cage_id: str = Form("compare"),
     classic_reader: str = Form("http_ocr"),
     run_agent: bool = Form(True),
     run_classic: bool = Form(True),
 ) -> JSONResponse:
-    """Upload one video; run agent and/or classic pipeline; return side-by-side.
+    """Run agent and/or classic pipeline on one video; return side-by-side.
 
-    Used by the legacy algorithm lab UI for A/B evaluation. Does not touch the
+    Accepts either an uploaded ``video`` or a ``source_run_id`` pointing at an
+    existing platform run whose ``source.<ext>`` will be reused in place
+    (read-only, no copy). Providing both or neither yields 422.
+
+    Used by the algorithm lab UI for A/B evaluation. Does not touch the
     production job queue ordinal allocator.
     """
     classic = (classic_reader or "http_ocr").strip().lower()
@@ -2705,86 +2816,142 @@ async def api_lab_compare(
     if not run_agent and not run_classic:
         raise HTTPException(status_code=422, detail="至少选择一条路径")
 
-    suffix = _upload_suffix(video.filename, video.content_type)
+    source_run_id = (source_run_id or "").strip()
+    has_upload = video is not None and video.filename
+    if has_upload and source_run_id:
+        raise HTTPException(status_code=422, detail="video 与 source_run_id 二选一")
+    if not has_upload and not source_run_id:
+        raise HTTPException(status_code=422, detail="请提供 video 或 source_run_id")
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     compare_id = f"cmp_{stamp}_{uuid.uuid4().hex[:8]}"
     work = COMPARE_ROOT / compare_id
     work.mkdir(parents=True, exist_ok=False)
-    video_path = work / f"source{suffix}"
-    size = 0
-    with video_path.open("wb") as fh:
-        while True:
-            chunk = await video.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_UPLOAD_BYTES:
-                fh.close()
-                shutil.rmtree(work, ignore_errors=True)
-                raise HTTPException(status_code=413, detail="视频过大")
-            fh.write(chunk)
-    if size == 0:
-        shutil.rmtree(work, ignore_errors=True)
-        raise HTTPException(status_code=422, detail="空视频")
 
-    cage = _clean_id(cage_id or "compare", field_name="cage_id")
-    branches: dict[str, Any] = {}
+    video_name: str
+    size: int
+    video_path: Path
+    cleanup_work = True
+    try:
+        if has_upload:
+            assert video is not None  # for type checkers
+            suffix = _upload_suffix(video.filename, video.content_type)
+            video_path = work / f"source{suffix}"
+            size = 0
+            with video_path.open("wb") as fh:
+                while True:
+                    chunk = await video.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        fh.close()
+                        raise HTTPException(status_code=413, detail="视频过大")
+                    fh.write(chunk)
+            if size == 0:
+                raise HTTPException(status_code=422, detail="空视频")
+            video_name = video.filename or "source"
+        else:
+            run_dir = _resolve_run_dir_for_source(source_run_id)
+            src = _find_run_source(run_dir)
+            if src is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"该 run 未保留源视频: {source_run_id}",
+                )
+            video_path = src  # read-only reuse; do NOT copy
+            video_name = src.name
+            try:
+                size = src.stat().st_size
+            except OSError:
+                size = 0
+            cleanup_work = False  # nothing of ours to delete; keep work for outputs
 
-    # Serialize heavy CPA/OCR work so concurrent lab clicks do not thrash.
-    with _COMPARE_LOCK:
-        if run_agent:
-            agent_out = work / "agent"
-            agent_out.mkdir(exist_ok=True)
-            branches["agent"] = _run_pipeline_branch(
-                video_path=video_path,
-                cage_id=cage,
-                output_root=agent_out,
-                weight_reader="agent",
-                project_id=f"lab-compare-agent",
-            )
-        if run_classic:
-            classic_out = work / "classic"
-            classic_out.mkdir(exist_ok=True)
-            branches["classic"] = _run_pipeline_branch(
-                video_path=video_path,
-                cage_id=cage,
-                output_root=classic_out,
-                weight_reader=classic,
-                project_id=f"lab-compare-{classic}",
-            )
+        cage = _clean_id(cage_id or "compare", field_name="cage_id")
+        branches: dict[str, Any] = {}
 
-    agent_w = (branches.get("agent") or {}).get("weights") or []
-    classic_w = (branches.get("classic") or {}).get("weights") or []
-    alignment = _align_weight_lists(list(agent_w), list(classic_w)) if (run_agent and run_classic) else []
-    comparable = [r for r in alignment if r.get("delta") is not None]
-    summary = {
-        "n_agent": len(agent_w),
-        "n_classic": len(classic_w),
-        "n_comparable": len(comparable),
-        "match_0_1": sum(1 for r in comparable if r["match_0_1"]),
-        "match_0_5": sum(1 for r in comparable if r["match_0_5"]),
-        "mean_delta": (
-            round(sum(float(r["delta"]) for r in comparable) / len(comparable), 4)
-            if comparable
-            else None
-        ),
-    }
-    payload = {
-        "ok": True,
-        "compare_id": compare_id,
-        "video_name": video.filename,
-        "video_bytes": size,
-        "cage_id": cage,
-        "branches": branches,
-        "alignment": alignment,
-        "summary": summary,
-        "work_dir": str(work),
-    }
-    (work / "compare_result.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return JSONResponse(payload)
+        # Serialize heavy CPA/OCR work so concurrent lab clicks do not thrash.
+        with _COMPARE_LOCK:
+            if run_agent:
+                agent_out = work / "agent"
+                agent_out.mkdir(exist_ok=True)
+                branches["agent"] = _run_pipeline_branch(
+                    video_path=video_path,
+                    cage_id=cage,
+                    output_root=agent_out,
+                    weight_reader="agent",
+                    project_id="lab-compare-agent",
+                )
+            if run_classic:
+                classic_out = work / "classic"
+                classic_out.mkdir(exist_ok=True)
+                branches["classic"] = _run_pipeline_branch(
+                    video_path=video_path,
+                    cage_id=cage,
+                    output_root=classic_out,
+                    weight_reader=classic,
+                    project_id=f"lab-compare-{classic}",
+                )
+
+        # Augment per-record with artifact URLs + time window (for history reload).
+        for branch_key, branch in branches.items():
+            recs = branch.get("records") or []
+            for rec in recs:
+                ord_val = rec.get("ordinal")
+                if ord_val is None:
+                    continue
+                base = (
+                    f"/api/lab/compare/{compare_id}/branches/{branch_key}"
+                    f"/mice/{ord_val}"
+                )
+                rec["photo_url"] = f"{base}/photo"
+                rec["clip_url"] = f"{base}/clip"
+
+        agent_w = (branches.get("agent") or {}).get("weights") or []
+        classic_w = (branches.get("classic") or {}).get("weights") or []
+        alignment = (
+            _align_weight_lists(list(agent_w), list(classic_w))
+            if (run_agent and run_classic)
+            else []
+        )
+        comparable = [r for r in alignment if r.get("delta") is not None]
+        summary = {
+            "n_agent": len(agent_w),
+            "n_classic": len(classic_w),
+            "n_comparable": len(comparable),
+            "match_0_1": sum(1 for r in comparable if r["match_0_1"]),
+            "match_0_5": sum(1 for r in comparable if r["match_0_5"]),
+            "mean_delta": (
+                round(sum(float(r["delta"]) for r in comparable) / len(comparable), 4)
+                if comparable
+                else None
+            ),
+        }
+        payload = {
+            "ok": True,
+            "compare_id": compare_id,
+            "video_name": video_name,
+            "video_bytes": size,
+            "source_run_id": source_run_id or None,
+            "cage_id": cage,
+            "branches": branches,
+            "alignment": alignment,
+            "summary": summary,
+            "work_dir": str(work),
+        }
+        (work / "compare_result.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return JSONResponse(payload)
+    except HTTPException:
+        if cleanup_work:
+            shutil.rmtree(work, ignore_errors=True)
+        raise
+    except Exception:
+        if cleanup_work:
+            shutil.rmtree(work, ignore_errors=True)
+        raise
 
 
 @app.get("/api/lab/compare/{compare_id}")
@@ -2794,6 +2961,141 @@ def api_lab_compare_get(compare_id: str) -> Any:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="compare not found")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+@app.get("/api/lab/compares", dependencies=[Depends(require_token_or_operator)])
+def api_lab_compares_list() -> Any:
+    """List compare run directories (newest first) for the UI history dropdown."""
+    out: list[dict[str, Any]] = []
+    if not COMPARE_ROOT.exists():
+        return {"items": out}
+    for d in sorted(COMPARE_ROOT.glob("cmp_*"), reverse=True):
+        if not d.is_dir():
+            continue
+        item: dict[str, Any] = {
+            "compare_id": d.name,
+            "cage_id": None,
+            "started_at": None,
+            "n_agent": None,
+            "n_classic": None,
+            "video_name": None,
+        }
+        try:
+            st = d.stat()
+            item["started_at"] = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+        except OSError:
+            pass
+        rp = d / "compare_result.json"
+        if rp.is_file():
+            try:
+                data = json.loads(rp.read_text(encoding="utf-8"))
+                item["cage_id"] = data.get("cage_id")
+                item["video_name"] = data.get("video_name")
+                sumr = data.get("summary") or {}
+                item["n_agent"] = sumr.get("n_agent")
+                item["n_classic"] = sumr.get("n_classic")
+            except Exception:
+                pass
+        out.append(item)
+    return {"items": out}
+
+
+@app.get("/api/lab/videos", dependencies=[Depends(require_token_or_operator)])
+def api_lab_videos() -> Any:
+    """List platform videos persisted as ``source.<ext>`` in registry run dirs."""
+    items: list[dict[str, Any]] = []
+    for run in registry.list_runs():
+        run_path = Path(run["path"])
+        if not run_path.is_dir():
+            continue
+        src = _find_run_source(run_path)
+        if src is None:
+            continue
+        try:
+            st = src.stat()
+            size_bytes = st.st_size
+            mtime = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+        except OSError:
+            size_bytes = 0
+            mtime = None
+        items.append(
+            {
+                "run_id": run.get("run_id"),
+                "cage_id": run.get("cage_id"),
+                "started_at": run.get("started_at"),
+                "record_count": run.get("record_count"),
+                "mode": run.get("mode"),
+                "file": src.name,
+                "size_bytes": size_bytes,
+                "mtime": mtime,
+            }
+        )
+    items.sort(key=lambda x: x.get("started_at") or "", reverse=True)
+    return {"items": items}
+
+
+@app.get(
+    "/api/lab/videos/{run_id}/poster",
+    response_model=None,
+    dependencies=[Depends(require_token_or_operator)],
+)
+def api_lab_video_poster(run_id: str):
+    """Serve a poster for a platform video: analysis_preview, else first mouse photo."""
+    cleaned = _clean_id(run_id, field_name="run_id")
+    run_dir: Path | None = None
+    for run in registry.list_runs():
+        if run.get("run_id") == cleaned:
+            run_dir = Path(run["path"])
+            break
+    if run_dir is None and (DEFAULT_OUTPUT / cleaned).is_dir():
+        run_dir = DEFAULT_OUTPUT / cleaned
+    if run_dir is None or not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="run 不存在")
+    try:
+        run_dir.resolve().relative_to(DEFAULT_OUTPUT.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="非法 run 路径") from exc
+
+    preview = run_dir / "analysis_preview.jpg"
+    if preview.is_file():
+        return FileResponse(preview, headers={"Cache-Control": "max-age=60"})
+    for cand in sorted(run_dir.glob("mouse_*")):
+        photo = cand / "photo.jpg"
+        if photo.is_file():
+            return FileResponse(photo, headers={"Cache-Control": "max-age=60"})
+    raise HTTPException(status_code=404, detail="无可用预览图")
+
+
+@app.get(
+    "/api/lab/compare/{compare_id}/branches/{branch}/mice/{ordinal}/photo",
+    response_model=None,
+    dependencies=[Depends(require_token_or_operator)],
+)
+def api_lab_compare_mouse_photo(
+    compare_id: str,
+    branch: str,
+    ordinal: int,
+    size: str = Query("thumb", pattern="^(thumb|full)$"),
+):
+    cleaned = _clean_id(compare_id, field_name="compare_id")
+    run_dir = _resolve_compare_branch_dir(cleaned, branch)
+    mouse_dir = _resolve_compare_mouse_dir(run_dir, ordinal)
+    return _serve_photo(mouse_dir / "photo.jpg", size)
+
+
+@app.get(
+    "/api/lab/compare/{compare_id}/branches/{branch}/mice/{ordinal}/clip",
+    response_model=None,
+    dependencies=[Depends(require_token_or_operator)],
+)
+def api_lab_compare_mouse_clip(compare_id: str, branch: str, ordinal: int):
+    cleaned = _clean_id(compare_id, field_name="compare_id")
+    run_dir = _resolve_compare_branch_dir(cleaned, branch)
+    mouse_dir = _resolve_compare_mouse_dir(run_dir, ordinal)
+    clip = mouse_dir / "clip.mp4"
+    if not clip.is_file():
+        raise HTTPException(status_code=404, detail="clip 不存在")
+    return FileResponse(clip, media_type="video/mp4")
 
 
 def main() -> None:
