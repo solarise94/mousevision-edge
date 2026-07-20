@@ -77,6 +77,7 @@ from ui.records_meta import RecordsMetaStore
 from ui.registry import MouseRegistry
 from ui.settings import SettingsStore
 from ui.users import SESSION_COOKIE, UserStore
+import ui.realtime_api as realtime_api
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).resolve().parent / "static"
@@ -759,6 +760,10 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="MouseVision Edge UI", lifespan=lifespan)
+
+# Realtime weighing WebSocket + REST API
+realtime_api.configure(DEFAULT_CONFIG)
+app.include_router(realtime_api.router)
 
 
 class _NoCacheStaticFiles(StaticFiles):

@@ -848,7 +848,7 @@
     }
     document.documentElement.classList.add("camera-mode", "record-light");
     const box = state.currentBox;
-    const titleEl = h("h1", {}, `录制准备 · ${box.cageId}`);
+    const titleEl = h("h1", {}, `实时称重 · ${box.cageId}`);
     function setTitle(text) { titleEl.textContent = text; }
     const switchCamBtn = h(
       "button",
@@ -860,9 +860,20 @@
       },
       "切换"
     );
+    const finishBtn = h(
+      "button",
+      {
+        class: "action-text rt-finish-btn",
+        type: "button",
+        title: "完成本箱并上传录像",
+      },
+      "完成本箱"
+    );
+    const appbarRight = h("span", { class: "rt-appbar-right" }, [switchCamBtn, finishBtn]);
 
     // Hidden source video (camera decode). Visible canvas is what the user
-    // sees and what MediaRecorder captures — same 720×1280 pixels.
+    // sees, what MediaRecorder captures, and what we JPEG-encode for the
+    // realtime WebSocket stream — same 720×1280 pixels.
     const video = h("video", {
       class: "camera-source",
       autoplay: "",
@@ -877,46 +888,101 @@
       height: String(CANVAS_H),
     });
     const ctx = canvas.getContext("2d", { alpha: false });
-    const timer = h("b", {}, "00:00:00");
-    const recTimer = h("div", { class: "rec-timer", hidden: true }, [
-      h("span", { class: "rec-dot" }),
-      timer,
-    ]);
-    const shutter = h("button", {
-      class: "shutter idle",
-      type: "button",
-      "aria-label": "开始/结束录制",
-    });
-    const hint = h("div", { class: "rec-hint" }, "绿框放完整小鼠和秤盘，黄框放体重显示屏");
+
     const guides = h("div", { class: "weighing-guides", "aria-hidden": "true" }, [
       h("div", { class: "capture-guide mouse-guide" }, [h("span", {}, "小鼠称重区（秤盘）")]),
-      h("div", { class: "framing-hint" }, "两个区域都清晰后再开始录制"),
+      h("div", { class: "framing-hint" }, "调整手机使两个区域都清晰"),
       h("div", { class: "capture-guide weight-guide" }, [h("span", {}, "体重读数区（显示屏）")]),
     ]);
-    // Canvas + guides share one 9:16 capture-viewport so display == recording pixels.
-    // Shutter / timer / hint live in rec-dock outside the video (no LCD overlap).
-    const viewport = h("div", { class: "capture-viewport" }, [
-      video,
-      canvas,
-      guides,
-    ]);
+    const viewport = h("div", { class: "capture-viewport" }, [video, canvas, guides]);
     const viewportHost = h("div", { class: "record-viewport-host" }, [viewport]);
-    const dock = h("div", { class: "rec-dock" }, [
-      recTimer,
-      h("div", { class: "rec-dock-actions" }, [shutter]),
-      hint,
-    ]);
-    const stage = h("div", { class: "camera-stage record-stage" }, [
+
+    // --- Realtime dock ---
+    const stateDot = h("span", {
+      class: "rt-state-dot",
+      style:
+        "display:inline-block;width:10px;height:10px;border-radius:50%;background:#9aa0a6;margin-right:6px;vertical-align:middle",
+    });
+    const stateText = h("span", { class: "rt-state-text" }, "正在连接…");
+    const stateIndicator = h(
+      "div",
+      { class: "rt-state-indicator", style: "text-align:center;padding:6px 0;font-size:15px" },
+      [stateDot, stateText]
+    );
+
+    const weightValue = h(
+      "span",
+      { class: "rt-weight-value", style: "font-size:56px;font-weight:700;line-height:1;color:#9aa0a6" },
+      "--"
+    );
+    const weightUnit = h(
+      "span",
+      { class: "rt-weight-unit", style: "font-size:20px;margin-left:6px;color:#9aa0a6" },
+      "g"
+    );
+    const weightDisplay = h(
+      "div",
+      { class: "rt-weight-display", style: "text-align:center;margin:2px 0" },
+      [weightValue, weightUnit]
+    );
+
+    const qualityHints = h("div", {
+      class: "rt-quality-hints",
+      style: "text-align:center;color:var(--muted,#5f6368);font-size:13px;min-height:18px",
+    });
+
+    const retryBtn = h(
+      "button",
+      { class: "btn rt-btn-retry", type: "button", hidden: true },
+      "重测"
+    );
+    const acceptBtn = h(
+      "button",
+      { class: "btn primary rt-btn-accept", type: "button", hidden: true },
+      "确认"
+    );
+    const actionButtons = h(
+      "div",
+      { class: "rt-actions", style: "display:flex;gap:12px;justify-content:center" },
+      [retryBtn, acceptBtn]
+    );
+
+    const mouseCount = h(
+      "div",
+      { class: "rt-mouse-count", style: "text-align:center;color:var(--muted,#5f6368);font-size:13px" },
+      "已记录 0 只"
+    );
+
+    const dock = h(
+      "div",
+      { class: "realtime-dock", style: "padding:8px 16px 16px" },
+      [stateIndicator, weightDisplay, qualityHints, actionButtons, mouseCount]
+    );
+
+    const stage = h("div", { class: "camera-stage record-stage realtime-stage" }, [
       viewportHost,
       dock,
     ]);
-    const screen = h("div", { class: "screen camera-screen record-screen" }, [
+
+    const reconnectOverlay = h(
+      "div",
+      {
+        class: "rt-reconnect-overlay",
+        hidden: true,
+        style:
+          "position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;color:#fff;font-size:17px",
+      },
+      "连接断开，正在重连…"
+    );
+
+    const screen = h("div", { class: "screen camera-screen record-screen realtime-screen" }, [
       appbar("", {
         back: "/",
         titleNode: titleEl,
-        right: switchCamBtn,
+        right: appbarRight,
       }),
       stage,
+      reconnectOverlay,
     ]);
     mount(screen);
 
@@ -935,6 +1001,21 @@
     let currentDeviceId = null;
     let paintedReady = false;
     let viewportObserver = null;
+
+    // Realtime-specific state
+    let rtSession = null; // { session_id, ... }
+    let ws = null;
+    let wsClosedByUs = false;
+    let reconnectHandle = null;
+    let frameInterval = null;
+    let frameSeq = 0;
+    let recordingT0 = 0;
+    let frameInFlight = false;
+    let rtState = "connecting";
+    let rtMouseCount = 0;
+    let announcedWeight = null;
+    let finished = false;
+    let abandoned = false;
 
     // Pixel-exact 9:16 layout within the host (excludes bottom dock chrome).
     function layoutViewport() {
@@ -967,17 +1048,6 @@
       window.addEventListener("resize", layoutViewport);
     }
 
-    function setShutterArmed(armed) {
-      if (armed) {
-        shutter.disabled = false;
-        shutter.classList.remove("waiting");
-      } else {
-        shutter.disabled = true;
-        shutter.classList.add("waiting");
-      }
-    }
-    setShutterArmed(false);
-
     function paintFrame() {
       if (!ctx) return false;
       try {
@@ -993,13 +1063,10 @@
           rect.sx, rect.sy, rect.sw, rect.sh,
           0, 0, CANVAS_W, CANVAS_H
         );
-        if (!paintedReady) {
-          paintedReady = true;
-          setShutterArmed(true);
-        }
+        paintedReady = true;
         return true;
       } catch (_) {
-        // Transient WebView draw failures: keep the loop alive, do not arm shutter.
+        // Transient WebView draw failures: keep the loop alive.
         return false;
       }
     }
@@ -1050,30 +1117,8 @@
       };
     }
 
-    function setHint(text, warn) {
-      hint.textContent = text || "";
-      hint.classList.toggle("warn", !!warn);
-    }
-
-    function disableRecording(reason) {
-      useCanvas = false;
-      paintedReady = false;
-      setShutterArmed(false);
-      setHint(reason || "当前浏览器无法进行网页录像，请更换浏览器后重试", true);
-      shutter.classList.add("hidden");
-      switchCamBtn.hidden = true;
-      stopDraw();
-      stopStream(stream);
-      stream = null;
-      if (canvasStream) {
-        canvasStream.getTracks().forEach((t) => t.stop());
-        canvasStream = null;
-      }
-    }
-
     async function startCamera(deviceId) {
       paintedReady = false;
-      setShutterArmed(false);
       stopStream(stream);
       stream = await openBackCamera(video, deviceId || undefined);
       const settings = trackSettings(stream);
@@ -1081,11 +1126,8 @@
       lastSourceSize = videoSourceSize(video, stream);
       const facing = (settings.facingMode || "").toLowerCase();
       if (facing && facing !== "environment") {
-        setHint("当前可能是前置摄像头，请点右上角「切换」", true);
         switchCamBtn.hidden = false;
         toast("未检测到后置摄像头，请切换");
-      } else {
-        setHint("绿框放完整小鼠和秤盘，黄框放体重显示屏", false);
       }
       try {
         videoInputs = await listVideoInputs();
@@ -1094,7 +1136,7 @@
     }
 
     switchCamBtn.addEventListener("click", async () => {
-      if (recording || switchCamBtn.disabled) return;
+      if (switchCamBtn.disabled) return;
       if (!videoInputs.length) {
         try { videoInputs = await listVideoInputs(); } catch (_) {}
       }
@@ -1113,80 +1155,57 @@
       }
     });
 
-    (async () => {
-      if (!useCanvas) {
-        disableRecording("浏览器不支持网页录像，请更换浏览器后重试");
-        return;
-      }
-      try {
-        await startCamera();
-        drawing = true;
-        scheduleDraw();
-        if (window.screen && window.screen.orientation && window.screen.orientation.lock) {
-          window.screen.orientation.lock("portrait").catch(() => {});
-        }
-      } catch (err) {
-        disableRecording("无法打开实时相机，请确认 HTTPS 与摄像头权限");
-      }
-    })();
-
-    function tick() {
-      const s = Math.floor((Date.now() - startedAt) / 1000);
-      timer.textContent = `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
-    }
-
-    function startRec() {
+    // --- Background MediaRecorder (starts immediately, uploads on finish) ---
+    function startBackgroundRecorder() {
       if (!useCanvas || !stream || !window.MediaRecorder || typeof canvas.captureStream !== "function") {
         toast("当前浏览器不支持网页录像，请更换浏览器后重试");
-        disableRecording();
-        return;
+        return false;
       }
       // Require a successful paint — never record black/frozen frames.
       if (!paintFrame() || !paintedReady) {
-        toast("画面未就绪，请稍候再录");
-        return;
+        toast("画面未就绪，请稍候");
+        return false;
       }
       chunks = [];
       try {
         canvasStream = canvas.captureStream(15);
       } catch (err) {
         toast("无法录制当前画面，请稍后重试");
-        disableRecording("无法录制当前画面，请更换浏览器后重试");
-        return;
+        return false;
       }
       const mime = pickMime();
       if (!mime) {
         toast("当前浏览器不支持 MP4/H.264 录像，请更换浏览器后重试");
-        disableRecording("当前浏览器不支持 MP4/H.264 录像");
-        return;
+        return false;
       }
       const opts = { videoBitsPerSecond: 1500000, mimeType: mime };
-      try { recorder = new MediaRecorder(canvasStream, opts); }
-      catch (err2) {
+      try {
+        recorder = new MediaRecorder(canvasStream, opts);
+      } catch (err2) {
         toast("无法启动 MP4 录像，请更换浏览器后重试");
-        disableRecording();
-        return;
+        return false;
       }
       recorder.addEventListener("dataavailable", (e) => {
         if (e.data && e.data.size) chunks.push(e.data);
       });
       recorder.addEventListener("stop", () => {
         clearInterval(clockTimer);
+        // If the user navigated away without finishing, drop the recording.
+        if (abandoned) return;
         const type = recorder.mimeType || mime || "video/mp4";
-        const ext = "mp4";
         const blob = new Blob(chunks, { type });
         const durationSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-        // Freeze meta before stopping the camera track (hdjeldn: never refresh
-        // geometry after stopStream zeros videoWidth).
-        const meta = buildCaptureMeta("canvas");
+        // Freeze meta before stopping the camera track (never refresh geometry
+        // after stopStream zeros videoWidth).
+        const meta = buildCaptureMeta("realtime");
         stopStream(stream);
         stream = null;
         if (canvasStream) {
           canvasStream.getTracks().forEach((t) => t.stop());
           canvasStream = null;
         }
-        doUpload(blob, `mv-${Date.now()}.${ext}`, durationSec, {
-          captureMode: "canvas",
+        doUpload(blob, `mv-${Date.now()}.mp4`, durationSec, {
+          captureMode: "realtime",
           captureMeta: meta,
         });
       });
@@ -1194,24 +1213,9 @@
       recorder.start();
       recording = true;
       startedAt = Date.now();
-      tick();
-      clockTimer = setInterval(tick, 500);
-      recTimer.hidden = false;
-      shutter.classList.remove("idle");
-      shutter.classList.add("recording");
-      switchCamBtn.disabled = true;
-      setTitle(`录制中 · ${box.cageId}`);
-      setHint("录制中：保持小鼠在绿框、体重数字在黄框内", false);
+      recordingT0 = startedAt;
+      return true;
     }
-
-    function stopRec() {
-      if (recorder && recording) {
-        recording = false;
-        recorder.stop();
-      }
-    }
-
-    shutter.addEventListener("click", () => (recording ? stopRec() : startRec()));
 
     function doUpload(blob, filename, durationSec, uploadOpts) {
       stopDraw();
@@ -1221,10 +1225,360 @@
       renderUploading(box, blob, filename, durationSec, uploadOpts || {});
     }
 
+    // --- Realtime session + WebSocket ---
+    function getToken() {
+      try {
+        const meta = document.querySelector('meta[name="mousevision-api-token"]');
+        return meta && meta.content ? meta.content.trim() : "";
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function rtSend(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify(obj)); return true; } catch (_) {}
+      }
+      return false;
+    }
+
+    function showReconnect(show) {
+      reconnectOverlay.hidden = !show;
+    }
+
+    function connectWs() {
+      if (!rtSession || !rtSession.session_id) return;
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const token = getToken();
+      const qs = `session_id=${encodeURIComponent(rtSession.session_id)}&token=${encodeURIComponent(token)}`;
+      const url = `${proto}//${location.host}/api/realtime/ws?${qs}`;
+      try {
+        ws = new WebSocket(url);
+        ws.binaryType = "arraybuffer";
+      } catch (err) {
+        showReconnect(true);
+        scheduleReconnect();
+        return;
+      }
+      ws.addEventListener("open", () => {
+        showReconnect(false);
+        if (rtState === "connecting") setState("calibrating", {});
+      });
+      ws.addEventListener("message", (ev) => {
+        if (typeof ev.data !== "string") return;
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        handleServerMessage(msg);
+      });
+      ws.addEventListener("close", () => {
+        if (wsClosedByUs || finished) return;
+        showReconnect(true);
+        scheduleReconnect();
+      });
+      ws.addEventListener("error", () => {
+        // The close handler will fire and trigger reconnect.
+      });
+    }
+
+    function scheduleReconnect() {
+      if (reconnectHandle || finished) return;
+      reconnectHandle = setTimeout(() => {
+        reconnectHandle = null;
+        connectWs();
+      }, 2000);
+    }
+
+    function speakWeight(weight) {
+      try {
+        if (!("speechSynthesis" in window)) return;
+        const u = new SpeechSynthesisUtterance(`${Number(weight).toFixed(2)}克`);
+        u.lang = "zh-CN";
+        u.rate = 1.0;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(u);
+      } catch (_) {}
+    }
+
+    function setWeightValue(value, confirmed) {
+      if (value == null) {
+        weightValue.textContent = "--";
+        weightValue.style.color = "#9aa0a6";
+        weightUnit.style.color = "#9aa0a6";
+      } else {
+        weightValue.textContent = Number(value).toFixed(2);
+        // Confirmed (announced) = green; live/unconfirmed = gray.
+        const c = confirmed ? "#1e8e3e" : "#5f6368";
+        weightValue.style.color = c;
+        weightUnit.style.color = c;
+      }
+    }
+
+    function setQualityHints(lines) {
+      qualityHints.innerHTML = "";
+      if (!lines || !lines.length) return;
+      lines.forEach((txt) => {
+        qualityHints.appendChild(h("div", { class: "rt-hint" }, String(txt)));
+      });
+    }
+
+    const STATE_LABELS = {
+      connecting: "正在连接…",
+      calibrating: "校准中",
+      armed: "待称重",
+      weighing: "称重中",
+      announced: "请确认",
+      wait_clear: "等待清场",
+      accepted: "已记录",
+    };
+    const STATE_COLORS = {
+      connecting: "#9aa0a6",
+      calibrating: "#f59e0b",
+      armed: "#1a73e8",
+      weighing: "#1a73e8",
+      announced: "#1e8e3e",
+      wait_clear: "#f59e0b",
+      accepted: "#1e8e3e",
+    };
+
+    function setState(newState, msg) {
+      msg = msg || {};
+      rtState = newState;
+      stateText.textContent = STATE_LABELS[newState] || newState;
+      stateDot.style.background = STATE_COLORS[newState] || "#9aa0a6";
+
+      const showGuides = newState === "connecting" || newState === "calibrating";
+      guides.style.display = showGuides ? "" : "none";
+
+      const showActions = newState === "announced";
+      retryBtn.hidden = !showActions;
+      acceptBtn.hidden = !showActions;
+
+      switch (newState) {
+        case "calibrating":
+          setQualityHints(
+            msg.hints && msg.hints.length ? msg.hints : ["请调整手机，使显示屏位于画面内"]
+          );
+          setWeightValue(msg.weight != null ? msg.weight : null, false);
+          break;
+        case "armed":
+          setQualityHints(["请将小鼠放上秤盘"]);
+          setWeightValue(msg.weight != null ? msg.weight : null, false);
+          break;
+        case "weighing":
+          setQualityHints([]);
+          setWeightValue(msg.weight != null ? msg.weight : null, false);
+          break;
+        case "announced":
+          setQualityHints([]);
+          if (typeof msg.weight === "number") announcedWeight = msg.weight;
+          if (announcedWeight != null) setWeightValue(announcedWeight, true);
+          break;
+        case "wait_clear":
+          setQualityHints(["请取走小鼠"]);
+          setWeightValue(null, false);
+          break;
+        case "accepted":
+          setQualityHints([]);
+          if (announcedWeight != null) {
+            weightDisplay.style.transition = "transform .15s ease";
+            weightDisplay.style.transform = "scale(1.15)";
+            setTimeout(() => { weightDisplay.style.transform = "scale(1)"; }, 200);
+          }
+          break;
+      }
+    }
+
+    function handleServerMessage(msg) {
+      if (!msg || typeof msg !== "object") return;
+      const t = msg.type;
+      if (t === "state") {
+        setState(msg.state || rtState, msg);
+      } else if (t === "weight") {
+        if (typeof msg.weight === "number" && (rtState === "weighing" || rtState === "armed")) {
+          setWeightValue(msg.weight, false);
+        }
+      } else if (t === "announced") {
+        if (typeof msg.weight === "number") {
+          announcedWeight = msg.weight;
+          speakWeight(msg.weight);
+        }
+        setState("announced", msg);
+      } else if (t === "accepted") {
+        if (msg.accepted_count != null) rtMouseCount = msg.accepted_count;
+        else rtMouseCount += 1;
+        mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
+        announcedWeight = null;
+        setState("accepted", msg);
+      } else if (t === "quality") {
+        const hints = msg.hints || msg.warnings || [];
+        if (hints.length) setQualityHints(hints);
+      } else if (t === "mouse_count" || t === "count") {
+        const c = msg.accepted_count != null ? msg.accepted_count : msg.count;
+        if (c != null) {
+          rtMouseCount = c;
+          mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
+        }
+      } else if (t === "error") {
+        toast(msg.message || "实时分析出错");
+      }
+    }
+
+    retryBtn.addEventListener("click", () => {
+      rtSend({ type: "retry" });
+      announcedWeight = null;
+      setState("armed", {});
+    });
+    acceptBtn.addEventListener("click", () => {
+      rtSend({ type: "accept" });
+    });
+
+    // --- Frame sending loop (every 250ms, JPEG q=0.55, 8-byte header) ---
+    function sendFrame() {
+      if (frameInFlight) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!paintedReady) return;
+      frameInFlight = true;
+      try {
+        canvas.toBlob((blob) => {
+          frameInFlight = false;
+          if (!blob) return;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            const jpegBytes = new Uint8Array(reader.result);
+            const buf = new ArrayBuffer(8 + jpegBytes.length);
+            const dv = new DataView(buf);
+            dv.setUint32(0, frameSeq, true);
+            frameSeq += 1;
+            dv.setUint32(4, Date.now() - recordingT0, true);
+            new Uint8Array(buf, 8).set(jpegBytes);
+            try { ws.send(buf); } catch (_) {}
+          };
+          reader.onerror = () => { frameInFlight = false; };
+          reader.readAsArrayBuffer(blob);
+        }, "image/jpeg", 0.55);
+      } catch (_) {
+        frameInFlight = false;
+      }
+    }
+
+    function startFrameLoop() {
+      if (frameInterval) return;
+      frameInterval = setInterval(sendFrame, 250);
+    }
+
+    function stopFrameLoop() {
+      if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
+      frameInFlight = false;
+    }
+
+    // --- Create realtime session and open WS ---
+    async function startRealtime() {
+      try {
+        const res = await api.json("/api/realtime/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cage_id: box.cageId, project_id: state.projectId }),
+        });
+        rtSession = res;
+        connectWs();
+        startFrameLoop();
+      } catch (err) {
+        toast(err && err.message ? err.message : "无法启动实时称重");
+        showReconnect(true);
+        scheduleReconnect();
+      }
+    }
+
+    // --- Finish: stop everything, announce to server, then upload ---
+    async function finishSession() {
+      if (finished) return;
+      finished = true;
+      finishBtn.disabled = true;
+      stopFrameLoop();
+      wsClosedByUs = true;
+      if (ws) {
+        try { ws.close(); } catch (_) {}
+        ws = null;
+      }
+      if (reconnectHandle) {
+        clearTimeout(reconnectHandle);
+        reconnectHandle = null;
+      }
+      showReconnect(false);
+      if (rtSession && rtSession.session_id) {
+        try {
+          await api.json(
+            `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
+            { method: "POST" }
+          );
+        } catch (_) {}
+      }
+      // Stop the background recorder → its stop handler runs doUpload.
+      if (recorder && recording) {
+        recording = false;
+        try { recorder.stop(); } catch (_) {}
+      } else {
+        // Nothing recorded (recorder never started) — just leave.
+        go("/");
+      }
+    }
+    finishBtn.addEventListener("click", finishSession);
+
+    function disableRealtime(reason) {
+      useCanvas = false;
+      paintedReady = false;
+      stopDraw();
+      stopFrameLoop();
+      wsClosedByUs = true;
+      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+      if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }
+      stopStream(stream);
+      stream = null;
+      if (canvasStream) {
+        canvasStream.getTracks().forEach((t) => t.stop());
+        canvasStream = null;
+      }
+      switchCamBtn.hidden = true;
+      finishBtn.disabled = true;
+      stateText.textContent = "不可用";
+      stateDot.style.background = "#dc3545";
+      setQualityHints([reason || "当前浏览器无法进行实时称重，请更换浏览器后重试"]);
+    }
+
+    // --- Boot: camera → draw loop → background recorder → realtime session ---
+    (async () => {
+      if (!useCanvas) {
+        disableRealtime("浏览器不支持网页录像，请更换浏览器后重试");
+        return;
+      }
+      try {
+        await startCamera();
+        drawing = true;
+        scheduleDraw();
+        if (window.screen && window.screen.orientation && window.screen.orientation.lock) {
+          window.screen.orientation.lock("portrait").catch(() => {});
+        }
+        startBackgroundRecorder();
+        startRealtime();
+      } catch (err) {
+        disableRealtime("无法打开实时相机，请确认 HTTPS 与摄像头权限");
+      }
+    })();
+
     return () => {
+      // Distinguish navigation-away from an explicit finish: only the former
+      // should suppress the recorder's upload handler.
+      if (!finished) abandoned = true;
+      finished = true;
       document.documentElement.classList.remove("camera-mode", "record-light");
       clearInterval(clockTimer);
       stopDraw();
+      stopFrameLoop();
+      wsClosedByUs = true;
+      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+      if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }
       if (viewportObserver) {
         try { viewportObserver.disconnect(); } catch (_) {}
         viewportObserver = null;
@@ -1234,6 +1588,7 @@
       if (window.screen && window.screen.orientation && window.screen.orientation.unlock) {
         try { window.screen.orientation.unlock(); } catch (_) {}
       }
+      try { if ("speechSynthesis" in window) window.speechSynthesis.cancel(); } catch (_) {}
       if (recorder && recording) try { recorder.stop(); } catch (_) {}
       if (canvasStream) canvasStream.getTracks().forEach((t) => t.stop());
       stopStream(stream);
