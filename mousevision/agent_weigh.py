@@ -32,6 +32,10 @@ DEFAULT_MAX_WIDTH = 720
 DEFAULT_CRF = 28
 DEFAULT_TIMEOUT_S = 420
 DEFAULT_REVIEW_CONF = 0.7
+# Physical plausibility bounds for VLM output validation.
+VALID_WEIGHT_MIN_G = 0.5
+VALID_WEIGHT_MAX_G = 60.0
+MIN_SESSION_GAP_S = 1.0
 # Local evidence attachment defaults (agent path).
 DEFAULT_ATTACH_PHOTOS = True
 DEFAULT_PHOTO_SAMPLE_INTERVAL_MS = 200
@@ -304,12 +308,42 @@ def _sessions_from_payload(payload: dict[str, Any]) -> list[AgentSession]:
         t_start = _float_or_none("t_start_s", "start_s")
         t_end = _float_or_none("t_end_s", "end_s")
         t_stable = _float_or_none("t_stable_s", "stable_s")
+
+        # --- Physical plausibility validation ---
+        note = str(row.get("note") or "")
+        validation_flags: list[str] = []
+
+        # Weight range check
+        if weight is not None:
+            if weight < VALID_WEIGHT_MIN_G or weight > VALID_WEIGHT_MAX_G:
+                validation_flags.append(f"weight_out_of_range({weight:.1f}g)")
+                weight = None  # reject implausible weight
+                conf = 0.0
+
+        # Time anchor monotonicity: t_start <= t_stable <= t_end
+        if t_start is not None and t_end is not None and t_start > t_end:
+            validation_flags.append("time_anchors_inverted")
+            t_start, t_end = t_end, t_start  # auto-correct by swapping
+        if t_stable is not None:
+            if t_start is not None and t_stable < t_start - 0.5:
+                validation_flags.append("t_stable_before_t_start")
+                t_stable = t_start
+            if t_end is not None and t_stable > t_end + 0.5:
+                validation_flags.append("t_stable_after_t_end")
+                t_stable = t_end
+
+        # Confidence range clamp
+        conf = max(0.0, min(1.0, conf))
+
+        if validation_flags:
+            note = f"{note} [validation: {','.join(validation_flags)}]".strip()
+
         out.append(
             AgentSession(
                 ordinal=ord_,
                 weight_g=weight,
                 confidence=conf,
-                note=str(row.get("note") or ""),
+                note=note,
                 t_start_s=t_start,
                 t_end_s=t_end,
                 t_stable_s=t_stable,
@@ -495,6 +529,9 @@ def persist_agent_sessions(
             reasons.append("agent_null_weight")
         elif conf < float(review_confidence):
             reasons.append("agent_low_confidence")
+        if "[validation:" in str(sess.note or ""):
+            needs = True
+            reasons.append("agent_validation_flag")
         analysis = AnalysisResult(
             weight=weight,
             confidence=conf,

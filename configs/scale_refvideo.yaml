@@ -53,9 +53,12 @@ mouse_detect:
   # blob mean must be clearly darker than the pan (<= 0.62 * ROI median).
   dark_p05: 30
   dark_ratio: 0.62
+  min_solidity: 0.65
+  min_extent: 0.50
   aspect_ratio: [0.3, 2.0]
   x_ratio: [0.12, 0.88]
   use_otsu: true
+  smooth_window: 5
   # pan_roi: absolute scale-pan pixels (NOT weight_roi / LCD). Calibrate on device.
   # pan_roi: {x: 80, y: 120, w: 560, h: 520}
 
@@ -111,9 +114,15 @@ temporal:
   min_weight: 0.0
   max_weight: 50.0
   stick_tol: 0.08
+  # Minimum weight gap (g) between two clusters to count as a real conflict.
+  # Gaps below this are OCR jitter (e.g. 18.93 vs 18.79) and are merged silently.
+  conflict_weight_tol: 0.50
   # Bound the mouse-on-scale zero hold (re-tare transient): after 4 held zero
   # frames the zero passes through — a long zero run is a real empty scale.
   zero_hold_max_frames: 4
+  # Time-weighted voting: 0 disables (equal weight, legacy behaviour).
+  # Enable with e.g. 800 after validating on target video data.
+  time_weight_half_life_ms: 0
 
 # Template matching / OCR confidence floor
 match_threshold: 0.50
@@ -158,6 +167,9 @@ raw_cluster:
   stable_max_span: 0.25
   conflict_min_votes: 3
   conflict_min_frac: 0.25
+  conflict_weight_tol: 0.50
+  dominant_suppress_frac: 0.65
+  dominant_gap_grams: 5.0
   pre_enter_ms: 3000
 
 # Sustained raw reads BETWEEN sessions that never fused (restless animal)
@@ -177,6 +189,7 @@ dup_session:
 
 # Curve analyzer
 platform_window_seconds: 0.8
+adaptive_platform_window: false
 platform_max_std: 0.35
 near_zero: 0.5
 max_session_seconds: 30

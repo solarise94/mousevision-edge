@@ -182,6 +182,50 @@ def _projection_slots(bw: np.ndarray) -> list[tuple[int, int]]:
     return slots
 
 
+def _validate_slot_consistency(
+    slots: list[tuple[int, int]],
+    bw: np.ndarray,
+) -> list[tuple[int, int]]:
+    """Filter out slots with inconsistent width or height.
+
+    Real digit slots should have roughly consistent width and height.
+    Removes slots that are likely fragments from bad projection splits
+    (e.g. an '8' split into two halves, or two digits merged into one).
+
+    Returns the filtered slot list (may be shorter than input).
+    """
+    if len(slots) <= 1:
+        return slots
+
+    h = bw.shape[0]
+    widths = [b - a for a, b in slots]
+    heights = []
+    for a, b in slots:
+        ph, _ = _run_height(bw, a, b)
+        heights.append(ph)
+
+    med_w = float(np.median(widths))
+    med_h = float(np.median(heights))
+
+    if med_w <= 0 or med_h <= 0:
+        return slots
+
+    valid: list[tuple[int, int]] = []
+    for i, (a, b) in enumerate(slots):
+        w = widths[i]
+        ph = heights[i]
+        # Width consistency: within [0.35, 2.8] of median.
+        # Too narrow → fragment; too wide → merged digits.
+        if w < med_w * 0.35 or w > med_w * 2.8:
+            continue
+        # Height consistency: within [0.5, 1.5] of median.
+        if ph > 0 and (ph < med_h * 0.5 or ph > med_h * 1.5):
+            continue
+        valid.append((a, b))
+
+    return valid if valid else slots  # never return empty
+
+
 def _expand_seven_slots(bw: np.ndarray, slots: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Expand narrow right-stem slots leftward to capture a disconnected '7' top bar."""
     h, _ = bw.shape
@@ -444,6 +488,7 @@ class TemplateReader:
 
     def _decode_binary(self, bw: np.ndarray) -> tuple[float | None, float, int]:
         slots = [s for s in _projection_slots(bw) if not _is_noise_slot(bw, s[0], s[1])]
+        slots = _validate_slot_consistency(slots, bw)
         slots = _expand_seven_slots(bw, slots)
         if len(slots) < 2:
             return None, 0.0, 0

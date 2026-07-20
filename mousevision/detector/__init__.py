@@ -46,6 +46,47 @@ class StateMachineConfig:
     # Stuck ENTER (never reaches WEIGHING, never sees zero) aborts to ANALYZE
     # after this many ms from enter_ms. 0 disables (legacy).
     max_enter_ms: float = 0.0
+    # --- Time-based parameter overrides ---
+    # When set (> 0), these take precedence over the frame-based parameters
+    # above. The driver converts them to frame counts using analysis_fps.
+    # This simplifies configuration: operators think in seconds, not frames.
+    enter_confirm_seconds: float = 0.0  # overrides enter_sustain_frames
+    leave_confirm_seconds: float = 0.0  # overrides leave_hold_frames
+    empty_arm_seconds: float = 0.0  # overrides empty_arm_frames
+
+    def resolved(self, analysis_fps: float) -> "StateMachineConfig":
+        """Return a copy with time-based params converted to frame counts.
+
+        Time-based overrides (``*_seconds``) take precedence over the
+        frame-based fields when > 0. Frame counts are rounded up to at
+        least 1 frame.
+        """
+        import math
+
+        if analysis_fps <= 0:
+            return self
+        cfg = StateMachineConfig(
+            empty_max=self.empty_max,
+            enter_min=self.enter_min,
+            leave_max=self.leave_max,
+            leave_hold_frames=self.leave_hold_frames,
+            weighing_min_samples=self.weighing_min_samples,
+            empty_arm_frames=self.empty_arm_frames,
+            reenter_cooldown_ms=self.reenter_cooldown_ms,
+            require_mouse_for_enter=self.require_mouse_for_enter,
+            enter_abort_to_analyze=self.enter_abort_to_analyze,
+            max_session_ms=self.max_session_ms,
+            enter_sustain_frames=self.enter_sustain_frames,
+            enter_zero_hold_frames=self.enter_zero_hold_frames,
+            max_enter_ms=self.max_enter_ms,
+        )
+        if self.enter_confirm_seconds > 0:
+            cfg.enter_sustain_frames = max(1, math.ceil(self.enter_confirm_seconds * analysis_fps))
+        if self.leave_confirm_seconds > 0:
+            cfg.leave_hold_frames = max(1, math.ceil(self.leave_confirm_seconds * analysis_fps))
+        if self.empty_arm_seconds > 0:
+            cfg.empty_arm_frames = max(1, math.ceil(self.empty_arm_seconds * analysis_fps))
+        return cfg
 
 
 @dataclass

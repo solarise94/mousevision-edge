@@ -21,6 +21,8 @@ class RawWeightObservation:
     raw_text: str = ""
     latency_ms: float = 0.0
     collection_assets: dict[str, str] | None = None  # base64 JPEGs from OCR service
+    # Timestamp attached by temporal fusion for time-weighted clustering.
+    _ts_ms: float = 0.0
 
     @property
     def is_readable(self) -> bool:

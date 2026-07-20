@@ -76,6 +76,8 @@ class SessionDriver:
 
     session_index: int = 0
     saved_events: list[SessionSavedEvent] = field(default_factory=list)
+    # Mouse detection temporal smoothing: sliding window of recent results.
+    _mouse_history: list[bool] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         cfg = self.config
@@ -103,10 +105,16 @@ class SessionDriver:
                 min_weight=float(temporal_cfg.get("min_weight", 0.0)),
                 max_weight=float(temporal_cfg.get("max_weight", 50.0)),
                 stick_tol=float(temporal_cfg.get("stick_tol", 0.20)),
+                conflict_weight_tol=float(
+                    temporal_cfg.get("conflict_weight_tol", 0.50)
+                ),
                 zero_hold_max_frames=(
                     int(temporal_cfg.get("zero_hold_max_frames", 4))
                     if self.use_http_ocr
                     else 0
+                ),
+                time_weight_half_life_ms=float(
+                    temporal_cfg.get("time_weight_half_life_ms", 0)
                 ),
             )
         )
@@ -124,35 +132,41 @@ class SessionDriver:
             empty_arm = 0
             cooldown_ms = 0.0
             enter_min = float(cfg.get("enter_min", 1.0))
-        self.sm = WeighingStateMachine(
-            StateMachineConfig(
-                empty_max=float(cfg.get("empty_max", 0.15)),
-                enter_min=enter_min,
-                leave_max=float(cfg.get("leave_max", 0.30)),
-                leave_hold_frames=int(cfg.get("leave_hold_frames", 10)),
-                weighing_min_samples=int(cfg.get("weighing_min_samples", 5)),
-                empty_arm_frames=empty_arm,
-                reenter_cooldown_ms=cooldown_ms,
-                require_mouse_for_enter=(
-                    bool(cfg.get("require_mouse_for_enter", False))
-                    if self.use_http_ocr
-                    else False
-                ),
-                enter_abort_to_analyze=bool(self.use_http_ocr),
-                max_session_ms=float(cfg.get("max_session_seconds", 30)) * 1000.0,
-                enter_sustain_frames=(
-                    int(cfg.get("enter_sustain_frames", 2)) if self.use_http_ocr else 1
-                ),
-                enter_zero_hold_frames=(
-                    int(cfg.get("enter_zero_hold_frames", 3)) if self.use_http_ocr else 1
-                ),
-                max_enter_ms=(
-                    float(cfg.get("max_enter_seconds", 15)) * 1000.0
-                    if self.use_http_ocr
-                    else 0.0
-                ),
-            )
+        sm_cfg = StateMachineConfig(
+            empty_max=float(cfg.get("empty_max", 0.15)),
+            enter_min=enter_min,
+            leave_max=float(cfg.get("leave_max", 0.30)),
+            leave_hold_frames=int(cfg.get("leave_hold_frames", 10)),
+            weighing_min_samples=int(cfg.get("weighing_min_samples", 5)),
+            empty_arm_frames=empty_arm,
+            reenter_cooldown_ms=cooldown_ms,
+            require_mouse_for_enter=(
+                bool(cfg.get("require_mouse_for_enter", False))
+                if self.use_http_ocr
+                else False
+            ),
+            enter_abort_to_analyze=bool(self.use_http_ocr),
+            max_session_ms=float(cfg.get("max_session_seconds", 30)) * 1000.0,
+            enter_sustain_frames=(
+                int(cfg.get("enter_sustain_frames", 2)) if self.use_http_ocr else 1
+            ),
+            enter_zero_hold_frames=(
+                int(cfg.get("enter_zero_hold_frames", 3)) if self.use_http_ocr else 1
+            ),
+            max_enter_ms=(
+                float(cfg.get("max_enter_seconds", 15)) * 1000.0
+                if self.use_http_ocr
+                else 0.0
+            ),
+            enter_confirm_seconds=float(cfg.get("enter_confirm_seconds", 0)),
+            leave_confirm_seconds=float(cfg.get("leave_confirm_seconds", 0)),
+            empty_arm_seconds=float(cfg.get("empty_arm_seconds", 0)),
         )
+        # Convert time-based overrides to frame counts using analysis_fps.
+        analysis_fps = float(cfg.get("analysis_fps", 0) or 0)
+        if analysis_fps > 0:
+            sm_cfg = sm_cfg.resolved(analysis_fps)
+        self.sm = WeighingStateMachine(sm_cfg)
         self.analyzer = WeightCurveAnalyzer(
             CurveAnalyzerConfig(
                 platform_window_seconds=float(cfg.get("platform_window_seconds", 0.8)),
@@ -201,6 +215,9 @@ class SessionDriver:
             stable_max_span=float(rc.get("stable_max_span", 0.25)),
             conflict_min_votes=int(rc.get("conflict_min_votes", 3)),
             conflict_min_frac=float(rc.get("conflict_min_frac", 0.25)),
+            conflict_weight_tol=float(rc.get("conflict_weight_tol", 0.50)),
+            dominant_suppress_frac=float(rc.get("dominant_suppress_frac", 0.65)),
+            dominant_gap_grams=float(rc.get("dominant_gap_grams", 5.0)),
         )
         self._raw_pre_enter_ms = float(rc.get("pre_enter_ms", 3000.0))
         # Orphan-session recovery: sustained raw reads between sessions that
@@ -218,6 +235,7 @@ class SessionDriver:
         self._dup_weight_tol = float(dc.get("weight_tol", 0.10))
         self._last_session_end_ms: float | None = None
         self._last_saved_weight: float | None = None
+        self._mouse_history: list[bool] = []
 
     def _build_reader(self, cfg: dict[str, Any], expected: Any):
         # Env overrides YAML so Quadlet can flip http_ocr without rebuilding config.
@@ -265,10 +283,24 @@ class SessionDriver:
                 use_otsu=bool(md_cfg.get("use_otsu", True)),
                 dark_p05=(float(md_cfg["dark_p05"]) if md_cfg.get("dark_p05") is not None else None),
                 dark_ratio=(float(md_cfg["dark_ratio"]) if md_cfg.get("dark_ratio") is not None else None),
+                min_solidity=(float(md_cfg["min_solidity"]) if md_cfg.get("min_solidity") is not None else None),
+                min_extent=(float(md_cfg["min_extent"]) if md_cfg.get("min_extent") is not None else None),
             )
         except Exception:  # noqa: BLE001
             return None
-        return box is not None
+        detected = box is not None
+
+        # Temporal smoothing: majority vote over recent frames.
+        smooth_window = int(md_cfg.get("smooth_window", 5))
+        if smooth_window <= 1:
+            return detected
+        self._mouse_history.append(detected)
+        if len(self._mouse_history) > smooth_window:
+            self._mouse_history = self._mouse_history[-smooth_window:]
+        if len(self._mouse_history) < 3:
+            return detected  # not enough history yet
+        true_count = sum(self._mouse_history)
+        return true_count > len(self._mouse_history) / 2
 
     def process_frame(self, frame: Frame) -> FrameEvent:
         raw_status = ""
@@ -413,6 +445,7 @@ class SessionDriver:
             self._pinned = False
             self._session_raw_samples.clear()
             self._training_obs.clear()
+            self._mouse_history.clear()
             self.fusion.reset()
 
         return event
@@ -541,6 +574,8 @@ class SessionDriver:
                 use_otsu=bool(md_cfg.get("use_otsu", True)),
                 dark_p05=(float(md_cfg["dark_p05"]) if md_cfg.get("dark_p05") is not None else None),
                 dark_ratio=(float(md_cfg["dark_ratio"]) if md_cfg.get("dark_ratio") is not None else None),
+                min_solidity=(float(md_cfg["min_solidity"]) if md_cfg.get("min_solidity") is not None else None),
+                min_extent=(float(md_cfg["min_extent"]) if md_cfg.get("min_extent") is not None else None),
             )
 
         def _pan_overlap_ok(box, lcd, frame_h: int) -> bool:
@@ -784,6 +819,11 @@ class SessionDriver:
                 if verdict.status == "stable":
                     analysis.needs_review = False
                     analysis.review_reason = ""
+                    # Raw-cluster resolved the conflict with full session
+                    # context; clear any frame-level pending review flag so
+                    # it does not get re-applied below.
+                    if self._pending_review_reason.startswith("cluster_conflict"):
+                        self._pending_review_reason = ""
                 else:
                     analysis.needs_review = True
                     analysis.review_reason = verdict.reason
@@ -1054,6 +1094,7 @@ class SessionDriver:
         self.sm.finish_analyze(ts, wait_clear=wait_clear)
         self.buffer.clear()
         self._training_obs.clear()
+        self._mouse_history.clear()
 
     # ------------------------------------------------------------------ #
     # Raw-cluster session verdict + orphan recovery (http_ocr path)

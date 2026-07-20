@@ -154,3 +154,76 @@ def test_sustained_clusters_filters_short_and_thin():
 def test_sustained_clusters_respects_min_conf():
     samples = _samples([17.5] * 4, conf=0.2, dt=200.0)
     assert sustained_clusters(samples, min_conf=0.45) == []
+
+
+def test_tiny_gap_merged_as_stable():
+    """Two tight clusters 0.10g apart, temporally interleaved → stable."""
+    from mousevision.analyzer.raw_cluster import RawClusterConfig, analyze_raw_samples
+
+    cfg = RawClusterConfig(
+        tol=0.12,
+        stable_frac=0.60,
+        stable_min_votes=4,
+        stable_max_span=0.25,
+        conflict_weight_tol=0.50,
+    )
+    # 5 reads around 18.20, 4 reads around 18.10 (gap ≈ 0.10g < 0.50)
+    # Temporally interleaved (OCR jitter during the same platform).
+    samples = [
+        (0.0, 18.19, 0.8),
+        (100.0, 18.09, 0.8),
+        (200.0, 18.20, 0.8),
+        (300.0, 18.10, 0.8),
+        (400.0, 18.21, 0.8),
+        (500.0, 18.11, 0.8),
+        (600.0, 18.20, 0.8),
+        (700.0, 18.10, 0.8),
+        (800.0, 18.22, 0.8),
+    ]
+    verdict = analyze_raw_samples(samples, cfg)
+    assert verdict.status == "stable"
+    assert abs(verdict.weight - 18.20) < 0.15
+    assert verdict.votes == 9  # merged
+
+
+def test_dominant_cluster_suppresses_noise():
+    """Strong top cluster + large-gap weak second → stable, not conflict."""
+    from mousevision.analyzer.raw_cluster import RawClusterConfig, analyze_raw_samples
+
+    cfg = RawClusterConfig(
+        tol=0.12,
+        stable_frac=0.60,
+        stable_min_votes=4,
+        stable_max_span=0.25,
+        dominant_suppress_frac=0.65,
+        dominant_gap_grams=5.0,
+    )
+    # 8 reads at 18.11, 3 reads at 11.88 (gap = 6.23g, support = 8/11 = 0.73)
+    samples = (
+        [(float(i * 100), 18.11, 0.8) for i in range(8)]
+        + [(float(800 + i * 100), 11.88, 0.6) for i in range(3)]
+    )
+    verdict = analyze_raw_samples(samples, cfg)
+    assert verdict.status == "stable"
+    assert abs(verdict.weight - 18.11) < 0.15
+
+
+def test_genuine_conflict_still_flagged():
+    """Two strong clusters 2g apart → still conflict."""
+    from mousevision.analyzer.raw_cluster import RawClusterConfig, analyze_raw_samples
+
+    cfg = RawClusterConfig(
+        tol=0.12,
+        stable_frac=0.60,
+        stable_min_votes=4,
+        conflict_weight_tol=0.50,
+        dominant_suppress_frac=0.65,
+        dominant_gap_grams=5.0,
+    )
+    # 5 reads at 17.50, 5 reads at 15.50 (gap = 2.0g, neither dominant)
+    samples = (
+        [(float(i * 100), 17.50, 0.8) for i in range(5)]
+        + [(float(500 + i * 100), 15.50, 0.8) for i in range(5)]
+    )
+    verdict = analyze_raw_samples(samples, cfg)
+    assert verdict.status == "conflict"

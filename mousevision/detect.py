@@ -26,6 +26,8 @@ def detect_mouse_box(
     use_otsu: bool = True,
     dark_p05: float | None = None,
     dark_ratio: float | None = None,
+    min_solidity: float | None = None,
+    min_extent: float | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Detect a mouse on the scale pan.
 
@@ -47,6 +49,13 @@ def detect_mouse_box(
         dark_ratio: when set, a candidate blob is accepted only if its mean
             gray is ``<= dark_ratio * median(roi gray)``. Rejects large faint
             stain blobs that merely sit below the Otsu split.
+        min_solidity: when set, a candidate blob is accepted only if its
+            solidity (contour area / convex hull area) is >= this value.
+            Real mice are compact (solidity ~0.7-0.95); wires, shadows and
+            pan edges have lower solidity.
+        min_extent: when set, a candidate blob is accepted only if its
+            extent (contour area / bounding rect area) is >= this value.
+            Real mice fill their bounding box well (extent ~0.6-0.85).
     """
     h, w = image.shape[:2]
     if pan_roi is not None:
@@ -106,6 +115,21 @@ def detect_mouse_box(
                 continue
             if dark_ratio is not None and float(pixels.mean()) > float(dark_ratio) * roi_median:
                 continue
+        if min_solidity is not None or min_extent is not None:
+            hull = cv2.convexHull(contour)
+            hull_area = float(cv2.contourArea(hull))
+            if hull_area <= 0:
+                continue
+            solidity = area / hull_area
+            if min_solidity is not None and solidity < float(min_solidity):
+                continue
+            if min_extent is not None:
+                rect_area = float(bw * bh)
+                if rect_area <= 0:
+                    continue
+                extent = area / rect_area
+                if extent < float(min_extent):
+                    continue
         candidates.append((area, (x1 + x, y1 + y, bw, bh)))
 
     if not candidates:

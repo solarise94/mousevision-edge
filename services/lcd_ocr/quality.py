@@ -115,3 +115,105 @@ def assess_strip_quality(
         return StripQuality("transition", "speckle_ink", ink_ratio, evidence)
 
     return StripQuality("ok", "ok", ink_ratio, evidence)
+
+
+@dataclass
+class GlareReport:
+    """Result of glare detection on a normalized LCD screen."""
+    has_glare: bool
+    glare_fraction: float  # fraction of screen area affected
+    glare_intensity: float  # mean intensity of glare pixels (0-255)
+    overlaps_digits: bool  # whether glare overlaps the digit region
+    evidence: dict[str, Any]
+
+
+def detect_glare(
+    screen_bgr: np.ndarray,
+    *,
+    glare_pct: float = 97.0,
+    min_glare_frac: float = 0.005,
+    max_glare_frac: float = 0.15,
+    digit_roi: tuple[float, float, float, float] | None = None,
+) -> GlareReport:
+    """Detect specular glare on a normalized LCD screen image.
+
+    Glare is identified as connected bright regions above the ``glare_pct``
+    percentile that are small relative to the screen (true specular, not
+    overall bright exposure).
+
+    Args:
+        screen_bgr: Normalized LCD screen (BGR or grayscale).
+        glare_pct: Percentile above which pixels are considered glare
+            candidates. Default 97 (top 3% brightest).
+        min_glare_frac: Minimum fraction of screen area for glare to be
+            reported. Below this, glare is too small to matter.
+        max_glare_frac: Maximum fraction — above this, the whole screen
+            is bright (not specular glare, just overexposure).
+        digit_roi: Optional (x, y, w, h) normalized [0,1] digit region.
+            When provided, checks if glare overlaps the digit area.
+    """
+    if screen_bgr.ndim == 3:
+        gray = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = screen_bgr.copy()
+
+    if gray.size < 16:
+        return GlareReport(False, 0.0, 0.0, False, {"reason": "too_small"})
+
+    work = gray.astype(np.float32)
+    hi = float(np.percentile(work, glare_pct))
+    mid = float(np.percentile(work, 50))
+
+    # Primary glare threshold: the ``glare_pct`` percentile, but only if it
+    # sits meaningfully above the background. When the screen is nearly
+    # uniform (e.g. <3% bright pixels against a flat background), the
+    # percentile collapses to the background value and we'd miss the glare;
+    # fall back to an absolute bright threshold (>=230 on 0-255) so small
+    # but intense specular spots are still detected.
+    absolute_thr = 230.0
+    if hi > mid + 30:
+        threshold = hi
+    elif float(np.mean(work >= absolute_thr)) > 0.0:
+        threshold = absolute_thr
+    else:
+        return GlareReport(False, 0.0, 0.0, False, {"reason": "no_bright_region"})
+
+    glare_mask = work >= threshold
+    frac = float(np.mean(glare_mask))
+
+    # Too small to matter, or too large (overexposure, not specular).
+    if frac < min_glare_frac or frac > max_glare_frac:
+        intensity = float(np.mean(work[glare_mask])) if glare_mask.any() else 0.0
+        return GlareReport(
+            False,
+            frac,
+            intensity,
+            False,
+            {"reason": "frac_out_of_range", "glare_pct": glare_pct},
+        )
+
+    # Check overlap with digit region.
+    overlaps = False
+    if digit_roi is not None:
+        h, w = gray.shape
+        dx, dy, dw, dh = digit_roi
+        x0 = max(0, int(dx * w))
+        y0 = max(0, int(dy * h))
+        x1 = min(w, int((dx + dw) * w))
+        y1 = min(h, int((dy + dh) * h))
+        if x1 > x0 and y1 > y0:
+            digit_glare = glare_mask[y0:y1, x0:x1]
+            digit_frac = float(np.mean(digit_glare))
+            overlaps = digit_frac > 0.01  # >1% of digit area is glare
+
+    intensity = float(np.mean(work[glare_mask]))
+    evidence: dict[str, Any] = {
+        "glare_pct": glare_pct,
+        "threshold": round(float(threshold), 1),
+        "median": round(mid, 1),
+        "frac": round(frac, 5),
+    }
+    if digit_roi is not None:
+        evidence["digit_overlap"] = overlaps
+
+    return GlareReport(True, round(frac, 5), round(intensity, 1), overlaps, evidence)

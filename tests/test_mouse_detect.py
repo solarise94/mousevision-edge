@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
 from mousevision.detect import detect_mouse_box
@@ -81,3 +82,30 @@ def test_detect_mouse_pan_roi_limits_search():
     frame[50:120, 200:400, :] = 20
     # pan_roi is lower
     assert detect_mouse_box(frame, None, pan_roi={"x": 0, "y": 400, "w": 720, "h": 300}) is None
+
+
+def test_detect_mouse_rejects_low_solidity():
+    """A crescent/C-shaped dark blob (low solidity) should be rejected."""
+    img = np.full((480, 640, 3), 200, dtype=np.uint8)
+    # Draw a thick crescent (arc) — low solidity
+    cv2.ellipse(img, (320, 200), (80, 80), 0, 30, 330, (20, 20, 20), 25)
+    # min_area above the small compact chip the arc tip leaves after MORPH_CLOSE,
+    # so only the main low-solidity arc remains as a candidate.
+    result = detect_mouse_box(img, None, min_area=1500, min_solidity=0.7)
+    assert result is None
+
+
+def test_detect_mouse_accepts_high_solidity():
+    """A filled ellipse (high solidity) should pass."""
+    img = np.full((480, 640, 3), 200, dtype=np.uint8)
+    cv2.ellipse(img, (320, 200), (60, 40), 0, 0, 360, (20, 20, 20), -1)
+    result = detect_mouse_box(img, None, min_area=500, min_solidity=0.65, min_extent=0.5)
+    assert result is not None
+
+
+def test_detect_mouse_rejects_low_extent():
+    """A thin diagonal line (low extent) should be rejected."""
+    img = np.full((480, 640, 3), 200, dtype=np.uint8)
+    cv2.line(img, (200, 100), (440, 300), (20, 20, 20), 4)
+    result = detect_mouse_box(img, None, min_area=100, min_extent=0.5)
+    assert result is None

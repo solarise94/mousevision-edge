@@ -188,6 +188,68 @@ def test_sessions_from_payload_parses_time_anchors() -> None:
     assert sessions[2].t_end_s is None
 
 
+def test_sessions_from_payload_rejects_out_of_range_weight() -> None:
+    payload = {
+        "sessions": [
+            {"ordinal": 1, "weight_g": 200.0, "confidence": 0.9, "note": "ok"},
+            {"ordinal": 2, "weight_g": 16.5, "confidence": 0.9, "note": "ok"},
+        ]
+    }
+    sessions = _sessions_from_payload(payload)
+    assert sessions[0].weight_g is None  # 200g rejected
+    assert sessions[0].confidence == 0.0
+    assert "weight_out_of_range" in sessions[0].note
+    assert sessions[1].weight_g == 16.5  # normal weight kept
+
+
+def test_sessions_from_payload_fixes_inverted_time_anchors() -> None:
+    payload = {
+        "sessions": [
+            {
+                "ordinal": 1,
+                "weight_g": 17.0,
+                "confidence": 0.9,
+                "t_start_s": 10.0,
+                "t_end_s": 5.0,
+                "t_stable_s": 7.0,
+            },
+        ]
+    }
+    sessions = _sessions_from_payload(payload)
+    assert sessions[0].t_start_s == 5.0  # swapped
+    assert sessions[0].t_end_s == 10.0
+    assert sessions[0].t_stable_s == 7.0  # within range, unchanged
+    assert "time_anchors_inverted" in sessions[0].note
+
+
+def test_sessions_from_payload_clamps_t_stable() -> None:
+    payload = {
+        "sessions": [
+            {
+                "ordinal": 1,
+                "weight_g": 17.0,
+                "confidence": 0.9,
+                "t_start_s": 5.0,
+                "t_end_s": 10.0,
+                "t_stable_s": 15.0,  # after t_end
+            },
+        ]
+    }
+    sessions = _sessions_from_payload(payload)
+    assert sessions[0].t_stable_s == 10.0  # clamped to t_end
+    assert "t_stable_after_t_end" in sessions[0].note
+
+
+def test_sessions_from_payload_clamps_confidence() -> None:
+    payload = {
+        "sessions": [
+            {"ordinal": 1, "weight_g": 17.0, "confidence": 1.5},
+        ]
+    }
+    sessions = _sessions_from_payload(payload)
+    assert sessions[0].confidence == 1.0
+
+
 def test_resolve_agent_config_attach_defaults() -> None:
     cfg = resolve_agent_config({})
     assert cfg["attach_photos"] is True

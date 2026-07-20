@@ -66,3 +66,40 @@ def test_read_fixed_slots_zero():
     r = read_fixed_slots(blanks)
     assert r.status == "zero_display"
     assert r.weight == 0.0
+
+
+def test_validate_slot_consistency_removes_fragment():
+    """A very narrow fragment next to normal slots should be removed."""
+    from mousevision.reader.template import _validate_slot_consistency
+    import numpy as np
+
+    # Synthetic binary strip: 3 normal-width slots + 1 tiny fragment
+    bw = np.zeros((60, 200), dtype=np.uint8)
+    # Normal slots (width ~30)
+    bw[10:50, 10:40] = 255
+    bw[10:50, 50:80] = 255
+    bw[10:50, 90:120] = 255
+    # Tiny fragment (width 5)
+    bw[10:50, 130:135] = 255
+
+    slots = [(10, 40), (50, 80), (90, 120), (130, 135)]
+    result = _validate_slot_consistency(slots, bw)
+    # Fragment should be removed
+    assert len(result) == 3
+    assert (130, 135) not in result
+
+
+def test_validate_slot_consistency_keeps_uniform():
+    """Uniform slots should all be kept."""
+    from mousevision.reader.template import _validate_slot_consistency
+    import numpy as np
+
+    bw = np.zeros((60, 200), dtype=np.uint8)
+    bw[10:50, 10:40] = 255
+    bw[10:50, 50:80] = 255
+    bw[10:50, 90:120] = 255
+    bw[10:50, 130:160] = 255
+
+    slots = [(10, 40), (50, 80), (90, 120), (130, 160)]
+    result = _validate_slot_consistency(slots, bw)
+    assert len(result) == 4

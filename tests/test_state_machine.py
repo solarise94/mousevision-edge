@@ -57,6 +57,48 @@ def test_abort_false_enter_http_ocr():
     assert len(sm.session.curve) >= 1
 
 
+def test_resolved_converts_seconds_to_frames():
+    from mousevision.detector import StateMachineConfig
+
+    cfg = StateMachineConfig(
+        enter_sustain_frames=2,
+        leave_hold_frames=10,
+        empty_arm_frames=5,
+        enter_confirm_seconds=0.5,
+        leave_confirm_seconds=1.0,
+        empty_arm_seconds=0.4,
+    )
+    resolved = cfg.resolved(analysis_fps=10.0)
+    # 0.5s * 10fps = 5 frames
+    assert resolved.enter_sustain_frames == 5
+    # 1.0s * 10fps = 10 frames
+    assert resolved.leave_hold_frames == 10
+    # 0.4s * 10fps = 4 frames
+    assert resolved.empty_arm_frames == 4
+
+
+def test_resolved_no_override_keeps_frames():
+    from mousevision.detector import StateMachineConfig
+
+    cfg = StateMachineConfig(
+        enter_sustain_frames=3,
+        leave_hold_frames=8,
+        empty_arm_frames=5,
+    )
+    resolved = cfg.resolved(analysis_fps=10.0)
+    assert resolved.enter_sustain_frames == 3
+    assert resolved.leave_hold_frames == 8
+    assert resolved.empty_arm_frames == 5
+
+
+def test_resolved_zero_fps_returns_self():
+    from mousevision.detector import StateMachineConfig
+
+    cfg = StateMachineConfig(enter_confirm_seconds=1.0)
+    resolved = cfg.resolved(analysis_fps=0)
+    assert resolved is cfg
+
+
 def test_history_cleared_between_sessions():
     sm = WeighingStateMachine(
         StateMachineConfig(

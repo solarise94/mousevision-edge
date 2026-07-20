@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from mousevision.four_nine import FOUR_NINE_GAP_HI, FOUR_NINE_GAP_LO, is_four_nine_pair
+
 
 @dataclass
 class RawClusterConfig:
@@ -41,10 +43,19 @@ class RawClusterConfig:
     # Below this vote share there is no dominant worth reporting.
     conflict_min_frac: float = 0.25
     # Classic seven-seg 4<->9 glare confusion gap (24.18 vs 29.18).
-    four_nine_gap: tuple[float, float] = (4.5, 5.5)
+    four_nine_gap: tuple[float, float] = (FOUR_NINE_GAP_LO, FOUR_NINE_GAP_HI)
     # Score tie-break: prefer the LATER cluster when scores are this close
     # (settlement happens at the end of a session).
     recency_tiebreak: float = 0.15
+    # Minimum weight gap (grams) between the top two clusters to count as
+    # a real conflict. Gaps below this are OCR jitter → merge into stable.
+    conflict_weight_tol: float = 0.50
+    # When the top cluster dominates (support >= dominant_suppress_frac)
+    # AND the gap to the second cluster exceeds dominant_gap_grams,
+    # the second cluster is treated as OCR noise and suppressed (no conflict).
+    # This handles transition-frame / glare misreads (e.g. 18.xx vs 10.xx).
+    dominant_suppress_frac: float = 0.65
+    dominant_gap_grams: float = 5.0
 
 
 @dataclass
@@ -154,7 +165,7 @@ def _fold_four_nine(clusters: list[dict], min_votes: int = 3) -> list[dict]:
             if used[j]:
                 continue
             gap = float(hi["median"]) - float(lo["median"])
-            if not (4.5 <= gap <= 5.5):
+            if not (FOUR_NINE_GAP_LO <= gap <= FOUR_NINE_GAP_HI):
                 continue
             # Never let a weak '4' cluster steal votes from a strong '9'
             # plateau (a lone 9->4 misread): fold only when the '9' side is
@@ -277,6 +288,72 @@ def analyze_raw_samples(
     if (
         support >= cfg.stable_frac
         and top["votes"] >= cfg.stable_min_votes
+        and top["span"] <= cfg.stable_max_span
+    ):
+        conf = float(
+            np.clip(
+                0.30 + 0.45 * support + 0.20 * min(1.0, top["mean_conf"]),
+                0.0,
+                0.95,
+            )
+        )
+        return RawClusterVerdict(
+            status="stable",
+            weight=round(top["median"], 2),
+            confidence=round(conf, 3),
+            support_frac=round(support, 3),
+            votes=top["votes"],
+            n_samples=n,
+            clusters=summary,
+        )
+
+    # --- Tiny-gap merge: clusters closer than conflict_weight_tol are OCR
+    # jitter, not a real disagreement. Re-evaluate as stable.
+    # Key insight: jitter clusters are temporally interleaved (same session,
+    # alternating reads), while drift clusters are sequential. Only merge when
+    # the two clusters overlap in time. ---
+    second = clusters[1] if len(clusters) > 1 else None
+    if second is not None:
+        gap = abs(top["median"] - second["median"])
+        if gap < cfg.conflict_weight_tol:
+            # Temporal overlap: jitter is interleaved, drift is sequential.
+            t_overlap = (
+                min(top["t_last"], second["t_last"])
+                - max(top["t_first"], second["t_first"])
+            )
+            if t_overlap > 0:
+                merged_votes = top["votes"] + second["votes"]
+                merged_support = merged_votes / float(n)
+                if (
+                    merged_support >= cfg.stable_frac
+                    and merged_votes >= cfg.stable_min_votes
+                ):
+                    conf = float(
+                        np.clip(
+                            0.30 + 0.45 * merged_support + 0.20 * min(1.0, top["mean_conf"]),
+                            0.0,
+                            0.95,
+                        )
+                    )
+                    return RawClusterVerdict(
+                        status="stable",
+                        weight=round(top["median"], 2),
+                        confidence=round(conf, 3),
+                        support_frac=round(merged_support, 3),
+                        votes=merged_votes,
+                        n_samples=n,
+                        clusters=summary,
+                    )
+
+    # --- Dominant-cluster suppression: when the top cluster is strong and
+    # the gap to the second is large (>5g), the second cluster is almost
+    # certainly OCR noise (transition frames, glare misreads like 18→10).
+    # Suppress it instead of flagging conflict. ---
+    if (
+        second is not None
+        and support >= cfg.dominant_suppress_frac
+        and top["votes"] >= cfg.stable_min_votes
+        and abs(top["median"] - second["median"]) >= cfg.dominant_gap_grams
         and top["span"] <= cfg.stable_max_span
     ):
         conf = float(

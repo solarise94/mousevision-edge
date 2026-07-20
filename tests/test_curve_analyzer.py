@@ -232,3 +232,54 @@ def test_stable_platform_does_not_require_manual():
     assert result.requires_manual_weight is False
     assert result.weight_source == "stable_curve_median"
     assert abs(result.weight - 22.5) < 1e-6
+
+
+def test_adaptive_platform_window_finds_settled_region():
+    """Adaptive window should find the stable region in a climb-then-settle curve."""
+    cfg = CurveAnalyzerConfig(
+        platform_window_seconds=0.8,
+        adaptive_platform_window=True,
+        platform_window_min_seconds=0.5,
+        platform_window_max_seconds=5.0,
+        settle_slope_threshold=0.005,
+        near_zero=0.5,
+    )
+    analyzer = WeightCurveAnalyzer(cfg)
+
+    # Simulate: 0->17g climb over 1s, then stable 17.2g for 3s
+    curve = []
+    t = 0.0
+    # Climb phase (high slope)
+    for w in [0.0, 2.0, 5.0, 9.0, 13.0, 16.0]:
+        curve.append(CurvePoint(timestamp_ms=t, weight=w, confidence=0.8, frame_index=int(t)))
+        t += 200.0
+    # Settled phase (low slope, ~17.2g with tiny jitter)
+    for w in [17.20, 17.22, 17.19, 17.21, 17.20, 17.22, 17.18, 17.21, 17.20, 17.19]:
+        curve.append(CurvePoint(timestamp_ms=t, weight=w, confidence=0.9, frame_index=int(t)))
+        t += 300.0
+
+    result = analyzer.analyze(curve)
+    assert result is not None
+    assert result.weight is not None
+    assert abs(result.weight - 17.20) < 0.15
+    assert not result.requires_manual_weight
+
+
+def test_adaptive_disabled_uses_fixed_window():
+    """With adaptive disabled, the fixed window should still work."""
+    cfg = CurveAnalyzerConfig(
+        platform_window_seconds=0.8,
+        adaptive_platform_window=False,
+        near_zero=0.5,
+    )
+    analyzer = WeightCurveAnalyzer(cfg)
+
+    curve = []
+    t = 0.0
+    for w in [17.20, 17.22, 17.19, 17.21, 17.20, 17.22]:
+        curve.append(CurvePoint(timestamp_ms=t, weight=w, confidence=0.9, frame_index=int(t)))
+        t += 200.0
+
+    result = analyzer.analyze(curve)
+    assert result is not None
+    assert abs(result.weight - 17.20) < 0.15

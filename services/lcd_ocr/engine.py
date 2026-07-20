@@ -15,6 +15,7 @@ from decoders.base import DecoderResult
 from locator import locate_screen, quad_to_bbox
 from normalize import NormalizeConfig, strip_slot_candidates
 from profile import load_scale_profile
+from quality import detect_glare
 from schemas import (
     STATUS_BAD_ROI,
     STATUS_READABLE,
@@ -257,6 +258,22 @@ class LcdOcrEngine:
         total = (time.perf_counter() - t0) * 1000.0
         self._note_latency(total)
 
+        # Glare detection on the warped screen.
+        try:
+            glare = detect_glare(
+                warped,
+                digit_roi=self.norm_cfg.digit_roi,
+            )
+        except Exception:  # noqa: BLE001
+            glare = None
+        if glare is not None and glare.has_glare and glare.overlaps_digits:
+            # Downgrade confidence when glare overlaps the digit area.
+            classic.quality = float(classic.quality) * 0.70
+            if classic.digit_confidences:
+                classic.digit_confidences = [
+                    float(c) * 0.75 for c in classic.digit_confidences
+                ]
+
         status = _map_status(classic.status)
         conf = float(classic.quality)
         if classic.digit_confidences:
@@ -277,6 +294,13 @@ class LcdOcrEngine:
                 "slot_mode": self.norm_cfg.slot_mode,
                 "strip_variant": chosen_label,
                 "evidence": classic.evidence,
+                "glare": {
+                    "has_glare": glare.has_glare,
+                    "fraction": glare.glare_fraction,
+                    "overlaps_digits": glare.overlaps_digits,
+                }
+                if (glare is not None and glare.has_glare)
+                else None,
             }
             if run_audit:
                 debug["audit_text"] = self._audit_text(strip)
@@ -327,6 +351,10 @@ class LcdOcrEngine:
             collection_assets=collection,
             lcd_box=quad_to_bbox(located.screen_quad),
             debug=debug,
+            glare_fraction=glare.glare_fraction if (glare is not None and glare.has_glare) else 0.0,
+            glare_overlaps_digits=bool(
+                glare is not None and glare.has_glare and glare.overlaps_digits
+            ),
         )
 
     def _decode_slots(self, strip: Any, slots: list) -> ClassicRead:

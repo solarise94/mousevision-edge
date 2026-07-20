@@ -6,12 +6,22 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from mousevision.four_nine import is_four_nine_pair
 from mousevision.types import AnalysisResult, CurvePoint
 
 
 @dataclass
 class CurveAnalyzerConfig:
     platform_window_seconds: float = 0.8
+    # Adaptive platform window: when enabled, the analyzer first detects
+    # the settled region (|dW/dt| < slope_threshold) and searches for
+    # platforms within that region using a window between min and max.
+    adaptive_platform_window: bool = False
+    platform_window_min_seconds: float = 0.5
+    platform_window_max_seconds: float = 5.0
+    # Slope threshold (g/ms) for detecting the settled region.
+    # Below this rate of change, the weight is considered "settling".
+    settle_slope_threshold: float = 0.005
     platform_max_std: float = 0.35
     near_zero: float = 0.5
     # Photo selection no longer couples to weight matching; these are kept
@@ -156,13 +166,57 @@ class WeightCurveAnalyzer:
 
         duration_ms = float(times[-1] - times[0])
         window_ms = self.config.platform_window_seconds * 1000.0
-        # Short sessions no longer bypass std stability: they fall through to
-        # the normal sliding-window search (and to unstable/None if none fit).
+
+        # Adaptive window: detect the settled region first, then search
+        # for platforms within it using a data-driven window size.
+        search_start = 0
+        search_end = len(weights)
+        if self.config.adaptive_platform_window and len(weights) >= 6:
+            # Compute per-point slope (g/ms) using central differences.
+            slopes = np.zeros(len(weights))
+            for k in range(1, len(weights) - 1):
+                dt = float(times[k + 1] - times[k - 1])
+                if dt > 0:
+                    slopes[k] = abs(float(weights[k + 1] - weights[k - 1])) / dt
+            slopes[0] = slopes[1] if len(slopes) > 1 else 0.0
+            slopes[-1] = slopes[-2] if len(slopes) > 1 else 0.0
+
+            # Find the longest contiguous region where slope < threshold.
+            thr = self.config.settle_slope_threshold
+            settled = slopes < thr
+            best_run_start, best_run_len = 0, 0
+            run_start = None
+            for k in range(len(settled)):
+                if settled[k]:
+                    if run_start is None:
+                        run_start = k
+                else:
+                    if run_start is not None:
+                        run_len = k - run_start
+                        if run_len > best_run_len:
+                            best_run_start, best_run_len = run_start, run_len
+                        run_start = None
+            if run_start is not None:
+                run_len = len(settled) - run_start
+                if run_len > best_run_len:
+                    best_run_start, best_run_len = run_start, run_len
+
+            if best_run_len >= self.config.min_platform_points:
+                search_start = best_run_start
+                search_end = best_run_start + best_run_len
+                # Adaptive window: use the settled region duration, clamped.
+                settled_duration = float(
+                    times[min(search_end - 1, len(times) - 1)]
+                    - times[search_start]
+                )
+                min_ms = self.config.platform_window_min_seconds * 1000.0
+                max_ms = self.config.platform_window_max_seconds * 1000.0
+                window_ms = max(min_ms, min(max_ms, settled_duration))
 
         candidates: list[tuple[float, int, int, float, float]] = []
-        for i in range(len(weights)):
+        for i in range(search_start, search_end):
             j = i
-            while j < len(weights) and (times[j] - times[i]) <= window_ms:
+            while j < search_end and (times[j] - times[i]) <= window_ms:
                 j += 1
             if j - i < self.config.min_platform_points:
                 continue
@@ -177,7 +231,6 @@ class WeightCurveAnalyzer:
             score = (
                 length_score
                 + stability
-                + median * 0.001
                 + self.config.settlement_recency_weight * recency
             )
             # Prefer real weighing platforms over stable OCR-zero plateaus.
@@ -193,7 +246,7 @@ class WeightCurveAnalyzer:
                 pen = 1.0
                 for _s2, _a, _b, median2, _std2 in candidates:
                     if (
-                        4.5 <= abs(median - median2) <= 5.5
+                        is_four_nine_pair(median, median2)
                         and median > median2
                         and median2 > self.config.near_zero
                     ):
@@ -209,9 +262,9 @@ class WeightCurveAnalyzer:
             # but mark as no_stable_platform (do not silently write clean).
             unstable_fallback = True
             best_std = 1e9
-            for i in range(len(weights)):
+            for i in range(search_start, search_end):
                 j = i
-                while j < len(weights) and (times[j] - times[i]) <= window_ms:
+                while j < search_end and (times[j] - times[i]) <= window_ms:
                     j += 1
                 if j - i < self.config.min_platform_points:
                     continue
