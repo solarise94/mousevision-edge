@@ -221,11 +221,28 @@ class WeighingStateMachine:
             if self._arming:
                 if near_empty:
                     self._empty_arm_count += 1
+                    self._enter_sustain_count = 0  # zero breaks the non-zero chain
                     if self._empty_arm_count >= cfg.empty_arm_frames:
                         self._arming = False
+                    return self.state
                 else:
                     self._empty_arm_count = 0
-                return self.state
+                    # Sustained non-zero reads while arming → real mouse placed
+                    # immediately (no zero gap). Clear arming and allow ENTER.
+                    # OCR garbage is sporadic (1-2 flicker frames); a real
+                    # animal produces enter_sustain_frames consecutive reads.
+                    if weight is not None and weight >= cfg.enter_min:
+                        if self._enter_sustain_count == 0:
+                            self._enter_sustain_start_ms = timestamp_ms
+                        self._enter_sustain_count += 1
+                        if self._enter_sustain_count >= cfg.enter_sustain_frames:
+                            self._arming = False
+                            # Fall through to normal ENTER logic below.
+                        else:
+                            return self.state
+                    else:
+                        self._enter_sustain_count = 0
+                        return self.state
             if weight is not None and weight >= cfg.enter_min:
                 # Sustained-read ENTER: require N consecutive non-zero reads so
                 # a lone fused spike cannot open a phantom session.

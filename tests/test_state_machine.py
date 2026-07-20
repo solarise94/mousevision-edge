@@ -206,6 +206,49 @@ def test_empty_arm_blocks_immediate_reenter():
             weighing_min_samples=2,
             empty_arm_frames=3,
             reenter_cooldown_ms=0.0,
+            enter_sustain_frames=3,  # require 3 consecutive reads to prove real mouse
+        )
+    )
+    # Complete one session (need 3 sustained reads to enter).
+    sm.update(0, 10.0, 0.9, 0)
+    sm.update(50, 15.0, 0.9, 1)
+    sm.update(100, 20.0, 0.9, 2)
+    assert sm.state == WeighingState.ENTER
+    sm.update(200, 20.0, 0.9, 3)
+    assert sm.state == WeighingState.WEIGHING
+    sm.update(300, 0.0, 0.9, 4)
+    sm.update(400, 0.0, 0.9, 5)
+    assert sm.state in {WeighingState.LEAVE, WeighingState.ANALYZE}
+    if sm.state == WeighingState.LEAVE:
+        sm.update(450, 0.0, 0.9, 6)
+    assert sm.state == WeighingState.ANALYZE
+    sm.finish_analyze(500)
+    assert sm.state == WeighingState.EMPTY
+    # 2 non-empty reads (< enter_sustain_frames=3) must not start a new session.
+    sm.update(600, 23.28, 0.9, 7)
+    sm.update(700, 23.28, 0.9, 8)
+    assert sm.state == WeighingState.EMPTY
+    # After armed empty frames, enter is allowed.
+    sm.update(800, 0.0, 0.9, 9)
+    sm.update(900, 0.0, 0.9, 10)
+    sm.update(1000, 0.0, 0.9, 11)
+    sm.update(1100, 22.75, 0.9, 12)
+    sm.update(1200, 22.75, 0.9, 13)
+    sm.update(1300, 22.75, 0.9, 14)
+    assert sm.state == WeighingState.ENTER
+
+
+def test_empty_arm_sustained_nonzero_clears_arming():
+    """Sustained non-zero reads during arming → real mouse, clear arming."""
+    sm = WeighingStateMachine(
+        StateMachineConfig(
+            enter_min=1.0,
+            leave_max=0.3,
+            leave_hold_frames=2,
+            weighing_min_samples=2,
+            empty_arm_frames=3,
+            reenter_cooldown_ms=0.0,
+            enter_sustain_frames=2,
         )
     )
     # Complete one session.
@@ -213,22 +256,16 @@ def test_empty_arm_blocks_immediate_reenter():
     sm.update(100, 20.0, 0.9, 1)
     sm.update(200, 0.0, 0.9, 2)
     sm.update(300, 0.0, 0.9, 3)
-    assert sm.state in {WeighingState.LEAVE, WeighingState.ANALYZE}
     if sm.state == WeighingState.LEAVE:
         sm.update(400, 0.0, 0.9, 4)
-    assert sm.state == WeighingState.ANALYZE
     sm.finish_analyze(500)
     assert sm.state == WeighingState.EMPTY
-    # Immediate non-empty garbage must not start a new session.
-    sm.update(600, 23.28, 0.9, 5)
-    sm.update(700, 23.28, 0.9, 6)
-    assert sm.state == WeighingState.EMPTY
-    # After armed empty frames, enter is allowed.
-    sm.update(800, 0.0, 0.9, 7)
-    sm.update(900, 0.0, 0.9, 8)
-    sm.update(1000, 0.0, 0.9, 9)
-    sm.update(1100, 22.75, 0.9, 10)
-    assert sm.state == WeighingState.ENTER
+    assert sm._arming is True
+    # Sustained non-zero reads (>= enter_sustain_frames) clear arming → ENTER.
+    sm.update(600, 18.50, 0.9, 5)
+    assert sm.state == WeighingState.EMPTY  # 1 read, not enough
+    sm.update(700, 18.50, 0.9, 6)
+    assert sm.state == WeighingState.ENTER  # 2 reads → arming cleared → ENTER
 
 
 def test_reenter_cooldown_blocks_phantom_session():
