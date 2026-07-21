@@ -95,6 +95,20 @@ agent:
   photo_pad_s: 1.5
   photo_weight_tol: 0.25
   photo_window_s: 5.0
+  # Agent must cite multiple real frames. Any missing/multimodal/mismatched
+  # evidence becomes a manual record and never enters the upload queue.
+  require_evidence_votes: true
+  evidence_min_votes: 3
+  evidence_min_span_s: 0.5
+  evidence_weight_tol_g: 0.05
+  evidence_max_spread_g: 0.10
+  # Local evidence is the second gate after Agent self-reported votes.
+  photo_gate: true
+  photo_require_mouse: true
+  photo_mismatch_review_g: 0.25
+  local_evidence_min_votes: 3
+  local_evidence_weight_tol_g: 0.08
+  local_evidence_conflict_ratio: 0.35
 
 # Keep full source under run_*/source.* for training (not pruned with job_uploads).
 retain_source_video: true
@@ -199,3 +213,26 @@ photo_min_confidence: 0.45
 # Video processing
 # Migrated to time-based sampling (P0-a): frame_stride deprecated.
 analysis_fps: 7.5
+
+# Phone realtime weighing (WebSocket path). Independent of offline pipeline knobs.
+realtime:
+  calibrate_min_frames: 5
+  enter_min: 1.0
+  empty_max: 0.15
+  leave_max: 0.30
+  enter_sustain_frames: 2
+  stable_min_raw_reads: 3
+  stable_confirm_raw_reads: 1
+  stable_min_span_ms: 0.0
+  stable_max_age_s: 1.6
+  stable_weight_tol: 0.10
+  min_confidence: 0.50
+  min_brightness: 30.0
+  max_glare_ratio: 0.15
+  mouse_smooth_window: 5
+  mouse_advisory: true
+  announce_hold_s: 0.0
+  clear_timeout_s: 30.0
+  max_fps: 5
+  frame_ack_timeout_ms: 3000
+  encode_profile: high

@@ -1007,15 +1007,49 @@
     let ws = null;
     let wsClosedByUs = false;
     let reconnectHandle = null;
-    let frameInterval = null;
+    let nextFrameTimer = null;
     let frameSeq = 0;
     let recordingT0 = 0;
-    let frameInFlight = false;
+    // Strict single in-flight frame: only the matching frame_seq ACK releases.
+    let pendingFrameSeq = null;
+    let pendingFrameSentAt = 0;
+    let frameAckTimer = null;
+    let nextAllowedSendAt = 0;
+    let frameLoopActive = false;
+    let retryInFlight = false;
     let rtState = "connecting";
     let rtMouseCount = 0;
     let announcedWeight = null;
     let finished = false;
     let abandoned = false;
+
+    // Adaptive JPEG encode profiles (realtime path only; archive video untouched).
+    const ENCODE_PROFILES = {
+      high: { name: "high", w: 720, h: 1280, quality: 0.55 },
+      medium: { name: "medium", w: 540, h: 960, quality: 0.50 },
+      low: { name: "low", w: 480, h: 854, quality: 0.40 },
+    };
+    let encodeProfile = ENCODE_PROFILES.high;
+    let recentAckMs = [];
+    // These defaults are overridden by the server's client_config on session
+    // create (P2); declared with let so they can be clamped from YAML.
+    let MIN_FRAME_INTERVAL_MS = 200; // hard 5fps ceiling
+    let FRAME_ACK_TIMEOUT_MS = 3000;
+    // Client-side timing telemetry: per-ACK {frame_seq, encode_ms, rtt_ms,
+    // jpeg_bytes}. Flushed to the server in batches (P1-3) so the session
+    // finish summary can report client encode + RTT P50/P95.
+    let clientTimingSamples = [];
+    let clientTimingFlushTimer = null;
+    const CLIENT_TIMING_FLUSH_INTERVAL_MS = 2000;
+    const CLIENT_TIMING_FLUSH_BATCH = 10;
+    // Per-frame encode bookkeeping (set in sendFrame, consumed on ACK).
+    let lastEncodeStartedAt = 0;
+    let lastEncodeMs = 0;
+    let lastJpegBytes = 0;
+
+    // Offscreen canvas for downscaled realtime JPEG (archive stays 720×1280).
+    const encodeCanvas = document.createElement("canvas");
+    const encodeCtx = encodeCanvas.getContext("2d", { alpha: false });
 
     // Pixel-exact 9:16 layout within the host (excludes bottom dock chrome).
     function layoutViewport() {
@@ -1271,11 +1305,13 @@
         handleServerMessage(msg);
       });
       ws.addEventListener("close", () => {
+        releasePendingFrame();
         if (wsClosedByUs || finished) return;
         showReconnect(true);
         scheduleReconnect();
       });
       ws.addEventListener("error", () => {
+        releasePendingFrame();
         // The close handler will fire and trigger reconnect.
       });
     }
@@ -1329,6 +1365,7 @@
       announced: "请确认",
       wait_clear: "等待清场",
       accepted: "已记录",
+      retry_requested: "正在重测…",
     };
     const STATE_COLORS = {
       connecting: "#9aa0a6",
@@ -1338,6 +1375,7 @@
       announced: "#1e8e3e",
       wait_clear: "#f59e0b",
       accepted: "#1e8e3e",
+      retry_requested: "#f59e0b",
     };
 
     function setState(newState, msg) {
@@ -1388,16 +1426,109 @@
       }
     }
 
+    function maybeReleasePendingFrame(msg) {
+      // Only state/error that carries the matching frame_seq releases the lock.
+      // hello / retry ACK / accept ACK must never release a pending frame.
+      if (pendingFrameSeq == null) return;
+      if (msg.type !== "state" && msg.type !== "error") return;
+      if (Number(msg.frame_seq) !== pendingFrameSeq) return;
+      if (pendingFrameSentAt > 0) {
+        noteAckLatency(performance.now() - pendingFrameSentAt);
+      }
+      releasePendingFrame();
+      if (frameLoopActive && !retryInFlight) scheduleNextFrame();
+    }
+
+    function noteAckLatency(ms) {
+      recentAckMs.push(ms);
+      if (recentAckMs.length > 8) recentAckMs.shift();
+      const avg = recentAckMs.reduce((a, b) => a + b, 0) / recentAckMs.length;
+      // Soft adaptive: slow ACK → low; recover → medium. Stay off high by default.
+      if (avg > 1200 && encodeProfile.name !== "low") {
+        encodeProfile = ENCODE_PROFILES.low;
+      } else if (avg < 500 && encodeProfile.name === "low") {
+        encodeProfile = ENCODE_PROFILES.medium;
+      }
+      // Record a client-side timing sample tied to the just-ACKed frame.
+      if (pendingFrameSeq != null || lastEncodeMs > 0) {
+        clientTimingSamples.push({
+          frame_seq: frameSeq > 0 ? frameSeq - 1 : 0,
+          encode_ms: Math.round(lastEncodeMs * 10) / 10,
+          rtt_ms: Math.round(ms * 10) / 10,
+          jpeg_bytes: lastJpegBytes,
+        });
+        if (clientTimingSamples.length >= CLIENT_TIMING_FLUSH_BATCH) {
+          flushClientTiming();
+        } else if (!clientTimingFlushTimer) {
+          clientTimingFlushTimer = setTimeout(flushClientTiming, CLIENT_TIMING_FLUSH_INTERVAL_MS);
+        }
+      }
+    }
+
+    function flushClientTiming() {
+      clientTimingFlushTimer = null;
+      if (!clientTimingSamples.length) return;
+      const batch = clientTimingSamples.splice(0, clientTimingSamples.length);
+      rtSend({ type: "client_timing", samples: batch });
+    }
+
+    function releasePendingFrame() {
+      pendingFrameSeq = null;
+      pendingFrameSentAt = 0;
+      if (frameAckTimer) {
+        clearTimeout(frameAckTimer);
+        frameAckTimer = null;
+      }
+    }
+
+    function onFrameAckTimeout() {
+      frameAckTimer = null;
+      pendingFrameSeq = null;
+      pendingFrameSentAt = 0;
+      // P1 fix: a single ACK timeout means the old frame may still be queued
+      // in the network or server. Rather than send another frame on the same
+      // connection (which could re-introduce multi-frame queuing on weak
+      // networks), close the socket and let the reconnect path deliver only
+      // the freshest frame.
+      showReconnect(true);
+      stateText.textContent = "网络较慢，正在重连";
+      try {
+        if (ws) ws.close();
+      } catch (_) {}
+    }
+
     function handleServerMessage(msg) {
       if (!msg || typeof msg !== "object") return;
       const t = msg.type;
 
+      // Release in-flight frame ONLY when frame_seq matches (state or error).
+      maybeReleasePendingFrame(msg);
+
       if (t === "hello") {
-        // Initial state snapshot on WS connect.
+        // Initial state snapshot on WS connect — does not release frame lock.
         if (msg.state) setState(msg.state, msg);
         if (msg.accepted_count != null) {
           rtMouseCount = msg.accepted_count;
           mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
+        }
+        // P1 fix: full state recovery on (re)connect. A dropped retry ACK
+        // would otherwise leave retryInFlight stuck; and a reconnect during
+        // weighing/armed/wait_clear must resume the frame loop or the phone
+        // stops sending frames forever.
+        retryInFlight = false;
+        retryBtn.disabled = false;
+        retryBtn.textContent = "重测";
+        const helloState = msg.state;
+        if (
+          helloState === "weighing" ||
+          helloState === "armed" ||
+          helloState === "calibrating" ||
+          helloState === "wait_clear"
+        ) {
+          // These states need frames to progress. announced is handled by
+          // setState (shows the accept/retry buttons) and waits for user
+          // input, so it does NOT need the frame loop.
+          startFrameLoop();
         }
       } else if (t === "state") {
         // Primary per-frame state update from the engine.
@@ -1439,98 +1570,218 @@
 
         setState(newState, msg);
       } else if (t === "ack") {
-        // Response to a retry/accept command sent by the client.
-        if (msg.cmd === "accept" && msg.accepted) {
-          rtMouseCount += 1;
-          mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
-          announcedWeight = null;
+        // Response to a retry/accept command — never releases a frame lock.
+        if (msg.cmd === "accept") {
+          if (msg.accepted) {
+            rtMouseCount += 1;
+            mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
+            announcedWeight = null;
+            if (msg.state) setState(msg.state, msg);
+            // P0 fix: backend now sits in WAIT_CLEAR and needs more frames to
+            // see the weight return to zero for the next mouse. We must resume
+            // the frame loop on success — otherwise the flow stalls forever
+            // after the first mouse.
+            startFrameLoop();
+          } else {
+            // accept rejected (e.g. already accepted / stale state): restore
+            // the loop so the operator can try again.
+            if (msg.state) setState(msg.state, msg);
+            startFrameLoop();
+          }
+        } else if (msg.cmd === "retry") {
+          retryBtn.disabled = false;
+          retryBtn.textContent = "重测";
+          retryInFlight = false;
+          if (msg.applied) {
+            announcedWeight = null;
+            setState(msg.state || "weighing", msg);
+            startFrameLoop();
+          } else {
+            toast("当前无法重测，请稍后再试");
+            if (msg.state) setState(msg.state, msg);
+            startFrameLoop();
+          }
+        } else if (msg.state) {
+          setState(msg.state, msg);
+          // Any other ack must not leave the loop stopped, or the phone
+          // would freeze in weighing/announced/wait_clear.
+          if (!retryInFlight) startFrameLoop();
         }
-        if (msg.state) setState(msg.state, msg);
       } else if (t === "error") {
         toast(msg.message || "实时分析出错");
       }
     }
 
-    retryBtn.addEventListener("click", () => {
-      // Commands are tiny JSON; but if old frames are buffered ahead of us,
-      // drain-first so a retry isn't stuck behind 30 stale images.
-      drainSendQueue();
-      rtSend({ type: "retry" });
-      announcedWeight = null;
-      setState("armed", {});
-    });
-    acceptBtn.addEventListener("click", () => {
-      drainSendQueue();
-      rtSend({ type: "accept" });
-    });
-
-    // Drop any frames still queued in the browser's send buffer so a fresh
-    // command (retry/accept) reaches the server ahead of stale imagery.
-    // WS send order is FIFO per connection, so the only way to prioritise a
-    // command is to stop enqueuing more frames and wait for the buffer to
-    // drain below a threshold before sending the command.
-    function drainSendQueue() {
-      // Nothing to drain synchronously (we can't cancel already-buffered
-      // binary messages), but we suspend the frame loop briefly so the
-      // small JSON command isn't queued behind a burst of new frames.
-      stopFrameLoop();
-      // Resume after a short beat — enough for the command + ACK round-trip.
-      setTimeout(startFrameLoop, 400);
+    async function waitForPendingFrameClear(timeoutMs) {
+      const deadline = performance.now() + (timeoutMs || FRAME_ACK_TIMEOUT_MS);
+      while (pendingFrameSeq != null && performance.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      if (pendingFrameSeq != null) releasePendingFrame();
     }
 
-    // --- Frame sending loop (every 250ms, JPEG q=0.55, 8-byte header) ---
-    // P1: backpressure. If the WS send buffer has grown past a threshold we
-    // skip this tick instead of enqueuing another frame; otherwise OCR
-    // slower than 4fps would pile up stale frames and lag state updates.
-    const WS_BACKPRESSURE_BYTES = 512 * 1024; // 512KB ≈ ~4-6 queued JPEGs
+    retryBtn.addEventListener("click", async () => {
+      if (retryInFlight || rtState !== "announced") return;
+      retryInFlight = true;
+      retryBtn.disabled = true;
+      retryBtn.textContent = "正在重测…";
+      stopFrameLoop();
+      // Wait for the single in-flight frame ACK (or timeout) so retry is not
+      // queued behind a stale JPEG. Same-connection FIFO then puts retry next.
+      await waitForPendingFrameClear(FRAME_ACK_TIMEOUT_MS);
+      const sent = rtSend({ type: "retry" });
+      if (!sent) {
+        retryInFlight = false;
+        retryBtn.disabled = false;
+        retryBtn.textContent = "重测";
+        toast("发送失败，请检查网络");
+        startFrameLoop();
+      }
+      // Do not optimistic-switch to armed; wait for applied ACK.
+    });
+    acceptBtn.addEventListener("click", async () => {
+      stopFrameLoop();
+      await waitForPendingFrameClear(FRAME_ACK_TIMEOUT_MS);
+      const sent = rtSend({ type: "accept" });
+      if (!sent) {
+        toast("发送失败，请检查网络");
+        startFrameLoop();
+      }
+    });
 
-    function sendFrame() {
-      if (frameInFlight) return;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if (!paintedReady) return;
-      // Backpressure: skip if the OS/browser buffer is already deep.
-      if (ws.bufferedAmount && ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return;
-      frameInFlight = true;
+    // --- Frame sending: strict single in-flight + 5fps ceiling ---
+    function encodeRealtimeBlob(cb) {
+      const profile = encodeProfile;
       try {
-        canvas.toBlob((blob) => {
-          frameInFlight = false;
-          if (!blob) return;
-          if (!ws || ws.readyState !== WebSocket.OPEN) return;
-          // Re-check backpressure after the async encode — the buffer may
-          // have grown while we were waiting for toBlob.
-          if (ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return;
-          const reader = new FileReader();
-          reader.onload = () => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            if (ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return;
-            const jpegBytes = new Uint8Array(reader.result);
-            const buf = new ArrayBuffer(8 + jpegBytes.length);
-            const dv = new DataView(buf);
-            dv.setUint32(0, frameSeq, true);
-            frameSeq += 1;
-            dv.setUint32(4, Date.now() - recordingT0, true);
-            new Uint8Array(buf, 8).set(jpegBytes);
-            try { ws.send(buf); } catch (_) {}
-          };
-          reader.onerror = () => { frameInFlight = false; };
-          reader.readAsArrayBuffer(blob);
-        }, "image/jpeg", 0.55);
+        if (profile.w === CANVAS_W && profile.h === CANVAS_H) {
+          canvas.toBlob(cb, "image/jpeg", profile.quality);
+          return;
+        }
+        encodeCanvas.width = profile.w;
+        encodeCanvas.height = profile.h;
+        encodeCtx.drawImage(canvas, 0, 0, profile.w, profile.h);
+        encodeCanvas.toBlob(cb, "image/jpeg", profile.quality);
       } catch (_) {
-        frameInFlight = false;
+        cb(null);
       }
     }
 
+    function sendFrame() {
+      if (!frameLoopActive || retryInFlight) return;
+      if (pendingFrameSeq != null) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!paintedReady) {
+        scheduleNextFrame();
+        return;
+      }
+      // Encode first; allocate frame_seq only immediately before ws.send().
+      lastEncodeStartedAt = performance.now();
+      encodeRealtimeBlob((blob) => {
+        if (!blob) {
+          scheduleNextFrame();
+          return;
+        }
+        // Capture encode duration (drawImage + JPEG encode) for telemetry.
+        lastEncodeMs = performance.now() - lastEncodeStartedAt;
+        lastJpegBytes = blob.size;
+        if (!frameLoopActive || retryInFlight) return;
+        if (pendingFrameSeq != null) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          scheduleNextFrame();
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (!frameLoopActive || retryInFlight) return;
+          if (pendingFrameSeq != null) return;
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            scheduleNextFrame();
+            return;
+          }
+          const jpegBytes = new Uint8Array(reader.result);
+          const seq = frameSeq;
+          const buf = new ArrayBuffer(8 + jpegBytes.length);
+          const dv = new DataView(buf);
+          dv.setUint32(0, seq, true);
+          dv.setUint32(4, Date.now() - recordingT0, true);
+          new Uint8Array(buf, 8).set(jpegBytes);
+          try {
+            ws.send(buf);
+          } catch (_) {
+            scheduleNextFrame();
+            return;
+          }
+          frameSeq = seq + 1;
+          pendingFrameSeq = seq;
+          pendingFrameSentAt = performance.now();
+          nextAllowedSendAt = performance.now() + MIN_FRAME_INTERVAL_MS;
+          if (frameAckTimer) clearTimeout(frameAckTimer);
+          frameAckTimer = setTimeout(onFrameAckTimeout, FRAME_ACK_TIMEOUT_MS);
+          // Do NOT schedule next frame here — wait for matching ACK.
+        };
+        reader.onerror = () => {
+          scheduleNextFrame();
+        };
+        reader.readAsArrayBuffer(blob);
+      });
+    }
+
+    function scheduleNextFrame() {
+      if (!frameLoopActive || retryInFlight) return;
+      const delay = Math.max(0, nextAllowedSendAt - performance.now());
+      if (nextFrameTimer) clearTimeout(nextFrameTimer);
+      nextFrameTimer = setTimeout(sendFrame, delay);
+    }
+
     function startFrameLoop() {
-      if (frameInterval) return;
-      frameInterval = setInterval(sendFrame, 250);
+      frameLoopActive = true;
+      scheduleNextFrame();
     }
 
     function stopFrameLoop() {
-      if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
-      frameInFlight = false;
+      frameLoopActive = false;
+      if (nextFrameTimer) {
+        clearTimeout(nextFrameTimer);
+        nextFrameTimer = null;
+      }
+      // Keep pendingFrameSeq until ACK/timeout so retry can wait on it;
+      // full cleanup happens on WS close / session teardown.
+    }
+
+    function teardownFrameProtocol() {
+      // Flush any remaining client timing before the socket goes away so the
+      // session summary reflects the tail frames too.
+      if (clientTimingFlushTimer) {
+        clearTimeout(clientTimingFlushTimer);
+        clientTimingFlushTimer = null;
+      }
+      flushClientTiming();
+      stopFrameLoop();
+      releasePendingFrame();
     }
 
     // --- Create realtime session and open WS ---
+    function applyClientConfig(cc) {
+      // Apply server-provided tuning knobs with client-side clamping so a bad
+      // or stale YAML value cannot break the frame loop (P2).
+      if (!cc || typeof cc !== "object") return;
+      if (typeof cc.max_fps === "number" && cc.max_fps > 0) {
+        // Clamp to [1, 10] fps; floor of 100ms/frame.
+        const fps = Math.max(1, Math.min(10, Math.floor(cc.max_fps)));
+        MIN_FRAME_INTERVAL_MS = Math.max(100, Math.round(1000 / fps));
+      }
+      if (typeof cc.frame_ack_timeout_ms === "number" && cc.frame_ack_timeout_ms > 0) {
+        // Clamp to [1000, 10000] ms.
+        FRAME_ACK_TIMEOUT_MS = Math.max(1000, Math.min(10000, Math.round(cc.frame_ack_timeout_ms)));
+      }
+      if (
+        typeof cc.encode_profile === "string" &&
+        Object.prototype.hasOwnProperty.call(ENCODE_PROFILES, cc.encode_profile)
+      ) {
+        encodeProfile = ENCODE_PROFILES[cc.encode_profile];
+      }
+    }
+
     async function startRealtime() {
       try {
         const res = await api.json("/api/realtime/session", {
@@ -1539,6 +1790,9 @@
           body: JSON.stringify({ cage_id: box.cageId, project_id: state.projectId }),
         });
         rtSession = res;
+        // Apply server-side client_config BEFORE starting the frame loop so
+        // the first frame uses the configured fps / profile / ACK timeout.
+        applyClientConfig(res && res.client_config);
         connectWs();
         startFrameLoop();
       } catch (err) {
@@ -1556,7 +1810,7 @@
       if (finished) return;
       finished = true;
       finishBtn.disabled = true;
-      stopFrameLoop();
+      teardownFrameProtocol();
       wsClosedByUs = true;
       if (ws) {
         try { ws.close(); } catch (_) {}
@@ -1640,7 +1894,7 @@
       useCanvas = false;
       paintedReady = false;
       stopDraw();
-      stopFrameLoop();
+      teardownFrameProtocol();
       wsClosedByUs = true;
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
       if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }
@@ -1693,7 +1947,7 @@
       document.documentElement.classList.remove("camera-mode", "record-light");
       clearInterval(clockTimer);
       stopDraw();
-      stopFrameLoop();
+      teardownFrameProtocol();
       wsClosedByUs = true;
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
       if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }

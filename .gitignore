@@ -38,6 +38,9 @@ tmp_gemini_weigh/
 # 参考视频：体积较大，需手动放置（见 README）
 RefVideo/*.mp4
 
+# CNN 训练数据（本地采集的数字 patch 图片，体积大，不进仓库）
+training_data/
+
 # 部署专用配置（含本地 token / 端口，不进仓库）
 compose.deploy.yaml
 *.container

@@ -7,16 +7,15 @@ client and drives a small state machine dedicated to live announcements:
     CALIBRATING -> ARMED -> WEIGHING -> ANNOUNCED -> WAIT_CLEAR -> ACCEPTED
                                               |
                                               v
-                                    RETRY_REQUESTED -> ARMED (after clear)
+                                    (retry) -> WEIGHING  (same mouse, new epoch)
 
 Reuse strategy (no reimplementation):
   * :class:`mousevision.reader.template.TemplateReader` for OCR
-  * :class:`mousevision.fusion.temporal.TemporalWeightFusion` for stability
   * :func:`mousevision.detect.detect_mouse_box` for mouse presence
 
-The session is in-memory only — no recorder, no upload queue, no clip
-export. The caller (WebSocket handler) is responsible for persisting the
-accepted :class:`Attempt` records returned by :meth:`get_accepted_records`.
+Stability is decided from independent raw OCR reads (not a fused sliding
+window), so a platform switch like ``16.14 × 3 -> 15.62 × 3`` cannot lock
+the old platform.
 
 Thread safety: ``process_frame`` is normally called from one streaming
 task, while ``request_retry`` / ``accept_weight`` may arrive from a
@@ -31,12 +30,12 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 import numpy as np
 
 from mousevision.detect import detect_mouse_box
 from mousevision.fusion.temporal import TemporalWeightFusion
-from mousevision.reader.observations import RawWeightObservation
 from mousevision.reader.template import TemplateReader
 
 
@@ -57,7 +56,7 @@ class RealtimeState(str, Enum):
     ANNOUNCED = "announced"
     WAIT_CLEAR = "wait_clear"
     ACCEPTED = "accepted"
-    RETRY_REQUESTED = "retry_requested"
+    RETRY_REQUESTED = "retry_requested"  # legacy; retry now goes to WEIGHING
 
 
 # --------------------------------------------------------------------- #
@@ -84,21 +83,59 @@ class RealtimeConfig:
     # 进入称重阶段需要的连续非零帧（沿用 enter_sustain_frames 概念）
     enter_sustain_frames: int = 2
 
-    # 稳定性
-    stable_min_frames: int = 4  # 连续稳定读数才播报
-    stable_weight_tol: float = 0.10  # 稳定窗内最大跨度（克）
+    # 稳定性（原始 OCR 证据）
+    stable_min_frames: int = 4  # 兼容旧配置；实时判定改用 stable_min_raw_reads
+    stable_min_raw_reads: int = 3  # 稳定后缀最少独立原始读数
+    # 候选确认期：stable_min_raw_reads 条一致只形成 pending candidate，需再
+    # 等 stable_confirm_raw_reads 条独立读数仍在容差内才正式播报。挡住
+    # ARMED 延续进 WEIGHING 的旧平台残留（16.14×3 不会立即播报）。
+    stable_confirm_raw_reads: int = 1
+    stable_min_span_ms: float = 0.0  # 确认期最小时间跨度（ms）；0 = 仅按帧数
+    stable_max_age_s: float = 1.6  # 稳定证据允许保留的最大年龄（秒）
+    stable_weight_tol: float = 0.10  # 稳定后缀内最大跨度（克）
     min_confidence: float = 0.50  # OCR 最低置信度
 
     # 画面质量
     min_brightness: float = 30.0  # 最小平均亮度
     max_glare_ratio: float = 0.15  # 饱和像素最大占比
 
-    # 小鼠检测时序平滑窗口（多数投票）
+    # 小鼠检测
     mouse_smooth_window: int = 5
+    mouse_advisory: bool = True  # True: 不因无鼠清空重量窗，仅提示
+
+    # 帧序校验
+    frame_seq_dedupe: bool = True
 
     # 计时
-    announce_hold_s: float = 0.0  # 播报后自动接受的等待时间（0 = 关闭，首版必须显式确认）
+    announce_hold_s: float = 0.0  # 播报后自动接受的等待时间（0 = 关闭）
     clear_timeout_s: float = 30.0  # 等待清秤超时（秒）
+
+
+@dataclass
+class RealtimeRawRead:
+    """一条独立原始 OCR 读数，用作稳定证据。"""
+
+    frame_seq: int
+    client_ts_ms: float
+    weight: float
+    confidence: float
+    epoch: int
+
+
+@dataclass
+class _PendingCandidate:
+    """候选确认期：stable_min_raw_reads 条一致读数形成的待确认播报。
+
+    只有再收到 stable_confirm_raw_reads 条独立读数仍在容差内的读数才
+    正式创建 Attempt；平台变化则撤销。
+    """
+
+    median_weight: float
+    median_confidence: float
+    frame_seq: int
+    client_ts_ms: float
+    first_ts_ms: float  # 第一条候选读数的 client_ts，用于 span 判定
+    confirm_count: int = 0  # 候选之后仍在容差内的独立读数
 
 
 @dataclass
@@ -144,6 +181,29 @@ class RealtimeFrameResult:
     attempt: Attempt | None = None  # 仅在本帧新建 Attempt 时设置
     accepted_weight: float | None = None  # 仅在本帧某 Attempt 被接受时设置
     frame_seq: int = 0
+    epoch: int = 0
+
+
+def validate_realtime_config(cfg: RealtimeConfig) -> None:
+    """Raise ``ValueError`` if realtime knobs are out of safe range."""
+    if cfg.stable_min_raw_reads < 2:
+        raise ValueError(f"stable_min_raw_reads must be >= 2, got {cfg.stable_min_raw_reads}")
+    if cfg.stable_confirm_raw_reads < 0:
+        raise ValueError(
+            f"stable_confirm_raw_reads must be >= 0, got {cfg.stable_confirm_raw_reads}"
+        )
+    if cfg.stable_min_span_ms < 0:
+        raise ValueError(f"stable_min_span_ms must be >= 0, got {cfg.stable_min_span_ms}")
+    if cfg.stable_max_age_s <= 0:
+        raise ValueError(f"stable_max_age_s must be > 0, got {cfg.stable_max_age_s}")
+    if not (0.0 < cfg.min_confidence <= 1.0):
+        raise ValueError(f"min_confidence must be in (0, 1], got {cfg.min_confidence}")
+    if cfg.stable_weight_tol <= 0:
+        raise ValueError(f"stable_weight_tol must be > 0, got {cfg.stable_weight_tol}")
+    if cfg.calibrate_min_frames < 1:
+        raise ValueError(f"calibrate_min_frames must be >= 1, got {cfg.calibrate_min_frames}")
+    if cfg.enter_sustain_frames < 1:
+        raise ValueError(f"enter_sustain_frames must be >= 1, got {cfg.enter_sustain_frames}")
 
 
 # --------------------------------------------------------------------- #
@@ -155,8 +215,7 @@ class RealtimeSession:
     """驱动一次实时称重会话的状态机。
 
     构造时传入已配置好的 ``reader``（通常是 :class:`TemplateReader`）与
-    ``fusion``（通常是 :class:`TemporalWeightFusion`）。这两个对象由调用
-    方持有，本会话不负责它们的生命周期。
+    ``fusion``（保留参数以兼容调用方；稳定判定改用原始 OCR 窗）。
     """
 
     def __init__(
@@ -166,6 +225,7 @@ class RealtimeSession:
         fusion: TemporalWeightFusion,
         mouse_detect_config: dict | None = None,
     ) -> None:
+        validate_realtime_config(config)
         self.config = config
         self.reader = reader
         self.fusion = fusion
@@ -177,9 +237,15 @@ class RealtimeSession:
 
         self._calibrate_good: int = 0  # CALIBRATING 连续好帧
         self._enter_sustain: int = 0  # ARMED 连续高于 enter_min 的帧
-        self._stable_run: deque[float] = deque()  # WEIGHING 稳定窗
+        self._stable_run: deque[float] = deque()  # 兼容字段；不再驱动播报
         self._leave_count: int = 0  # WEIGHING 连续低重帧
-        self._clear_count: int = 0  # WAIT_CLEAR / RETRY_REQUESTED 连续空秤帧
+        self._clear_count: int = 0  # WAIT_CLEAR 连续空秤帧
+
+        # 原始 OCR 稳定证据
+        self._raw_window: deque[RealtimeRawRead] = deque()
+        self._weighing_epoch: int = 0
+        self._last_frame_seq: int = -1
+        self._last_client_ts_ms: float = -1.0
 
         # 小鼠检测时序平滑
         self._mouse_history: deque[bool] = deque(maxlen=max(1, config.mouse_smooth_window))
@@ -187,14 +253,17 @@ class RealtimeSession:
         # 播报相关
         self._current_attempt: Attempt | None = None
         self._announce_at: float = 0.0  # 进入 ANNOUNCED 的 time.time()
-        self._wait_clear_at: float = 0.0  # 进入 WAIT_CLEAR / RETRY_REQUESTED 的时间
+        self._wait_clear_at: float = 0.0  # 进入 WAIT_CLEAR 的时间
+        # 候选确认期：stable_min_raw_reads 条一致只形成 pending；需再等
+        # stable_confirm_raw_reads 条独立读数仍在容差内才播报。
+        self._pending_candidate: _PendingCandidate | None = None
 
         # 所有 Attempt（含已接受、已拒绝、待处理）
         self._attempts: list[Attempt] = []
         # 已接受记录（get_accepted_records 直接返回）
         self._accepted: list[Attempt] = []
 
-        # 最近一次 weight_candidate（用于 ANNOUNCED/RETRY_REQUESTED 时回填）
+        # 最近一次 weight_candidate（用于 ANNOUNCED 时回填）
         self._last_candidate: float | None = None
         self._last_confidence: float = 0.0
 
@@ -207,6 +276,11 @@ class RealtimeSession:
         """当前状态（线程安全读取）。"""
         with self._lock:
             return self._state
+
+    @property
+    def weighing_epoch(self) -> int:
+        with self._lock:
+            return self._weighing_epoch
 
     def process_frame(
         self,
@@ -223,20 +297,33 @@ class RealtimeSession:
         with self._lock:
             return self._process_locked(image, frame_seq=frame_seq, client_ts_ms=client_ts_ms, now=now)
 
-    def request_retry(self) -> None:
-        """用户按下「重称」按钮。仅在 ANNOUNCED 状态生效。"""
+    def request_retry(self) -> dict[str, Any]:
+        """用户按下「重称」按钮。仅在 ANNOUNCED 状态生效。
+
+        产品语义：同一只鼠可留在秤上立即重新采样。成功时直接进入
+        WEIGHING，并递增 weighing epoch，使旧证据无法进入新窗口。
+
+        Returns:
+            ``{"applied": bool, "state": str, "epoch": int}``
+        """
         with self._lock:
             if self._state != RealtimeState.ANNOUNCED:
-                return
+                return {
+                    "applied": False,
+                    "state": self._state.value,
+                    "epoch": self._weighing_epoch,
+                }
             if self._current_attempt is not None:
                 self._current_attempt.mark_rejected()
             self._current_attempt = None
-            self._stable_run.clear()
-            self._enter_sustain = 0
-            self._clear_count = 0
-            self._wait_clear_at = time.time()
-            self._state = RealtimeState.RETRY_REQUESTED
-            self.fusion.reset()
+            self._weighing_epoch += 1
+            self._reset_weighing()
+            self._transition(RealtimeState.WEIGHING)
+            return {
+                "applied": True,
+                "state": self._state.value,
+                "epoch": self._weighing_epoch,
+            }
 
     def accept_weight(self) -> Attempt | None:
         """用户确认播报的重量。仅在 ANNOUNCED 状态生效。
@@ -252,7 +339,7 @@ class RealtimeSession:
             attempt.mark_accepted()
             self._accepted.append(attempt)
             self._current_attempt = None
-            self._stable_run.clear()
+            self._reset_weighing()
             self._clear_count = 0
             self._wait_clear_at = time.time()
             self._state = RealtimeState.WAIT_CLEAR
@@ -271,6 +358,18 @@ class RealtimeSession:
     # ----------------------------------------------------------------- #
     # Internal helpers (all called under self._lock)
     # ----------------------------------------------------------------- #
+
+    def _reset_weighing(self) -> None:
+        """清空称重相关证据与计数（清秤 / 下一只 / retry / 异常恢复）。"""
+        self._raw_window.clear()
+        self._stable_run.clear()
+        self._enter_sustain = 0
+        self._leave_count = 0
+        self._pending_candidate = None
+        try:
+            self.fusion.reset()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _quality_checks(self, image: np.ndarray) -> tuple[bool, list[QualityHint]]:
         """画面质量检查（所有状态共用）。
@@ -321,29 +420,101 @@ class RealtimeSession:
             return detected
         return sum(self._mouse_history) > len(self._mouse_history) / 2
 
-    def _obs_from_weight(
-        self, weight: float | None, confidence: float, *, digits: list[str] | None = None
-    ) -> RawWeightObservation:
-        """把 TemplateReader.read_weight 的二元组包装成 RawWeightObservation，
-        供 TemporalWeightFusion.update 使用。"""
-        if weight is None:
-            status = "unreadable"
-        elif weight <= self.config.empty_max:
-            status = "zero_display"
-        else:
-            status = "readable"
-        return RawWeightObservation(
-            weight=weight,
-            digits=list(digits or []),
-            quality=float(confidence),
-            status=status,
-            confidence=float(confidence),
-        )
-
     def _transition(self, new_state: RealtimeState) -> None:
         if new_state == self._state:
             return
         self._state = new_state
+
+    def _accept_frame_order(self, frame_seq: int, client_ts_ms: float) -> bool:
+        """校验 frame_seq / client_ts_ms，通过后更新游标。
+
+        Returns:
+            True 表示本帧可作为新证据；False 表示重复/倒序，只回状态。
+        """
+        if not self.config.frame_seq_dedupe:
+            return True
+        if frame_seq <= self._last_frame_seq:
+            return False
+        if self._last_client_ts_ms >= 0 and client_ts_ms < self._last_client_ts_ms:
+            return False
+        self._last_frame_seq = frame_seq
+        self._last_client_ts_ms = float(client_ts_ms)
+        return True
+
+    def _prune_raw_window(self, latest_ts_ms: float) -> None:
+        """裁剪超出最大证据年龄、或不属于当前 epoch 的读数。"""
+        max_age_ms = self.config.stable_max_age_s * 1000.0
+        epoch = self._weighing_epoch
+        kept: deque[RealtimeRawRead] = deque()
+        for r in self._raw_window:
+            if r.epoch != epoch:
+                continue
+            if latest_ts_ms - r.client_ts_ms > max_age_ms:
+                continue
+            kept.append(r)
+        self._raw_window = kept
+
+    def _append_raw_read(
+        self,
+        *,
+        frame_seq: int,
+        client_ts_ms: float,
+        weight: float,
+        confidence: float,
+    ) -> None:
+        self._raw_window.append(
+            RealtimeRawRead(
+                frame_seq=frame_seq,
+                client_ts_ms=float(client_ts_ms),
+                weight=float(weight),
+                confidence=float(confidence),
+                epoch=self._weighing_epoch,
+            )
+        )
+        self._prune_raw_window(float(client_ts_ms))
+
+    def _stable_suffix(self) -> tuple[float, float] | None:
+        """从最新读数向前寻找连续稳定后缀。
+
+        Returns:
+            ``(median_weight, median_confidence)`` 或 None。
+        """
+        cfg = self.config
+        reads = [r for r in self._raw_window if r.epoch == self._weighing_epoch]
+        if len(reads) < cfg.stable_min_raw_reads:
+            return None
+
+        latest = reads[-1]
+        max_age_ms = cfg.stable_max_age_s * 1000.0
+        suffix: list[RealtimeRawRead] = []
+        for r in reversed(reads):
+            if latest.client_ts_ms - r.client_ts_ms > max_age_ms:
+                break
+            weights_so_far = [x.weight for x in suffix] + [r.weight]
+            if max(weights_so_far) - min(weights_so_far) > cfg.stable_weight_tol:
+                break
+            suffix.append(r)
+
+        suffix.reverse()
+        if len(suffix) < cfg.stable_min_raw_reads:
+            return None
+        if suffix[-1] is not latest and suffix[-1].frame_seq != latest.frame_seq:
+            return None
+
+        weights = [r.weight for r in suffix]
+        confs = [r.confidence for r in suffix]
+        median_w = float(np.median(weights))
+        if abs(latest.weight - median_w) > cfg.stable_weight_tol:
+            return None
+        return median_w, float(np.median(confs))
+
+    def _read_weight_once(
+        self, image: np.ndarray
+    ) -> tuple[float | None, float, Any]:
+        """定位一次 LCD，同时供鼠检测与重量读取复用。"""
+        lcd_box = self.reader.lcd_box(image)
+        weight, conf = self.reader.read_weight(image, lcd_box=lcd_box)
+        return weight, float(conf), lcd_box
 
     # ----------------------------------------------------------------- #
     # State handlers
@@ -364,6 +535,7 @@ class RealtimeSession:
             state=self._state,
             quality_hints=hints,
             frame_seq=frame_seq,
+            epoch=self._weighing_epoch,
         )
 
         # 画面太差时：CALIBRATING 重置计数；其他状态仅返回提示，不推进判定。
@@ -386,6 +558,7 @@ class RealtimeSession:
         elif state == RealtimeState.WAIT_CLEAR:
             self._handle_wait_clear(image, now=now, result=result)
         elif state == RealtimeState.RETRY_REQUESTED:
+            # Legacy path: clear then re-arm. New retry goes straight to WEIGHING.
             self._handle_retry_requested(image, now=now, result=result)
         elif state == RealtimeState.ACCEPTED:
             self._handle_accepted(image, now=now, result=result)
@@ -396,6 +569,7 @@ class RealtimeSession:
         if result.confidence <= 0.0 and self._last_confidence > 0.0:
             result.confidence = self._last_confidence
         result.state = self._state
+        result.epoch = self._weighing_epoch
         return result
 
     def _handle_calibrating(
@@ -426,60 +600,41 @@ class RealtimeSession:
         client_ts_ms: float,
         result: RealtimeFrameResult,
     ) -> None:
-        weight, conf = self.reader.read_weight(image)
-        result.confidence = float(conf)
-        if weight is not None:
-            result.weight_candidate = float(weight)
-            self._last_candidate = float(weight)
-            self._last_confidence = float(conf)
+        cfg = self.config
+        order_ok = self._accept_frame_order(frame_seq, client_ts_ms)
 
-        if weight is None or conf < self.config.min_confidence:
-            self._enter_sustain = 0
-            return
-
-        if weight > self.config.enter_min:
-            self._enter_sustain += 1
-        else:
-            self._enter_sustain = 0
-
-        if self._enter_sustain >= max(1, self.config.enter_sustain_frames):
-            self._enter_sustain = 0
-            self._stable_run.clear()
-            self._leave_count = 0
-            self.fusion.reset()
-            self._transition(RealtimeState.WEIGHING)
-            # 注意：本帧只完成状态切换，不重复读取；下一帧由 _handle_weighing
-            # 处理，避免对 HttpOcrReader 造成额外的网络往返。
-
-    def _feed_weighing(
-        self,
-        image: np.ndarray,
-        *,
-        frame_seq: int,
-        client_ts_ms: float,
-        result: RealtimeFrameResult,
-    ) -> tuple[float | None, float, bool]:
-        """读一帧并喂给 fusion + 小鼠检测，返回 (stable_weight, stable_conf, mouse_present)。"""
-        lcd_box = self.reader.lcd_box(image)
+        weight, conf, lcd_box = self._read_weight_once(image)
         mouse_present = self._detect_mouse_smoothed(image, lcd_box)
         result.mouse_present = mouse_present
-
-        weight, conf = self.reader.read_weight(image)
         result.confidence = float(conf)
         if weight is not None:
             result.weight_candidate = float(weight)
             self._last_candidate = float(weight)
             self._last_confidence = float(conf)
 
-        obs = self._obs_from_weight(weight, conf)
-        stable = self.fusion.update(
-            obs,
-            mouse_present=mouse_present,
-            timestamp_ms=float(client_ts_ms),
+        if not order_ok:
+            return
+
+        if weight is None or conf < cfg.min_confidence or weight <= cfg.enter_min:
+            # 回落 / 无效：清空进入证据，重新开始。
+            self._enter_sustain = 0
+            self._raw_window.clear()
+            return
+
+        # 可信非零读数：保留为当前 epoch 的原始证据（进入 WEIGHING 后不清空）。
+        self._append_raw_read(
+            frame_seq=frame_seq,
+            client_ts_ms=client_ts_ms,
+            weight=float(weight),
+            confidence=float(conf),
         )
-        if stable is not None and stable.weight is not None:
-            return float(stable.weight), float(stable.confidence), mouse_present
-        return None, 0.0, mouse_present
+        self._enter_sustain += 1
+
+        if self._enter_sustain >= max(1, cfg.enter_sustain_frames):
+            self._enter_sustain = 0
+            self._leave_count = 0
+            # 不清空 _raw_window：ARMED 证据延续到 WEIGHING。
+            self._transition(RealtimeState.WEIGHING)
 
     def _handle_weighing(
         self,
@@ -490,57 +645,127 @@ class RealtimeSession:
         now: float,
         result: RealtimeFrameResult,
     ) -> None:
-        stable_w, stable_conf, mouse_present = self._feed_weighing(
-            image, frame_seq=frame_seq, client_ts_ms=client_ts_ms, result=result
-        )
         cfg = self.config
+        order_ok = self._accept_frame_order(frame_seq, client_ts_ms)
+
+        weight, conf, lcd_box = self._read_weight_once(image)
+        mouse_present = self._detect_mouse_smoothed(image, lcd_box)
+        result.mouse_present = mouse_present
+        result.confidence = float(conf)
+        if weight is not None:
+            result.weight_candidate = float(weight)
+            self._last_candidate = float(weight)
+            self._last_confidence = float(conf)
+
+        if not mouse_present and cfg.mouse_advisory:
+            result.quality_hints.append(
+                QualityHint(code="mouse_uncertain", message="未稳定检测到小鼠，请确认秤盘")
+            )
+
+        if not order_ok:
+            return
 
         # 1) 小鼠提前离开（重量连续低于 leave_max）→ 回到 ARMED。
-        cur_w = result.weight_candidate
-        if cur_w is not None and cur_w <= cfg.leave_max:
+        if weight is not None and weight <= cfg.leave_max:
             self._leave_count += 1
             if self._leave_count >= max(1, cfg.enter_sustain_frames):
                 self._leave_count = 0
-                self._stable_run.clear()
-                self._enter_sustain = 0
-                self.fusion.reset()
+                self._reset_weighing()
                 self._transition(RealtimeState.ARMED)
                 return
         else:
             self._leave_count = 0
 
-        # 2) 没有 stable 观测则继续等待。
-        if stable_w is None:
+        # 2) 有效原始读数进入稳定窗。
+        if weight is None or conf < cfg.min_confidence or weight <= cfg.enter_min:
             return
 
-        # 3) fusion 已稳定 + 小鼠在秤 → 追踪连续稳定读数。
-        if not mouse_present:
-            self._stable_run.clear()
+        self._append_raw_read(
+            frame_seq=frame_seq,
+            client_ts_ms=client_ts_ms,
+            weight=float(weight),
+            confidence=float(conf),
+        )
+
+        # 3) mouse_advisory=False 时鼠检测为硬门槛（明确语义，避免模糊）。
+        if not mouse_present and not cfg.mouse_advisory:
             return
 
-        # 与当前稳定窗的跨度在 tol 内则计入，否则重置（新的稳定点）。
-        if self._stable_run and abs(stable_w - float(np.mean(self._stable_run))) > cfg.stable_weight_tol:
-            self._stable_run.clear()
-        self._stable_run.append(stable_w)
+        stable = self._stable_suffix()
+        if stable is None:
+            return
 
-        if len(self._stable_run) >= cfg.stable_min_frames:
-            announced_w = float(np.mean(self._stable_run))
-            attempt = Attempt(
-                attempt_id=uuid.uuid4().hex[:12],
-                weight_g=round(announced_w, 2),
-                confidence=float(np.median([stable_conf] * len(self._stable_run))),
+        suffix_w, suffix_conf = stable
+
+        # 候选确认期：stable_min_raw_reads 条一致只形成 pending；需再等
+        # stable_confirm_raw_reads 条独立读数仍在容差内才播报。这挡住了
+        # ARMED 延续进 WEIGHING 的旧平台残留（16.14×3 不会立即播报）。
+        pc = self._pending_candidate
+        announced_w: float | None = None
+        announced_conf: float | None = None
+
+        if pc is None:
+            # 首次形成候选。不播报，等后续独立确认读数。
+            self._pending_candidate = _PendingCandidate(
+                median_weight=suffix_w,
+                median_confidence=suffix_conf,
                 frame_seq=frame_seq,
                 client_ts_ms=float(client_ts_ms),
-                state="announced",
-                created_at=now,
+                first_ts_ms=float(client_ts_ms),
+                confirm_count=0,
             )
-            self._attempts.append(attempt)
-            self._current_attempt = attempt
-            self._announce_at = now
-            self._stable_run.clear()
-            self._transition(RealtimeState.ANNOUNCED)
-            result.attempt = attempt
-            result.weight_candidate = attempt.weight_g
+            return
+
+        # 候选已存在：判断新读数是确认还是平台切换。
+        tol = cfg.stable_weight_tol
+        if abs(suffix_w - pc.median_weight) > tol:
+            # 平台变化：撤销候选，用新读数重启候选。
+            self._pending_candidate = _PendingCandidate(
+                median_weight=suffix_w,
+                median_confidence=suffix_conf,
+                frame_seq=frame_seq,
+                client_ts_ms=float(client_ts_ms),
+                first_ts_ms=float(client_ts_ms),
+                confirm_count=0,
+            )
+            return
+
+        # 确认读数：仍在容差内。
+        pc.confirm_count += 1
+        # 更新中位数（用更新后缀的更稳健估计）。
+        pc.median_weight = suffix_w
+        pc.median_confidence = suffix_conf
+
+        need = cfg.stable_confirm_raw_reads
+        if pc.confirm_count < need:
+            return
+        # 可选的最小跨度校验：跨度不足则继续等下一条读数。
+        if cfg.stable_min_span_ms > 0 and (client_ts_ms - pc.first_ts_ms) < cfg.stable_min_span_ms:
+            return
+
+        # 确认通过：播报。
+        announced_w = suffix_w
+        announced_conf = suffix_conf
+
+        attempt = Attempt(
+            attempt_id=uuid.uuid4().hex[:12],
+            weight_g=round(announced_w, 2),
+            confidence=float(announced_conf),
+            frame_seq=frame_seq,
+            client_ts_ms=float(client_ts_ms),
+            state="announced",
+            created_at=now,
+        )
+        self._attempts.append(attempt)
+        self._current_attempt = attempt
+        self._announce_at = now
+        self._raw_window.clear()
+        self._stable_run.clear()
+        self._pending_candidate = None
+        self._transition(RealtimeState.ANNOUNCED)
+        result.attempt = attempt
+        result.weight_candidate = attempt.weight_g
+        result.confidence = attempt.confidence
 
     def _handle_announced(self, *, now: float, result: RealtimeFrameResult) -> None:
         """播报态：等待用户 accept/retry，或超时自动接受（可选）。"""
@@ -557,6 +782,7 @@ class RealtimeSession:
                 self._accepted.append(attempt)
                 result.accepted_weight = attempt.weight_g
                 self._current_attempt = None
+                self._reset_weighing()
                 self._clear_count = 0
                 self._wait_clear_at = now
                 self._transition(RealtimeState.WAIT_CLEAR)
@@ -572,6 +798,7 @@ class RealtimeSession:
         if (now - self._wait_clear_at) >= cfg.clear_timeout_s:
             # 超时：直接进入 ARMED，避免永久卡在 WAIT_CLEAR。
             self._clear_count = 0
+            self._reset_weighing()
             self._transition(RealtimeState.ARMED)
             return
 
@@ -596,10 +823,8 @@ class RealtimeSession:
         result: RealtimeFrameResult,
     ) -> None:
         """ACCEPTED 是一个瞬态：紧接着回到 ARMED，等待下一只小鼠。"""
-        self._enter_sustain = 0
-        self._stable_run.clear()
-        self._leave_count = 0
-        self.fusion.reset()
+        self._reset_weighing()
+        self._weighing_epoch += 1
         self._transition(RealtimeState.ARMED)
 
     def _handle_retry_requested(
@@ -609,10 +834,11 @@ class RealtimeSession:
         now: float,
         result: RealtimeFrameResult,
     ) -> None:
+        """Legacy RETRY_REQUESTED：等空秤后回 ARMED。新路径不再进入此状态。"""
         cfg = self.config
         if (now - self._wait_clear_at) >= cfg.clear_timeout_s:
-            # 超时仍未清秤：强制重新 ARMED（用户可能已换姿势）。
             self._clear_count = 0
+            self._reset_weighing()
             self._transition(RealtimeState.ARMED)
             return
 
@@ -625,7 +851,5 @@ class RealtimeSession:
             self._clear_count = 0
         if self._clear_count >= 1:
             self._clear_count = 0
-            self._enter_sustain = 0
-            self._stable_run.clear()
-            self.fusion.reset()
+            self._reset_weighing()
             self._transition(RealtimeState.ARMED)

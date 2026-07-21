@@ -50,6 +50,7 @@ def finalize_session(
     upload_queue: UploadQueue | None = None,
     video_upload_job_id: str | None = None,
     capture_meta: dict[str, Any] | None = None,
+    timing_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Turn accepted attempts into durable records under a new run dir.
 
@@ -140,6 +141,8 @@ def finalize_session(
         manifest["video_upload_job_id"] = video_upload_job_id
     manifest["realtime_session_id"] = session_id
     manifest["record_count"] = len(accepted)
+    if timing_summary:
+        manifest["timing_summary"] = timing_summary
     write_manifest(run_dir, manifest)
 
     finish_run(run_dir, status="realtime_finalized")

@@ -120,6 +120,16 @@ class ActiveSession:
     # Serializes frame processing for this session across socket reconnects
     # or concurrent REST probes that feed frames.
     frame_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Performance telemetry buffers (capped). Server timing per frame, and
+    # client-reported timing samples (encode/RTT). Summarized at finish.
+    server_timing_samples: list = field(default_factory=list)
+    client_timing_samples: list = field(default_factory=list)
+    # Untruncated totals so the finish summary can report real coverage even
+    # when the rolling buffer (which only holds the tail) has evicted early
+    # frames. Calibation / first-connect / early jitter frames otherwise get
+    # silently dropped from P50/P95.
+    server_timing_total: int = 0
+    client_timing_total: int = 0
 
 
 # Global session store (single uvicorn worker -> dict is safe under _sessions_lock).
@@ -218,6 +228,86 @@ def _get_config() -> dict[str, Any]:
 # --------------------------------------------------------------------- #
 
 
+def _build_realtime_config(config: dict[str, Any]) -> RealtimeConfig:
+    """Load the dedicated ``realtime:`` YAML section with safe fallbacks.
+
+    Falls back to top-level weight thresholds when a field is absent, so
+    older configs keep working. Raises ``ValueError`` on out-of-range knobs
+    (surfaced as HTTP 500 at session create time).
+    """
+    rt = config.get("realtime") or {}
+    if not isinstance(rt, dict):
+        rt = {}
+
+    def _f(key: str, default: float, *fallbacks: str) -> float:
+        if key in rt:
+            return float(rt[key])
+        for fb in fallbacks:
+            if fb in config:
+                return float(config[fb])
+        return float(default)
+
+    def _i(key: str, default: int, *fallbacks: str) -> int:
+        if key in rt:
+            return int(rt[key])
+        for fb in fallbacks:
+            if fb in config:
+                return int(config[fb])
+        return int(default)
+
+    def _b(key: str, default: bool) -> bool:
+        if key in rt:
+            return bool(rt[key])
+        return bool(default)
+
+    return RealtimeConfig(
+        calibrate_min_frames=_i("calibrate_min_frames", 5),
+        enter_min=_f("enter_min", 1.0, "enter_min"),
+        empty_max=_f("empty_max", 0.15, "empty_max"),
+        leave_max=_f("leave_max", 0.30, "leave_max"),
+        enter_sustain_frames=_i("enter_sustain_frames", 2, "enter_sustain_frames"),
+        stable_min_frames=_i("stable_min_frames", 4),
+        stable_min_raw_reads=_i("stable_min_raw_reads", 3),
+        stable_confirm_raw_reads=_i("stable_confirm_raw_reads", 1),
+        stable_min_span_ms=_f("stable_min_span_ms", 0.0),
+        stable_max_age_s=_f("stable_max_age_s", 1.6),
+        stable_weight_tol=_f("stable_weight_tol", 0.10),
+        min_confidence=_f("min_confidence", 0.50),
+        min_brightness=_f("min_brightness", 30.0),
+        max_glare_ratio=_f("max_glare_ratio", 0.15),
+        mouse_smooth_window=_i("mouse_smooth_window", 5),
+        mouse_advisory=_b("mouse_advisory", True),
+        frame_seq_dedupe=_b("frame_seq_dedupe", True),
+        announce_hold_s=_f("announce_hold_s", 0.0),
+        clear_timeout_s=_f("clear_timeout_s", 30.0),
+    )
+
+
+# Profiles the phone client is allowed to select from (must match the
+# ENCODE_PROFILES map in mobile.js).
+_VALID_ENCODE_PROFILES = ("high", "medium", "low")
+
+
+def _build_client_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Build the client_config payload sent on session create.
+
+    These knobs exist in the ``realtime:`` YAML section but were previously
+    hard-coded in the client. The client clamps values to safe ranges before
+    use, so this only needs to forward the configured (or default) values.
+    """
+    rt = config.get("realtime") or {}
+    if not isinstance(rt, dict):
+        rt = {}
+    profile = str(rt.get("encode_profile", "high"))
+    if profile not in _VALID_ENCODE_PROFILES:
+        profile = "high"
+    return {
+        "max_fps": int(rt.get("max_fps", 5)),
+        "frame_ack_timeout_ms": int(rt.get("frame_ack_timeout_ms", 3000)),
+        "encode_profile": profile,
+    }
+
+
 def _create_engine(config: dict[str, Any]) -> RealtimeSession:
     """Build a fresh :class:`RealtimeSession` from a parsed config dict.
 
@@ -247,12 +337,7 @@ def _create_engine(config: dict[str, Any]) -> RealtimeSession:
         )
     )
 
-    rt_config = RealtimeConfig(
-        enter_min=float(config.get("enter_min", 1.0)),
-        empty_max=float(config.get("empty_max", 0.15)),
-        leave_max=float(config.get("leave_max", 0.30)),
-    )
-
+    rt_config = _build_realtime_config(config)
     mouse_cfg = config.get("mouse_detect", {}) or {}
     return RealtimeSession(rt_config, reader, fusion, mouse_detect_config=mouse_cfg)
 
@@ -273,6 +358,214 @@ def _decode_jpeg(data: bytes) -> np.ndarray | None:
     except Exception:  # noqa: BLE001 - corrupt JPEG / OOM, log + skip
         log.warning("JPEG decode failed (%d bytes)", len(data), exc_info=True)
         return None
+
+
+# Canonical realtime frame size. The server's LCD / mouse-detection thresholds
+# (lcd_detect.min_area, mouse_detect.min_area/max_area) are calibrated against
+# 720×1280; any client encode profile (high/medium/low) is normalized back to
+# this size before reaching the engine, so a smaller medium/low frame does not
+# silently fall under the detection thresholds.
+CANONICAL_FRAME_W = 720
+CANONICAL_FRAME_H = 1280
+
+
+def _normalize_to_canonical(image: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Resize an image to the canonical frame size if it differs.
+
+    Returns ``(image, resized)``. ``resized`` is True when a copy was made.
+    Detection algorithms always see 720×1280 regardless of client profile.
+    """
+    if image.ndim != 3:
+        return image, False
+    h, w = int(image.shape[0]), int(image.shape[1])
+    if w == CANONICAL_FRAME_W and h == CANONICAL_FRAME_H:
+        return image, False
+    resized = cv2.resize(
+        image, (CANONICAL_FRAME_W, CANONICAL_FRAME_H), interpolation=cv2.INTER_AREA
+    )
+    return resized, True
+
+
+# Cap on buffered timing samples (per session, per side) so a long session
+# cannot grow memory unbounded. 1200 frames at 5fps ≈ 4 minutes covers a full
+# multi-mouse session; the untruncated *_total counters still record the true
+# frame count when the rolling buffer eventually evicts the oldest samples.
+_TIMING_SAMPLE_CAP = 1200
+# Hard ceiling on the size of a single client_timing batch. A well-behaved
+# client flushes ~10 samples per batch; anything larger is treated as junk.
+_CLIENT_TIMING_BATCH_CAP = 50
+# Plausible upper bounds for client-reported fields, used to reject garbage.
+_CLIENT_TIMING_MAX_MS = 60_000.0      # 60s — encode or RTT above this is noise
+_CLIENT_TIMING_MAX_BYTES = 5_000_000  # 5MB JPEG — anything larger is invalid
+
+
+def _is_finite_number(value: Any) -> bool:
+    """True only for ints/floats that are finite (not NaN / not Inf)."""
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    try:
+        import math as _math
+        return _math.isfinite(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def _clean_client_sample(raw: Any) -> dict[str, Any] | None:
+    """Validate and normalize one client timing sample.
+
+    Returns a clean dict, or ``None`` if the sample is malformed / out of
+    range. Only the known fields are retained; unknown keys are dropped.
+    """
+    if not isinstance(raw, dict):
+        return None
+    frame_seq = raw.get("frame_seq")
+    encode_ms = raw.get("encode_ms")
+    rtt_ms = raw.get("rtt_ms")
+    jpeg_bytes = raw.get("jpeg_bytes")
+
+    # frame_seq is optional but if present must be a non-negative int.
+    if frame_seq is not None:
+        if isinstance(frame_seq, bool) or not isinstance(frame_seq, int) or frame_seq < 0:
+            return None
+
+    # Durations: must be finite, non-negative, below the noise ceiling.
+    for v in (encode_ms, rtt_ms):
+        if v is None:
+            continue
+        if not _is_finite_number(v) or v < 0 or v > _CLIENT_TIMING_MAX_MS:
+            return None
+
+    # jpeg_bytes: must be a non-negative int below the validity ceiling.
+    if jpeg_bytes is not None:
+        if isinstance(jpeg_bytes, bool) or not isinstance(jpeg_bytes, int) or jpeg_bytes < 0:
+            return None
+        if jpeg_bytes > _CLIENT_TIMING_MAX_BYTES:
+            return None
+
+    cleaned: dict[str, Any] = {}
+    if frame_seq is not None:
+        cleaned["frame_seq"] = int(frame_seq)
+    if encode_ms is not None:
+        cleaned["encode_ms"] = float(encode_ms)
+    if rtt_ms is not None:
+        cleaned["rtt_ms"] = float(rtt_ms)
+    if jpeg_bytes is not None:
+        cleaned["jpeg_bytes"] = int(jpeg_bytes)
+    return cleaned or None
+
+
+def _record_server_timing(session: "ActiveSession", timing: dict[str, Any]) -> None:
+    """Append a server-side timing snapshot to the session buffer (capped)."""
+    sample = {
+        "frame_seq": timing.get("frame_seq"),
+        "server_preprocess_wait_ms": timing.get("server_preprocess_wait_ms"),
+        "decode_ms": timing.get("decode_ms"),
+        "engine_ms": timing.get("engine_ms"),
+        "total_ms": timing.get("total_ms"),
+        "jpeg_bytes": timing.get("jpeg_bytes"),
+        "resized": timing.get("resized"),
+    }
+    session.server_timing_samples.append(sample)
+    session.server_timing_total += 1
+    if len(session.server_timing_samples) > _TIMING_SAMPLE_CAP:
+        del session.server_timing_samples[: len(session.server_timing_samples) - _TIMING_SAMPLE_CAP]
+
+
+def _record_client_timing(session: "ActiveSession", samples: list[Any]) -> None:
+    """Merge client-reported timing samples into the session buffer (capped).
+
+    Each sample is validated: only dict samples with finite, in-range numeric
+    fields are kept, and a batch is capped to reject junk floods. Invalid
+    timing must NEVER affect the weighing records' durability.
+    """
+    if not samples:
+        return
+    cleaned: list[dict[str, Any]] = []
+    for raw in samples[:_CLIENT_TIMING_BATCH_CAP]:
+        c = _clean_client_sample(raw)
+        if c is not None:
+            cleaned.append(c)
+    if not cleaned:
+        return
+    session.client_timing_samples.extend(cleaned)
+    session.client_timing_total += len(cleaned)
+    if len(session.client_timing_samples) > _TIMING_SAMPLE_CAP:
+        del session.client_timing_samples[: len(session.client_timing_samples) - _TIMING_SAMPLE_CAP]
+
+
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    """Linear-interpolation percentile over an already-sorted list."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = (pct / 100.0) * (len(sorted_values) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = rank - lo
+    return float(sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac)
+
+
+def _summarize_samples(samples: list[Any], keys: list[str]) -> dict[str, Any]:
+    """Build a {key: {p50, p95, n}} summary over a list of timing dicts.
+
+    Per-sample extraction is defensive: any element that is not a dict, or
+    whose value for ``key`` is missing / non-finite, is skipped — never
+    raised — so a single malformed sample cannot break the finish summary.
+    """
+    summary: dict[str, Any] = {}
+    for key in keys:
+        values: list[float] = []
+        for s in samples:
+            if not isinstance(s, dict):
+                continue
+            v = s.get(key)
+            if not _is_finite_number(v):
+                continue
+            values.append(float(v))
+        if not values:
+            continue
+        values.sort()
+        summary[key] = {
+            "p50": round(_percentile(values, 50), 2),
+            "p95": round(_percentile(values, 95), 2),
+            "n": len(values),
+        }
+    return summary
+
+
+def _build_session_timing_summary(session: "ActiveSession") -> dict[str, Any]:
+    """Aggregate server + client timing samples into a single summary.
+
+    ``samples_retained`` is the size of the rolling buffer used for P50/P95;
+    ``*_total`` is the untruncated count of frames/samples observed across the
+    whole session. When ``samples_retained < *_total`` the percentiles
+    describe only the retained tail — callers must not treat them as the full
+    session distribution.
+    """
+    return {
+        "server": _summarize_samples(
+            session.server_timing_samples,
+            ["server_preprocess_wait_ms", "decode_ms", "engine_ms", "total_ms"],
+        ),
+        "jpeg_bytes": _summarize_samples(
+            session.server_timing_samples, ["jpeg_bytes"]
+        ),
+        "client": _summarize_samples(
+            session.client_timing_samples,
+            ["encode_ms", "rtt_ms", "jpeg_bytes"],
+        ),
+        # Untruncated totals — the source of truth for session coverage.
+        "frames_processed": session.server_timing_total,
+        "client_samples": session.client_timing_total,
+        # Rolling-buffer sizes actually used for the percentiles above.
+        "samples_retained": {
+            "server": len(session.server_timing_samples),
+            "client": len(session.client_timing_samples),
+        },
+    }
 
 
 # --------------------------------------------------------------------- #
@@ -302,9 +595,10 @@ def _state_payload(
     result: RealtimeFrameResult,
     *,
     accepted_weight: float | None,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the JSON "state" message sent to the client."""
-    return {
+    payload: dict[str, Any] = {
         "type": "state",
         "state": result.state.value,
         "weight_candidate": (
@@ -322,7 +616,11 @@ def _state_payload(
             else None
         ),
         "frame_seq": result.frame_seq,
+        "epoch": int(getattr(result, "epoch", 0) or 0),
     }
+    if timing:
+        payload["timing"] = timing
+    return payload
 
 
 def _status_payload(session: ActiveSession) -> dict[str, Any]:
@@ -400,6 +698,10 @@ class CreateSessionRequest(BaseModel):
 class CreateSessionResponse(BaseModel):
     session_id: str
     state: str
+    # Tuning knobs the phone client should apply (P2). The client clamps
+    # these to safe ranges before use; absent fields fall back to client
+    # defaults so older clients keep working.
+    client_config: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------- #
@@ -453,6 +755,9 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
     config = _get_config()
     try:
         engine = _create_engine(config)
+    except ValueError as exc:
+        log.error("realtime: invalid realtime config: %s", exc)
+        raise HTTPException(status_code=400, detail=f"invalid realtime config: {exc}") from exc
     except Exception:  # noqa: BLE001 - surface as 500 with context, never crash the app
         log.exception("realtime: failed to build engine from config")
         raise HTTPException(status_code=500, detail="failed to initialize session")
@@ -479,7 +784,11 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
         "realtime: created session %s (cage=%s project=%s)",
         session_id, req.cage_id, req.project_id,
     )
-    return CreateSessionResponse(session_id=session_id, state=engine.state.value)
+    return CreateSessionResponse(
+        session_id=session_id,
+        state=engine.state.value,
+        client_config=_build_client_config(config),
+    )
 
 
 @router.get(
@@ -506,11 +815,13 @@ def session_retry(session_id: str) -> dict[str, Any]:
             session.journal.record_decision(cur.attempt_id, "rejected", cur.weight_g)
     except Exception:  # noqa: BLE001
         log.exception("realtime: journal record_decision(retry) failed")
-    session.engine.request_retry()
+    retry_info = session.engine.request_retry()
     return {
         "session_id": session_id,
-        "state": session.engine.state.value,
-        "ok": True,
+        "state": retry_info.get("state", session.engine.state.value),
+        "ok": bool(retry_info.get("applied")),
+        "applied": bool(retry_info.get("applied")),
+        "epoch": int(retry_info.get("epoch", 0)),
     }
 
 
@@ -575,6 +886,7 @@ def session_finish(
 
     # Persist accepted decisions as real records (P0 fix: the operator's
     # real-time decisions are the source of truth, not a re-analysis).
+    timing_summary = _build_session_timing_summary(session)
     finalize_result: dict[str, Any] = {}
     finalize_error: str | None = None
     try:
@@ -590,6 +902,7 @@ def session_finish(
             upload_queue=_get_upload_queue(),
             video_upload_job_id=(req.video_upload_job_id if req else None),
             capture_meta=(req.capture_meta if req else None),
+            timing_summary=timing_summary,
         )
     except Exception:  # noqa: BLE001
         log.exception("realtime: finalize_session failed (session=%s)", session_id)
@@ -604,6 +917,7 @@ def session_finish(
         "total_attempts": len(all_attempts),
         "finalize": finalize_result,
         "finalize_error": finalize_error,
+        "timing_summary": timing_summary,
     }
     log.info(
         "realtime: finished session %s (accepted=%d attempts=%d run=%s)",
@@ -656,11 +970,21 @@ async def _process_one_frame(
     image: np.ndarray,
     frame_seq: int,
     client_ts_ms: float,
+    *,
+    jpeg_bytes: int = 0,
+    received_at: float | None = None,
+    decode_ms: float = 0.0,
+    source_w: int | None = None,
+    source_h: int | None = None,
+    resized: bool = False,
 ) -> None:
     """Run the (blocking) engine on a worker thread and push the state."""
     # Run engine + journal append together inside the worker thread so the
     # threading.Lock is never held across an await (P1 fix).
-    def _process_and_journal() -> RealtimeFrameResult:
+    recv_at = float(received_at if received_at is not None else time.monotonic())
+
+    def _process_and_journal() -> tuple[RealtimeFrameResult, dict[str, Any]]:
+        processing_started = time.monotonic()
         with session.frame_lock:
             res = session.engine.process_frame(
                 image, frame_seq=frame_seq, client_ts_ms=client_ts_ms
@@ -675,20 +999,65 @@ async def _process_one_frame(
                         "realtime: journal record_attempt failed (session=%s)",
                         session.session_id,
                     )
-            return res
+        processing_completed = time.monotonic()
+        engine_ms = round((processing_completed - processing_started) * 1000.0, 2)
+        h, w = int(image.shape[0]), int(image.shape[1])
+        timing = {
+            "frame_seq": int(frame_seq),
+            "epoch": int(getattr(res, "epoch", 0) or 0),
+            "client_ts_ms": float(client_ts_ms),
+            "received_at": recv_at,
+            "processing_started_at": processing_started,
+            "processing_completed_at": processing_completed,
+            "jpeg_bytes": int(jpeg_bytes),
+            "image_w": w,
+            "image_h": h,
+            # Renamed from frame_age_ms: this is the server-side wait between
+            # WS message receipt and engine.process_frame() start (decode +
+            # threadpool + frame_lock contention). It is NOT a true frame age
+            # — phone encode + public-internet transit are not included.
+            "server_preprocess_wait_ms": round(
+                (processing_started - recv_at) * 1000.0, 2
+            ),
+            "decode_ms": round(float(decode_ms), 2),
+            "engine_ms": engine_ms,
+            "source_w": int(source_w) if source_w is not None else w,
+            "source_h": int(source_h) if source_h is not None else h,
+            "resized": bool(resized),
+        }
+        return res, timing
 
     try:
-        result = await run_in_threadpool(_process_and_journal)
+        result, timing = await run_in_threadpool(_process_and_journal)
     except Exception:  # noqa: BLE001 - never let one bad frame kill the socket
         log.exception(
             "realtime: process_frame raised (session=%s seq=%d)",
             session.session_id, frame_seq,
         )
+        # Must ACK the frame so the client can release its single in-flight lock.
+        await _send_state(
+            websocket,
+            {
+                "type": "error",
+                "code": "frame_processing_failed",
+                "message": "本帧识别失败，正在重试",
+                "frame_seq": int(frame_seq),
+                "session_id": session.session_id,
+            },
+        )
         return
 
     _touch(session)
 
-    payload = _state_payload(result, accepted_weight=result.accepted_weight)
+    timing["response_sent_at"] = time.monotonic()
+    timing["total_ms"] = round(
+        (timing["response_sent_at"] - recv_at) * 1000.0, 2
+    )
+    # Buffer server-side timing for the session summary (P50/P95 at finish).
+    _record_server_timing(session, timing)
+    payload = _state_payload(
+        result, accepted_weight=result.accepted_weight, timing=timing
+    )
     payload["session_id"] = session.session_id
     await _send_state(websocket, payload)
 
@@ -706,17 +1075,9 @@ async def _handle_ws_command(
     """
     ctype = str(cmd.get("type", "")).strip().lower()
 
-    def _retry_locked() -> None:
+    def _retry_locked() -> dict[str, Any]:
         with session.frame_lock:
-            # Find the currently announced attempt (if any) so its rejection
-            # is durable before we transition state.
-            engine = session.engine
-            cur = None
-            # The engine exposes the in-flight attempt via accept_weight's
-            # None-return when not in ANNOUNCED; reach into the private field
-            # is avoided by using request_retry's documented no-op-on-non-announced.
-            # We snapshot the attempt id via the engine's accepted list diff.
-            session.engine.request_retry()
+            return session.engine.request_retry()
 
     def _accept_locked() -> Attempt | None:
         with session.frame_lock:
@@ -745,14 +1106,16 @@ async def _handle_ws_command(
                 )
         except Exception:  # noqa: BLE001
             log.exception("realtime: journal record_decision(retry) failed")
-        await run_in_threadpool(_retry_locked)
+        retry_info = await run_in_threadpool(_retry_locked)
         await _send_state(
             websocket,
             {
                 "type": "ack",
                 "cmd": "retry",
                 "session_id": session.session_id,
-                "state": session.engine.state.value,
+                "applied": bool(retry_info.get("applied")),
+                "state": retry_info.get("state", session.engine.state.value),
+                "epoch": int(retry_info.get("epoch", 0)),
             },
         )
     elif ctype == "accept":
@@ -767,6 +1130,15 @@ async def _handle_ws_command(
                 "accepted": _attempt_to_dict(accepted),
             },
         )
+    elif ctype == "client_timing":
+        # Client-reported per-ACK timing samples (encode_ms / rtt_ms / jpeg_bytes).
+        # Fire-and-forget; no ACK is sent.
+        samples = cmd.get("samples") if isinstance(cmd.get("samples"), list) else []
+        if samples:
+            try:
+                _record_client_timing(session, samples)
+            except Exception:  # noqa: BLE001
+                log.debug("realtime: client_timing merge failed", exc_info=True)
     else:
         log.debug("realtime: ignoring unknown ws command %r", ctype)
 
@@ -846,9 +1218,12 @@ async def realtime_ws(
 
             frame_seq, client_ts_ms = _HEADER_STRUCT.unpack_from(data, 0)
             jpeg = data[_HEADER_SIZE:]
+            received_at = time.monotonic()
 
-            image = await run_in_threadpool(_decode_jpeg, jpeg)
-            if image is None:
+            decode_t0 = time.monotonic()
+            decoded = await run_in_threadpool(_decode_jpeg, jpeg)
+            decode_ms = (time.monotonic() - decode_t0) * 1000.0
+            if decoded is None:
                 # Skip unreadable frames but keep the socket open.
                 await _send_state(
                     websocket,
@@ -861,8 +1236,24 @@ async def realtime_ws(
                 )
                 continue
 
+            # Normalize to canonical 720×1280 before the engine so detection
+            # thresholds calibrated for that size remain valid regardless of
+            # the client's encode profile.
+            source_h, source_w = int(decoded.shape[0]), int(decoded.shape[1])
+            image, resized = await run_in_threadpool(_normalize_to_canonical, decoded)
+
             await _process_one_frame(
-                session, websocket, image, int(frame_seq), float(client_ts_ms)
+                session,
+                websocket,
+                image,
+                int(frame_seq),
+                float(client_ts_ms),
+                jpeg_bytes=len(jpeg),
+                received_at=received_at,
+                decode_ms=decode_ms,
+                source_w=source_w,
+                source_h=source_h,
+                resized=resized,
             )
 
     except WebSocketDisconnect:
