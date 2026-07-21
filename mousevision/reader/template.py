@@ -447,8 +447,13 @@ class TemplateReader:
                 best_key = key
         return best_key, best_score
 
-    def read_weight(self, image: np.ndarray) -> tuple[float | None, float]:
-        box = self._lcd_box(image)
+    def read_weight(
+        self,
+        image: np.ndarray,
+        *,
+        lcd_box: LcdBox | None = None,
+    ) -> tuple[float | None, float]:
+        box = lcd_box if lcd_box is not None else self._lcd_box(image)
         if box is None:
             return None, 0.0
         gray = _digit_area_gray(box.crop(image))

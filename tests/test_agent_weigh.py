@@ -10,6 +10,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mousevision.agent_weigh import (
+    AGENT_PROMPT_VERSION,
+    FULL_VIDEO_PROMPT,
+    AgentEvidenceVote,
     AgentSession,
     AgentWeighClient,
     AgentWeighError,
@@ -21,6 +24,7 @@ from mousevision.agent_weigh import (
     should_retain_source,
 )
 from mousevision.pipeline import WeighingPipeline, _resolved_weight_reader
+from mousevision.upload_queue import UploadQueue
 
 
 def test_resolve_agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,10 +90,12 @@ def test_persist_agent_sessions(tmp_path: Path) -> None:
     assert records[1]["needs_review"] is True
     assert records[1]["requires_manual_weight"] is True
     assert records[2]["needs_review"] is True  # low conf
+    assert records[2]["weight"] is None
+    assert records[2]["guessed_weight"] == 17.57
     assert (tmp_path / "mouse_001" / "record.json").is_file()
     assert (tmp_path / "mouse_002" / "record.json").is_file()
-    # null weight skips enqueue; two non-null enqueued
-    assert q.enqueue.call_count == 2
+    # Null and low-confidence weights are manual-only; only accepted rows queue.
+    assert q.enqueue.call_count == 1
 
 
 def test_pipeline_agent_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -117,7 +123,7 @@ def test_pipeline_agent_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
                 "device_id": "scale01",
                 "weight_reader": "agent",
                 "retain_source_video": True,
-                "agent": {"review_confidence": 0.7},
+                "agent": {"review_confidence": 0.7, "photo_gate": False},
             },
             tmp_path,
         )
@@ -142,7 +148,56 @@ def test_pipeline_agent_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     man = json.loads((result.run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert man.get("source_retained") is True
     assert man.get("weight_reader") == "agent"
+    assert man.get("agent_prompt_version") == AGENT_PROMPT_VERSION
     assert man.get("status") == "completed"
+
+
+def test_pipeline_queues_only_after_local_evidence_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"not-a-real-video")
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setenv("MOUSEVISION_WEIGHT_READER", "agent")
+    fake = AgentWeighResult(
+        sessions=[AgentSession(1, 23.98, 0.95, "agent accepted")],
+        model="gemini-3-flash",
+    )
+
+    def reject_evidence(**kwargs):
+        records = kwargs["records"]
+        records[0]["guessed_weight"] = records[0]["weight"]
+        records[0]["weight"] = None
+        records[0]["needs_review"] = True
+        records[0]["requires_manual_weight"] = True
+        records[0]["review_reason"] = "agent_photo_weight_mismatch"
+        return records
+
+    with (
+        patch.object(AgentWeighClient, "weigh_video", return_value=fake),
+        patch("mousevision.pipeline.attach_agent_evidence", side_effect=reject_evidence),
+    ):
+        result = WeighingPipeline(
+            {
+                "device_id": "scale01",
+                "weight_reader": "agent",
+                "retain_source_video": True,
+                "agent": {"attach_photos": True},
+            },
+            tmp_path,
+        ).run_video(
+            video,
+            cage_id="0001",
+            output_root=out,
+            create_run=True,
+            persist=True,
+            stop_after_first=False,
+        )
+
+    assert result.records is not None
+    assert result.records[0]["requires_manual_weight"] is True
+    assert UploadQueue(out / "upload_queue.db").list_held() == []
 
 
 def test_resolved_weight_reader_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,6 +303,108 @@ def test_sessions_from_payload_clamps_confidence() -> None:
     }
     sessions = _sessions_from_payload(payload)
     assert sessions[0].confidence == 1.0
+
+
+def test_agent_evidence_consensus_is_canonical() -> None:
+    payload = {
+        "sessions": [
+            {
+                "ordinal": 1,
+                "weight_g": 23.49,
+                "confidence": 0.95,
+                "t_start_s": 31.5,
+                "t_end_s": 36.0,
+                "stable_start_s": 33.0,
+                "stable_end_s": 35.5,
+                "t_stable_s": 34.0,
+                "evidence": [
+                    {"timestamp_s": 33.2, "weight_g": 23.48, "mouse_present": True, "display_readable": True},
+                    {"timestamp_s": 34.0, "weight_g": 23.49, "mouse_present": True, "display_readable": True},
+                    {"timestamp_s": 35.0, "weight_g": 23.50, "mouse_present": True, "display_readable": True},
+                ],
+            }
+        ]
+    }
+    sess = _sessions_from_payload(payload)[0]
+    assert sess.weight_g == 23.49
+    assert sess.evidence_consensus_g == 23.49
+    assert sess.review_reasons == []
+    assert len(sess.evidence) == 3
+
+
+def test_prompt_v2_requires_three_interior_median_votes() -> None:
+    assert AGENT_PROMPT_VERSION == "weighing-evidence-v2"
+    assert "evidence 必须恰好给 3 项" in FULL_VIDEO_PROMPT
+    assert "中位数" in FULL_VIDEO_PROMPT
+    assert "0.4–1.0 秒" in FULL_VIDEO_PROMPT
+
+
+def test_agent_single_frame_peak_fails_closed() -> None:
+    """Regression: the 23.98 single-frame peak must not beat 23.48/23.49."""
+    payload = {
+        "sessions": [
+            {
+                "ordinal": 5,
+                "weight_g": 23.98,
+                "confidence": 0.95,
+                "t_start_s": 31.5,
+                "t_end_s": 36.0,
+                "evidence": [
+                    {"timestamp_s": 33.5, "weight_g": 23.48, "mouse_present": True, "display_readable": True},
+                    {"timestamp_s": 34.0, "weight_g": 23.49, "mouse_present": True, "display_readable": True},
+                    {"timestamp_s": 34.5, "weight_g": 23.98, "mouse_present": True, "display_readable": True},
+                ],
+            }
+        ]
+    }
+    sess = _sessions_from_payload(payload)[0]
+    assert sess.weight_g == 23.49
+    assert "agent_evidence_multimodal" in sess.review_reasons
+    assert "agent_report_vote_mismatch" in sess.review_reasons
+
+
+def test_agent_missing_evidence_requires_review() -> None:
+    sess = _sessions_from_payload(
+        {"sessions": [{"ordinal": 1, "weight_g": 18.91, "confidence": 0.99}]}
+    )[0]
+    assert "agent_insufficient_evidence" in sess.review_reasons
+
+
+def test_persist_gated_agent_result_is_manual_and_not_queued(tmp_path: Path) -> None:
+    result = AgentWeighResult(
+        sessions=[
+            AgentSession(
+                1,
+                23.49,
+                0.95,
+                "single peak",
+                evidence=[
+                    AgentEvidenceVote(33.5, 23.48, True, True),
+                    AgentEvidenceVote(34.0, 23.49, True, True),
+                    AgentEvidenceVote(34.5, 23.98, True, True),
+                ],
+                reported_weight_g=23.98,
+                evidence_consensus_g=23.49,
+                review_reasons=["agent_evidence_multimodal"],
+            )
+        ]
+    )
+    q = MagicMock()
+    records = persist_agent_sessions(
+        result=result,
+        run_dir=tmp_path,
+        cage_id="0001",
+        run_id="rid",
+        device_id="scale01",
+        project_id="p",
+        start_ordinal=1,
+        upload_queue=q,
+    )
+    assert records[0]["weight"] is None
+    assert records[0]["guessed_weight"] == 23.49
+    assert records[0]["requires_manual_weight"] is True
+    assert "agent_evidence_multimodal" in records[0]["review_reason"]
+    q.enqueue.assert_not_called()
 
 
 def test_resolve_agent_config_attach_defaults() -> None:

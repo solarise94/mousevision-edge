@@ -14,6 +14,7 @@ from mousevision.agent_evidence import (
     pick_photo_for_session,
     resolve_session_window_ms,
     sample_video_frames,
+    summarize_local_ocr_evidence,
 )
 from mousevision.agent_weigh import AgentSession
 
@@ -195,6 +196,82 @@ def test_attach_agent_evidence_creates_photo_and_updates_record(
     # In-memory record is also updated.
     assert out[0]["photo_saved"] is True
     assert out[0]["platform_end_ms"] > 0.0
+    # The synthetic video has no mouse. Local evidence therefore fails closed.
+    assert out[0]["weight"] is None
+    assert out[0]["requires_manual_weight"] is True
+    assert "agent_photo_mouse_missing" in out[0]["review_reason"]
+
+
+def test_attach_agent_evidence_ocr_mismatch_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = _write_synthetic_video(tmp_path / "src.mp4", n_frames=40, fps=10.0)
+    run_dir = tmp_path / "run"
+    mouse_dir = run_dir / "mouse_001"
+    mouse_dir.mkdir(parents=True)
+    record = {
+        "box_id": "0001",
+        "weight": 23.98,
+        "confidence": 0.95,
+        "ordinal": 1,
+    }
+    (mouse_dir / "record.json").write_text(json.dumps(record), encoding="utf-8")
+
+    class FakeReader:
+        def read_weight(self, _image):
+            return 23.49, 0.99
+
+    monkeypatch.setattr(
+        "mousevision.agent_evidence._maybe_build_reader",
+        lambda *_args, **_kwargs: FakeReader(),
+    )
+    monkeypatch.setattr(
+        "mousevision.agent_evidence._detect_mouse",
+        lambda *_args, **_kwargs: (1, 1, 10, 10),
+    )
+    out = attach_agent_evidence(
+        records=[record],
+        sessions=[AgentSession(1, 23.98, 0.95, "single peak", t_stable_s=2.0)],
+        video_path=video,
+        run_dir=run_dir,
+        config={"agent": {"photo_mismatch_review_g": 0.25}},
+        templates_dir=tmp_path,
+    )
+    assert out[0]["weight"] is None
+    assert out[0]["guessed_weight"] == 23.98
+    assert out[0]["requires_manual_weight"] is True
+    assert "agent_local_evidence_mismatch" in out[0]["review_reason"]
+    assert out[0]["local_evidence_consensus_g"] == 23.49
+
+
+def test_local_evidence_uses_temporal_cluster_not_single_peak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    frames = [(float(i * 250), i, image) for i in range(6)]
+    values = iter([23.48, 23.49, 23.49, 23.50, 23.98, 23.49])
+
+    class SequenceReader:
+        def read_weight(self, _image):
+            return next(values), 0.99
+
+    monkeypatch.setattr(
+        "mousevision.agent_evidence._detect_mouse",
+        lambda *_args, **_kwargs: (1, 1, 10, 10),
+    )
+    summary = summarize_local_ocr_evidence(
+        frames,
+        start_ms=0.0,
+        end_ms=2000.0,
+        reader=SequenceReader(),
+        mouse_detect_cfg={},
+        min_votes=3,
+        weight_tol_g=0.08,
+        conflict_ratio=0.35,
+    )
+    assert summary["consensus_g"] == 23.49
+    assert summary["dominant_count"] == 5
+    assert summary["conflict"] is False
 
 
 def test_attach_agent_evidence_no_times_still_writes_photo(tmp_path: Path) -> None:

@@ -41,6 +41,7 @@ def main() -> int:
         "model": result.model,
         "input_mode": result.input_mode,
         "latency_s": result.latency_s,
+        "prompt_version": result.prompt_version,
         "summary": result.summary,
         "sessions": [
             {
@@ -48,6 +49,23 @@ def main() -> int:
                 "weight_g": s.weight_g,
                 "confidence": s.confidence,
                 "note": s.note,
+                "t_start_s": s.t_start_s,
+                "t_end_s": s.t_end_s,
+                "stable_start_s": s.stable_start_s,
+                "stable_end_s": s.stable_end_s,
+                "t_stable_s": s.t_stable_s,
+                "reported_weight_g": s.reported_weight_g,
+                "evidence_consensus_g": s.evidence_consensus_g,
+                "review_reasons": s.review_reasons,
+                "evidence": [
+                    {
+                        "timestamp_s": vote.timestamp_s,
+                        "weight_g": vote.weight_g,
+                        "mouse_present": vote.mouse_present,
+                        "display_readable": vote.display_readable,
+                    }
+                    for vote in s.evidence
+                ],
             }
             for s in result.sessions
         ],

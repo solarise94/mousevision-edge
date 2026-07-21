@@ -105,7 +105,12 @@ class HttpOcrReader:
                 self._hint_age = 0
         return obs
 
-    def read_weight(self, image: np.ndarray) -> tuple[float | None, float]:
+    def read_weight(
+        self,
+        image: np.ndarray,
+        *,
+        lcd_box: Any | None = None,  # noqa: ARG002 — protocol compat with TemplateReader
+    ) -> tuple[float | None, float]:
         """Backward-compatible tuple API (no temporal fusion)."""
         obs = self.read_observation(image)
         if obs.status not in {"readable", "zero_display"}:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,18 @@ from mousevision.agent_weigh import AgentSession, resolve_agent_config
 from mousevision.detect import detect_mouse_box
 
 log = logging.getLogger("mousevision.agent_evidence")
+
+
+def _append_review_reason(record: dict[str, Any], reason: str) -> None:
+    reasons = [r for r in str(record.get("review_reason") or "").split(",") if r]
+    if reason not in reasons:
+        reasons.append(reason)
+    record["review_reason"] = ",".join(reasons)
+    record["needs_review"] = True
+    record["requires_manual_weight"] = True
+    if record.get("weight") is not None and record.get("guessed_weight") is None:
+        record["guessed_weight"] = record.get("weight")
+    record["weight"] = None
 
 
 def sample_video_frames(
@@ -233,6 +246,79 @@ def score_frame_for_session(
     return score, meta
 
 
+def summarize_local_ocr_evidence(
+    frames: list[tuple[float, int, np.ndarray]],
+    *,
+    start_ms: float,
+    end_ms: float,
+    reader: Any | None,
+    mouse_detect_cfg: dict,
+    min_votes: int = 3,
+    weight_tol_g: float = 0.08,
+    conflict_ratio: float = 0.35,
+) -> dict[str, Any]:
+    """Build an independent temporal OCR consensus inside one Agent window.
+
+    The report photo picker is intentionally not used here: choosing a photo
+    against the Agent's target would make the local check circular and can
+    select the same single-frame peak that the gate is meant to reject.
+    """
+    result: dict[str, Any] = {
+        "observations": [],
+        "consensus_g": None,
+        "dominant_count": 0,
+        "conflict": False,
+    }
+    if reader is None:
+        return result
+
+    observations: list[dict[str, Any]] = []
+    for ts_ms, frame_index, image in frames:
+        if ts_ms < start_ms - 1e-3 or ts_ms > end_ms + 1e-3:
+            continue
+        try:
+            if _detect_mouse(image, mouse_detect_cfg) is None:
+                continue
+            weight, confidence = reader.read_weight(image)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("local evidence read failed: %s", exc)
+            continue
+        if weight is None or float(weight) <= 0:
+            continue
+        observations.append(
+            {
+                "timestamp_ms": round(float(ts_ms), 1),
+                "frame_index": int(frame_index),
+                "weight_g": round(float(weight), 2),
+                "confidence": round(float(confidence or 0.0), 4),
+            }
+        )
+    result["observations"] = observations
+    if len(observations) < int(min_votes):
+        return result
+
+    clusters: list[list[float]] = []
+    for value in sorted(float(o["weight_g"]) for o in observations):
+        match: list[float] | None = None
+        for cluster in clusters:
+            if abs(value - statistics.median(cluster)) <= float(weight_tol_g) + 1e-9:
+                match = cluster
+                break
+        if match is None:
+            clusters.append([value])
+        else:
+            match.append(value)
+    clusters.sort(key=lambda c: (-len(c), statistics.median(c)))
+    dominant = clusters[0]
+    if len(dominant) < int(min_votes):
+        return result
+    result["consensus_g"] = round(float(statistics.median(dominant)), 2)
+    result["dominant_count"] = len(dominant)
+    if len(clusters) > 1 and len(clusters[1]) / len(dominant) >= float(conflict_ratio):
+        result["conflict"] = True
+    return result
+
+
 def pick_photo_for_session(
     frames: list[tuple[float, int, np.ndarray]],
     window: tuple[float, float, float | None],
@@ -387,11 +473,26 @@ def attach_agent_evidence(
                 default_window_s=window_s,
             )
             target = record.get("weight")
+            if target is None:
+                target = record.get("guessed_weight")
             target_w = float(target) if isinstance(target, (int, float)) else None
+            local = summarize_local_ocr_evidence(
+                frames,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                reader=reader,
+                mouse_detect_cfg=mouse_detect_cfg,
+                min_votes=int(cfg.get("local_evidence_min_votes", 3)),
+                weight_tol_g=float(cfg.get("local_evidence_weight_tol_g", 0.08)),
+                conflict_ratio=float(cfg.get("local_evidence_conflict_ratio", 0.35)),
+            )
+            photo_target = local.get("consensus_g")
+            if photo_target is None:
+                photo_target = target_w
             pick = pick_photo_for_session(
                 frames,
                 (start_ms, end_ms, stable_ms),
-                target_weight=target_w,
+                target_weight=photo_target,
                 weight_tol=weight_tol,
                 reader=reader,
                 mouse_detect_cfg=mouse_detect_cfg,
@@ -426,8 +527,40 @@ def attach_agent_evidence(
             updated["photo_weight_delta"] = pick["photo_weight_delta"]
             updated["photo_saved"] = bool(ok)
             updated["agent_photo_score"] = float(pick["score"])
+            updated["photo_target_weight_g"] = photo_target
             updated["clip_start_ms"] = float(start_ms)
             updated["clip_end_ms"] = float(end_ms)
+            updated["local_evidence_consensus_g"] = local.get("consensus_g")
+            updated["local_evidence_dominant_count"] = int(
+                local.get("dominant_count") or 0
+            )
+            updated["local_evidence_conflict"] = bool(local.get("conflict"))
+            updated["local_evidence_observations"] = list(
+                local.get("observations") or []
+            )
+            if bool(cfg.get("photo_gate", True)):
+                if bool(cfg.get("photo_require_mouse", True)) and not bool(
+                    pick["mouse_detected"]
+                ):
+                    _append_review_reason(updated, "agent_photo_mouse_missing")
+                mismatch_limit = float(
+                    cfg.get("photo_mismatch_review_g", weight_tol)
+                )
+                delta = pick.get("photo_weight_delta")
+                if delta is not None and abs(float(delta)) > mismatch_limit:
+                    _append_review_reason(updated, "agent_photo_weight_mismatch")
+                local_consensus = local.get("consensus_g")
+                if local.get("conflict"):
+                    _append_review_reason(updated, "agent_local_evidence_multimodal")
+                if (
+                    local_consensus is not None
+                    and target_w is not None
+                    and abs(float(local_consensus) - target_w) > mismatch_limit
+                ):
+                    _append_review_reason(updated, "agent_local_evidence_mismatch")
+                updated["photo_verified"] = not bool(
+                    updated.get("requires_manual_weight")
+                )
             if record_path.is_file():
                 try:
                     record_path.write_text(

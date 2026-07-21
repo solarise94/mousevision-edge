@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -327,7 +328,9 @@ class WeighingPipeline:
                 project_id=project_id,
                 start_ordinal=start_ordinal,
                 review_confidence=float(agent_cfg["review_confidence"]),
-                upload_queue=queue,
+                # Evidence attachment can still fail-close a high-confidence
+                # Agent result. Queue only after that local gate has run.
+                upload_queue=None,
                 source_video=retained_source or video_path,
             )
             for i, _ in enumerate(records):
@@ -357,12 +360,69 @@ class WeighingPipeline:
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("attach_agent_evidence failed: %s", exc)
+            if bool(agent_cfg.get("photo_gate", True)):
+                for i, record in enumerate(records):
+                    if record.get("photo_saved"):
+                        continue
+                    reasons = [
+                        r
+                        for r in str(record.get("review_reason") or "").split(",")
+                        if r
+                    ]
+                    if "agent_local_evidence_unavailable" not in reasons:
+                        reasons.append("agent_local_evidence_unavailable")
+                    if record.get("weight") is not None and record.get(
+                        "guessed_weight"
+                    ) is None:
+                        record["guessed_weight"] = record.get("weight")
+                    record["weight"] = None
+                    record["needs_review"] = True
+                    record["requires_manual_weight"] = True
+                    record["review_reason"] = ",".join(reasons)
+                    record_path = (
+                        active_run
+                        / f"mouse_{start_ordinal + i:03d}"
+                        / "record.json"
+                    )
+                    try:
+                        record_path.write_text(
+                            json.dumps(record, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "agent fail-closed record write failed ordinal=%s: %s",
+                            record.get("ordinal", start_ordinal + i),
+                            exc,
+                        )
+            if queue is not None:
+                for i, record in enumerate(records):
+                    if record.get("weight") is None or record.get(
+                        "requires_manual_weight"
+                    ):
+                        continue
+                    mouse_dir = active_run / f"mouse_{start_ordinal + i:03d}"
+                    photo_path = mouse_dir / str(record.get("photo") or "photo.jpg")
+                    try:
+                        queue.enqueue(
+                            record,
+                            record_path=mouse_dir / "record.json",
+                            photo_path=photo_path if photo_path.is_file() else None,
+                            status="Held",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "agent enqueue failed ordinal=%s: %s",
+                            record.get("ordinal", start_ordinal + i),
+                            exc,
+                        )
             man = load_manifest(active_run) or {}
             man["weight_reader"] = "agent"
             man["agent_model"] = result.model
             man["agent_input_mode"] = result.input_mode
             man["agent_latency_s"] = result.latency_s
             man["agent_summary"] = result.summary
+            man["agent_prompt_version"] = result.prompt_version
             man["agent_photos_attached"] = sum(
                 1 for r in records if r.get("photo_saved")
             )

@@ -18,8 +18,8 @@ class OcrReader:
             )
         self._inner = HttpOcrReader(base_url, **kwargs)
 
-    def read_weight(self, image: np.ndarray) -> tuple[float | None, float]:
-        return self._inner.read_weight(image)
+    def read_weight(self, image: np.ndarray, *, lcd_box=None) -> tuple[float | None, float]:
+        return self._inner.read_weight(image, lcd_box=lcd_box)
 
     def read_observation(self, image: np.ndarray) -> RawWeightObservation:
         return self._inner.read_observation(image)
