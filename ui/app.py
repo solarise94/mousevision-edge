@@ -699,6 +699,9 @@ engine = PlaybackEngine(registry, upload_queue)
 job_store = JobStore(JOB_DB)
 box_registry = BoxRegistry(BOX_DB)
 records_meta = RecordsMetaStore(str(META_DB))
+# Share the upload queue with the realtime API so finalized realtime records
+# enter the same cloud-sync queue as offline analysis records.
+realtime_api.set_upload_queue(upload_queue)
 user_store = UserStore(str(USERS_DB))
 audit_store = AuditStore(str(AUDIT_DB))
 settings_store = SettingsStore(SETTINGS_PATH)
@@ -762,7 +765,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="MouseVision Edge UI", lifespan=lifespan)
 
 # Realtime weighing WebSocket + REST API
-realtime_api.configure(DEFAULT_CONFIG)
+realtime_api.configure(DEFAULT_CONFIG, str(DEFAULT_OUTPUT))
 app.include_router(realtime_api.router)
 
 
@@ -986,7 +989,7 @@ async def api_create_job(
         if crop_obj is not None:
             upload_updates["preview_crop"] = json.dumps(crop_obj)
         mode = (capture_mode or "").strip().lower() or None
-        if mode in ("canvas", "css_crop", "system"):
+        if mode in ("canvas", "css_crop", "system", "realtime"):
             upload_updates["capture_mode"] = mode
         if capture_meta:
             # Cap size so a runaway client cannot bloat the jobs DB.

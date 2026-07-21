@@ -57,6 +57,7 @@ import cv2
 import numpy as np
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     HTTPException,
     Query,
@@ -77,6 +78,8 @@ from mousevision.realtime import (
     RealtimeSession,
     RealtimeState,
 )
+from mousevision.realtime_journal import AttemptJournal, JournalMeta, journal_path
+from mousevision.realtime_finalize import finalize_session
 from ui.auth import require_api_token
 
 log = logging.getLogger("realtime_api")
@@ -108,9 +111,12 @@ class ActiveSession:
     cage_id: str
     project_id: str
     engine: RealtimeSession
+    journal: AttemptJournal
+    output_root: str
     created_at: float
     last_frame_at: float = 0.0
     recording_t0_ms: float = 0.0  # client's recording start time (future use)
+    device_id: str = "scale01"
     # Serializes frame processing for this session across socket reconnects
     # or concurrent REST probes that feed frames.
     frame_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -128,19 +134,57 @@ _sessions_lock = threading.Lock()
 # Set by configure() / create_realtime_router() before the router is mounted.
 _config_path: str | Path | None = None
 _config_cache: dict[str, Any] | None = None
+_output_root: str | Path | None = None
 _config_lock = threading.Lock()
 
 
-def configure(config_path: str | Path) -> None:
-    """Set the YAML config path used by the module-level :data:`router`.
+def configure(config_path: str | Path, output_root: str | Path | None = None) -> None:
+    """Set the YAML config path (and optionally the output root) used by the
+    module-level :data:`router`.
 
     Must be called once at startup, before the router handles requests.
+    ``output_root`` defaults to ``MOUSEVISION_OUTPUT_DIR`` env or ``./output``.
     """
-    global _config_path
+    global _config_path, _output_root
     with _config_lock:
         _config_path = str(config_path)
+        if output_root is None:
+            import os as _os
+
+            output_root = _os.getenv("MOUSEVISION_OUTPUT_DIR", "output")
+        _output_root = str(output_root)
         # Invalidate cache so the next request reloads from the new path.
         _invalidate_config_locked()
+
+
+def _get_output_root() -> str:
+    with _config_lock:
+        if not _output_root:
+            # Fall back to env if configure() was not given an explicit root.
+            import os as _os
+
+            return _os.getenv("MOUSEVISION_OUTPUT_DIR", "output")
+        return _output_root
+
+
+_upload_queue: Any | None = None
+_upload_queue_lock = threading.Lock()
+
+
+def set_upload_queue(queue: Any) -> None:
+    """Inject the app's shared :class:`~mousevision.upload_queue.UploadQueue`.
+
+    Optional: when not set, finalize still writes records but does not enqueue
+    them for cloud sync.
+    """
+    global _upload_queue
+    with _upload_queue_lock:
+        _upload_queue = queue
+
+
+def _get_upload_queue() -> Any:
+    with _upload_queue_lock:
+        return _upload_queue
 
 
 def _invalidate_config_locked() -> None:
@@ -363,17 +407,36 @@ class CreateSessionResponse(BaseModel):
 # --------------------------------------------------------------------- #
 
 
-def create_realtime_router(config_path: str | Path) -> APIRouter:
+def create_realtime_router(
+    config_path: str | Path, output_root: str | Path | None = None
+) -> APIRouter:
     """Build a fresh router bound to ``config_path``.
 
     Preferred for tests / multi-app setups. For the default single-app case,
     call :func:`configure` and use the module-level :data:`router`.
     """
-    configure(config_path)
+    configure(config_path, output_root)
     return router
 
 
 router = APIRouter(prefix="/api/realtime", tags=["realtime"])
+
+
+def _build_journal(session_id: str, cage_id: str, project_id: str, device_id: str) -> AttemptJournal:
+    """Create an append-only journal for this session and write its meta."""
+    out_root = _get_output_root()
+    jpath = journal_path(out_root, session_id)
+    j = AttemptJournal(jpath)
+    j.write_meta(
+        JournalMeta(
+            session_id=session_id,
+            cage_id=cage_id,
+            project_id=project_id,
+            created_at=time.time(),
+            device_id=device_id,
+        )
+    )
+    return j
 
 
 @router.post(
@@ -396,13 +459,18 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
 
     session_id = uuid.uuid4().hex
     now = time.time()
+    device_id = str(config.get("device_id", "scale01"))
+    journal = _build_journal(session_id, req.cage_id, req.project_id, device_id)
     session = ActiveSession(
         session_id=session_id,
         cage_id=req.cage_id,
         project_id=req.project_id,
         engine=engine,
+        journal=journal,
+        output_root=_get_output_root(),
         created_at=now,
         last_frame_at=0.0,
+        device_id=device_id,
     )
     with _sessions_lock:
         _cleanup_expired_locked(now)
@@ -430,7 +498,14 @@ def session_status(session_id: str) -> dict[str, Any]:
 def session_retry(session_id: str) -> dict[str, Any]:
     """Request a re-weigh of the currently announced attempt."""
     session = _get_session(session_id)
-    # No-op outside ANNOUNCED; the engine guards this internally.
+    # Snapshot the in-flight attempt so its rejection is durable BEFORE the
+    # engine transitions out of ANNOUNCED.
+    try:
+        cur = session.engine._current_attempt  # type: ignore[attr-defined]
+        if cur is not None:
+            session.journal.record_decision(cur.attempt_id, "rejected", cur.weight_g)
+    except Exception:  # noqa: BLE001
+        log.exception("realtime: journal record_decision(retry) failed")
     session.engine.request_retry()
     return {
         "session_id": session_id,
@@ -453,6 +528,10 @@ def session_accept(session_id: str) -> dict[str, Any]:
             status_code=409,
             detail="no announced weight to accept (state=%s)" % session.engine.state.value,
         )
+    try:
+        session.journal.record_decision(attempt.attempt_id, "accepted", attempt.weight_g)
+    except Exception:  # noqa: BLE001
+        log.exception("realtime: journal record_decision(accept) failed")
     return {
         "session_id": session_id,
         "state": session.engine.state.value,
@@ -460,15 +539,28 @@ def session_accept(session_id: str) -> dict[str, Any]:
     }
 
 
+class FinishRequest(BaseModel):
+    """Optional body for /finish: lets the client pass the uploaded video job id
+    so finalize can link the run dir to the source video."""
+
+    video_upload_job_id: str | None = None
+    capture_meta: dict[str, Any] | None = None
+
+
 @router.post(
     "/session/{session_id}/finish",
     dependencies=[Depends(require_api_token)],
 )
-def session_finish(session_id: str) -> dict[str, Any]:
-    """End the session and return a summary.
+def session_finish(
+    session_id: str, req: FinishRequest | None = Body(None)
+) -> dict[str, Any]:
+    """End the session, persist accepted attempts as durable records, and
+    return a summary.
 
-    The session is removed from the in-memory store; callers should persist
-    the ``accepted`` list before/after this call.
+    Accepted attempts become the official records (one ``mouse_NNN`` per
+    attempt under a new run dir). Rejected attempts are written to the run
+    manifest so the offline pipeline can skip them. The in-memory session is
+    then removed; the journal file remains for audit.
     """
     with _sessions_lock:
         _cleanup_expired_locked()
@@ -480,6 +572,29 @@ def session_finish(session_id: str) -> dict[str, Any]:
     accepted = engine.get_accepted_records()
     all_attempts = engine.get_all_attempts()
     rejected = [a for a in all_attempts if a.state == "rejected"]
+
+    # Persist accepted decisions as real records (P0 fix: the operator's
+    # real-time decisions are the source of truth, not a re-analysis).
+    finalize_result: dict[str, Any] = {}
+    finalize_error: str | None = None
+    try:
+        finalize_result = finalize_session(
+            session_id=session_id,
+            output_root=session.output_root,
+            journal=session.journal,
+            accepted=accepted,
+            rejected=rejected,
+            cage_id=session.cage_id,
+            project_id=session.project_id,
+            device_id=session.device_id,
+            upload_queue=_get_upload_queue(),
+            video_upload_job_id=(req.video_upload_job_id if req else None),
+            capture_meta=(req.capture_meta if req else None),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("realtime: finalize_session failed (session=%s)", session_id)
+        finalize_error = "finalize failed; journal preserved for recovery"
+
     summary = {
         "session_id": session_id,
         "cage_id": session.cage_id,
@@ -487,10 +602,13 @@ def session_finish(session_id: str) -> dict[str, Any]:
         "accepted": [_attempt_to_dict(a) for a in accepted],
         "rejected": [_attempt_to_dict(a) for a in rejected],
         "total_attempts": len(all_attempts),
+        "finalize": finalize_result,
+        "finalize_error": finalize_error,
     }
     log.info(
-        "realtime: finished session %s (accepted=%d attempts=%d)",
+        "realtime: finished session %s (accepted=%d attempts=%d run=%s)",
         session_id, len(accepted), len(all_attempts),
+        finalize_result.get("run_dir", "-"),
     )
     return summary
 
@@ -540,21 +658,33 @@ async def _process_one_frame(
     client_ts_ms: float,
 ) -> None:
     """Run the (blocking) engine on a worker thread and push the state."""
-    # Serialize per-session so reconnects / probes don't interleave.
-    with session.frame_lock:
-        try:
-            result = await run_in_threadpool(
-                session.engine.process_frame,
-                image,
-                frame_seq=frame_seq,
-                client_ts_ms=client_ts_ms,
+    # Run engine + journal append together inside the worker thread so the
+    # threading.Lock is never held across an await (P1 fix).
+    def _process_and_journal() -> RealtimeFrameResult:
+        with session.frame_lock:
+            res = session.engine.process_frame(
+                image, frame_seq=frame_seq, client_ts_ms=client_ts_ms
             )
-        except Exception:  # noqa: BLE001 - never let one bad frame kill the socket
-            log.exception(
-                "realtime: process_frame raised (session=%s seq=%d)",
-                session.session_id, frame_seq,
-            )
-            return
+            # Persist a newly-announced attempt before notifying the client,
+            # so a crash between announce and push leaves the journal consistent.
+            if res.attempt is not None:
+                try:
+                    session.journal.record_attempt(res.attempt)
+                except Exception:  # noqa: BLE001 - journal failure must not break the loop
+                    log.exception(
+                        "realtime: journal record_attempt failed (session=%s)",
+                        session.session_id,
+                    )
+            return res
+
+    try:
+        result = await run_in_threadpool(_process_and_journal)
+    except Exception:  # noqa: BLE001 - never let one bad frame kill the socket
+        log.exception(
+            "realtime: process_frame raised (session=%s seq=%d)",
+            session.session_id, frame_seq,
+        )
+        return
 
     _touch(session)
 
@@ -568,11 +698,54 @@ async def _handle_ws_command(
     websocket: WebSocket,
     cmd: dict[str, Any],
 ) -> None:
-    """Dispatch a JSON text command (retry / accept)."""
+    """Dispatch a JSON text command (retry / accept).
+
+    Engine calls are blocking-but-cheap (no OCR); they run in a worker thread
+    alongside the journal append so neither holds the asyncio loop and the
+    per-session lock is never acquired across an await.
+    """
     ctype = str(cmd.get("type", "")).strip().lower()
+
+    def _retry_locked() -> None:
+        with session.frame_lock:
+            # Find the currently announced attempt (if any) so its rejection
+            # is durable before we transition state.
+            engine = session.engine
+            cur = None
+            # The engine exposes the in-flight attempt via accept_weight's
+            # None-return when not in ANNOUNCED; reach into the private field
+            # is avoided by using request_retry's documented no-op-on-non-announced.
+            # We snapshot the attempt id via the engine's accepted list diff.
+            session.engine.request_retry()
+
+    def _accept_locked() -> Attempt | None:
+        with session.frame_lock:
+            attempt = session.engine.accept_weight()
+            if attempt is not None:
+                try:
+                    session.journal.record_decision(
+                        attempt.attempt_id, "accepted", attempt.weight_g
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "realtime: journal record_decision(accept) failed (session=%s)",
+                        session.session_id,
+                    )
+            return attempt
+
     if ctype == "retry":
-        # Blocking call but cheap (no OCR) — run inline.
-        session.engine.request_retry()
+        # Record the rejection of the in-flight attempt BEFORE transitioning.
+        # Peek at the engine's current attempt (private but stable) so the
+        # journal captures which announced weight the operator rejected.
+        try:
+            cur_attempt = session.engine._current_attempt  # type: ignore[attr-defined]
+            if cur_attempt is not None:
+                session.journal.record_decision(
+                    cur_attempt.attempt_id, "rejected", cur_attempt.weight_g
+                )
+        except Exception:  # noqa: BLE001
+            log.exception("realtime: journal record_decision(retry) failed")
+        await run_in_threadpool(_retry_locked)
         await _send_state(
             websocket,
             {
@@ -583,7 +756,7 @@ async def _handle_ws_command(
             },
         )
     elif ctype == "accept":
-        attempt = session.engine.accept_weight()
+        accepted = await run_in_threadpool(_accept_locked)
         await _send_state(
             websocket,
             {
@@ -591,7 +764,7 @@ async def _handle_ws_command(
                 "cmd": "accept",
                 "session_id": session.session_id,
                 "state": session.engine.state.value,
-                "accepted": _attempt_to_dict(attempt),
+                "accepted": _attempt_to_dict(accepted),
             },
         )
     else:

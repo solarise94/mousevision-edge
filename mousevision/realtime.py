@@ -97,7 +97,7 @@ class RealtimeConfig:
     mouse_smooth_window: int = 5
 
     # 计时
-    announce_hold_s: float = 3.0  # 播报后自动接受的等待时间（0 = 关闭）
+    announce_hold_s: float = 0.0  # 播报后自动接受的等待时间（0 = 关闭，首版必须显式确认）
     clear_timeout_s: float = 30.0  # 等待清秤超时（秒）
 
 

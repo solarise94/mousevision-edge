@@ -1391,61 +1391,118 @@
     function handleServerMessage(msg) {
       if (!msg || typeof msg !== "object") return;
       const t = msg.type;
-      if (t === "state") {
-        setState(msg.state || rtState, msg);
-      } else if (t === "weight") {
-        if (typeof msg.weight === "number" && (rtState === "weighing" || rtState === "armed")) {
-          setWeightValue(msg.weight, false);
-        }
-      } else if (t === "announced") {
-        if (typeof msg.weight === "number") {
-          announcedWeight = msg.weight;
-          speakWeight(msg.weight);
-        }
-        setState("announced", msg);
-      } else if (t === "accepted") {
-        if (msg.accepted_count != null) rtMouseCount = msg.accepted_count;
-        else rtMouseCount += 1;
-        mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
-        announcedWeight = null;
-        setState("accepted", msg);
-      } else if (t === "quality") {
-        const hints = msg.hints || msg.warnings || [];
-        if (hints.length) setQualityHints(hints);
-      } else if (t === "mouse_count" || t === "count") {
-        const c = msg.accepted_count != null ? msg.accepted_count : msg.count;
-        if (c != null) {
-          rtMouseCount = c;
+
+      if (t === "hello") {
+        // Initial state snapshot on WS connect.
+        if (msg.state) setState(msg.state, msg);
+        if (msg.accepted_count != null) {
+          rtMouseCount = msg.accepted_count;
           mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
         }
+      } else if (t === "state") {
+        // Primary per-frame state update from the engine.
+        const newState = msg.state || rtState;
+
+        // Weight display: use weight_candidate (backend field name).
+        if (typeof msg.weight_candidate === "number") {
+          const confirmed = newState === "announced";
+          setWeightValue(msg.weight_candidate, confirmed);
+          if (confirmed) announcedWeight = msg.weight_candidate;
+        }
+
+        // Quality hints: array of {code, message}.
+        if (msg.quality_hints && msg.quality_hints.length) {
+          setQualityHints(msg.quality_hints.map(function (h) { return h.message || h.code; }));
+        } else if (newState === "calibrating") {
+          setQualityHints(["请调整手机，使显示屏位于画面内"]);
+        } else if (newState === "armed") {
+          setQualityHints(["请将小鼠放上秤盘"]);
+        } else if (newState === "wait_clear") {
+          setQualityHints(["请取走小鼠"]);
+        } else {
+          setQualityHints([]);
+        }
+
+        // New attempt announced → speak + show action buttons.
+        if (msg.attempt && newState === "announced") {
+          announcedWeight = msg.attempt.weight_g;
+          setWeightValue(announcedWeight, true);
+          speakWeight(announcedWeight);
+        }
+
+        // Weight accepted (auto or explicit) → update count.
+        if (msg.accepted_weight != null) {
+          rtMouseCount += 1;
+          mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
+          announcedWeight = null;
+        }
+
+        setState(newState, msg);
+      } else if (t === "ack") {
+        // Response to a retry/accept command sent by the client.
+        if (msg.cmd === "accept" && msg.accepted) {
+          rtMouseCount += 1;
+          mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
+          announcedWeight = null;
+        }
+        if (msg.state) setState(msg.state, msg);
       } else if (t === "error") {
         toast(msg.message || "实时分析出错");
       }
     }
 
     retryBtn.addEventListener("click", () => {
+      // Commands are tiny JSON; but if old frames are buffered ahead of us,
+      // drain-first so a retry isn't stuck behind 30 stale images.
+      drainSendQueue();
       rtSend({ type: "retry" });
       announcedWeight = null;
       setState("armed", {});
     });
     acceptBtn.addEventListener("click", () => {
+      drainSendQueue();
       rtSend({ type: "accept" });
     });
 
+    // Drop any frames still queued in the browser's send buffer so a fresh
+    // command (retry/accept) reaches the server ahead of stale imagery.
+    // WS send order is FIFO per connection, so the only way to prioritise a
+    // command is to stop enqueuing more frames and wait for the buffer to
+    // drain below a threshold before sending the command.
+    function drainSendQueue() {
+      // Nothing to drain synchronously (we can't cancel already-buffered
+      // binary messages), but we suspend the frame loop briefly so the
+      // small JSON command isn't queued behind a burst of new frames.
+      stopFrameLoop();
+      // Resume after a short beat — enough for the command + ACK round-trip.
+      setTimeout(startFrameLoop, 400);
+    }
+
     // --- Frame sending loop (every 250ms, JPEG q=0.55, 8-byte header) ---
+    // P1: backpressure. If the WS send buffer has grown past a threshold we
+    // skip this tick instead of enqueuing another frame; otherwise OCR
+    // slower than 4fps would pile up stale frames and lag state updates.
+    const WS_BACKPRESSURE_BYTES = 512 * 1024; // 512KB ≈ ~4-6 queued JPEGs
+
     function sendFrame() {
       if (frameInFlight) return;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       if (!paintedReady) return;
+      // Backpressure: skip if the OS/browser buffer is already deep.
+      if (ws.bufferedAmount && ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return;
       frameInFlight = true;
       try {
         canvas.toBlob((blob) => {
           frameInFlight = false;
           if (!blob) return;
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          // Re-check backpressure after the async encode — the buffer may
+          // have grown while we were waiting for toBlob.
+          if (ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return;
           const reader = new FileReader();
           reader.onload = () => {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (ws.bufferedAmount > WS_BACKPRESSURE_BYTES) return;
             const jpegBytes = new Uint8Array(reader.result);
             const buf = new ArrayBuffer(8 + jpegBytes.length);
             const dv = new DataView(buf);
@@ -1491,7 +1548,10 @@
       }
     }
 
-    // --- Finish: stop everything, announce to server, then upload ---
+    // --- Finish: stop recording → upload video → finalize session with job_id ---
+    // Order matters: the uploaded video gets a job_id from /api/jobs, and
+    // we pass that id to /api/realtime/session/<id>/finish so the finalized
+    // run dir can link back to the source video for clip extraction.
     async function finishSession() {
       if (finished) return;
       finished = true;
@@ -1507,20 +1567,70 @@
         reconnectHandle = null;
       }
       showReconnect(false);
-      if (rtSession && rtSession.session_id) {
-        try {
-          await api.json(
-            `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
-            { method: "POST" }
-          );
-        } catch (_) {}
+
+      // 1. Stop the background recorder → its stop handler builds the blob
+      //    and calls doUpload → renderUploading → POST /api/jobs.
+      //    We intercept doUpload to capture the returned job_id before it
+      //    navigates away, so we can pass it to /finish.
+      let uploadedJobId = null;
+      const origDoUpload = doUpload;
+      function doUploadForFinish(blob, filename, durationSec, uploadOpts) {
+        // Override: upload, capture job_id, then finalize, then render done.
+        stopDraw();
+        stopStream(stream);
+        stream = null;
+        setTitle("上传中");
+        uploadVideo(blob, filename, box, null, durationSec, uploadOpts || {})
+          .then(async (job) => {
+            uploadedJobId = job.job_id;
+            // 2. Finalize the realtime session with the video job id.
+            if (rtSession && rtSession.session_id) {
+              try {
+                await api.json(
+                  `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      video_upload_job_id: uploadedJobId,
+                      capture_meta: (uploadOpts && uploadOpts.captureMeta) || null,
+                    }),
+                  }
+                );
+              } catch (_) {}
+            }
+            state.activeJobId = uploadedJobId;
+            go("/done");
+          })
+          .catch((err) => {
+            toast(err.message);
+            // Even if upload fails, try to finalize so accepted attempts
+            // are still persisted (without a linked source video).
+            if (rtSession && rtSession.session_id) {
+              api.json(
+                `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
+                { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+              ).catch(() => {});
+            }
+            go("/");
+          });
       }
-      // Stop the background recorder → its stop handler runs doUpload.
+      doUpload = doUploadForFinish; // type: ignore - local override
+
       if (recorder && recording) {
         recording = false;
-        try { recorder.stop(); } catch (_) {}
+        try { recorder.stop(); } catch (_) {} // triggers doUploadForFinish
       } else {
-        // Nothing recorded (recorder never started) — just leave.
+        // No recording (shouldn't happen post-P1 fix, but handle gracefully):
+        // finalize without a source video.
+        if (rtSession && rtSession.session_id) {
+          try {
+            await api.json(
+              `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
+              { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+            );
+          } catch (_) {}
+        }
         go("/");
       }
     }
@@ -1560,7 +1670,15 @@
         if (window.screen && window.screen.orientation && window.screen.orientation.lock) {
           window.screen.orientation.lock("portrait").catch(() => {});
         }
-        startBackgroundRecorder();
+        // P1: the background recorder is the only source of the uploaded
+        // video. If it cannot start, we MUST NOT begin a realtime session,
+        // because accepted attempts would otherwise have no audit video and
+        // the operator would believe a session was recorded when it wasn't.
+        const recOk = startBackgroundRecorder();
+        if (!recOk) {
+          disableRealtime("无法启动后台录像，实时称重不可用。请更换浏览器或重试。");
+          return;
+        }
         startRealtime();
       } catch (err) {
         disableRealtime("无法打开实时相机，请确认 HTTPS 与摄像头权限");
