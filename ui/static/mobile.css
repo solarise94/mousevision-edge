@@ -21,6 +21,11 @@
 
 * { box-sizing: border-box; }
 
+/* 与管理端 styles.css 保持一致：确保 [hidden] 永远生效，
+   防止 .btn / .rt-reconnect-overlay 等组件的 display:flex 覆盖浏览器内置隐藏，
+   导致“连接断开”遮罩、校准态“重测/确认”按钮等元素错误可见。 */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
