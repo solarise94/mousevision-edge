@@ -78,6 +78,7 @@ from ui.registry import MouseRegistry
 from ui.settings import SettingsStore
 from ui.users import SESSION_COOKIE, UserStore
 import ui.realtime_api as realtime_api
+import ui.scale_sync_api as scale_sync_api
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).resolve().parent / "static"
@@ -767,6 +768,10 @@ app = FastAPI(title="MouseVision Edge UI", lifespan=lifespan)
 # Realtime weighing WebSocket + REST API
 realtime_api.configure(DEFAULT_CONFIG, str(DEFAULT_OUTPUT))
 app.include_router(realtime_api.router)
+
+# Offline scale — phone clock calibration (MVP, see docs/SCALE_TIME_SYNC_MVP.md)
+scale_sync_api.configure(str(DEFAULT_OUTPUT))
+app.include_router(scale_sync_api.router)
 
 
 class _NoCacheStaticFiles(StaticFiles):

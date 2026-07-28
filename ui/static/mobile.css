@@ -964,3 +964,73 @@ html.camera-mode.record-light body {
 }
 .count-pill { font-size: 13px; color: var(--muted); }
 .warn-note { font-size: 12px; color: #9a6b00; margin-top: 3px; }
+
+/* ------------------------------------------------------------------ *
+ * 天平校时（测试）  docs/SCALE_TIME_SYNC_MVP.md
+ * ------------------------------------------------------------------ */
+.sclk-card { padding: 14px 16px; }
+.sclk-time {
+  font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; margin-top: 4px;
+}
+.sclk-tz { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.ssync-card { padding: 14px 16px; margin-top: 12px; }
+.ssync-card .section-head { margin-bottom: 10px; }
+.ssync-mini { font-size: 13px; padding: 6px 10px; margin-top: 8px; }
+
+/* progress bar */
+.ssync-progress { margin: 4px 0 8px; }
+.ssync-steps { display: flex; gap: 4px; }
+.ssync-step {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  font-size: 10px; color: var(--muted); position: relative;
+}
+.ssync-dot {
+  width: 22px; height: 22px; border-radius: 50%; background: var(--line);
+  color: var(--muted); display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600; margin-bottom: 4px;
+}
+.ssync-step.done .ssync-dot { background: var(--green); color: #fff; }
+.ssync-step.done { color: var(--green-dark); }
+.ssync-step.current .ssync-dot { box-shadow: 0 0 0 3px #b9dcc4; }
+.ssync-label { text-align: center; line-height: 1.2; }
+
+.ssync-pending { color: #9a6b00; }
+
+/* status colors */
+.ssync-result { border-left: 4px solid var(--green); }
+.ssync-result.yellow { border-left-color: #ffc107; }
+.ssync-result.red { border-left-color: var(--red); }
+.ssync-badge {
+  display: inline-block; padding: 5px 12px; border-radius: 999px;
+  font-size: 13px; font-weight: 600; margin-top: 8px;
+}
+.ssync-badge.green { background: var(--green-soft); color: var(--green-dark); }
+.ssync-badge.yellow { background: #fff5d6; color: #9a6b00; }
+.ssync-badge.red { background: #fce8ea; color: var(--red); }
+.ssync-warn { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: #9a6b00; }
+.ssync-warn li { margin: 2px 0; }
+
+/* readings table */
+.ssync-table-wrap { overflow-x: auto; margin-top: 10px; }
+.ssync-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.ssync-table th, .ssync-table td {
+  padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: left;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.ssync-table th { color: var(--muted); font-weight: 600; }
+
+/* modal for picking a CSV row */
+.ssync-modal {
+  position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,.55);
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.ssync-modal-card {
+  width: 100%; max-width: 560px; max-height: 86vh; overflow-y: auto;
+  border-radius: 16px 16px 0 0; margin: 0; padding: 16px;
+}
+.ssync-readings { max-height: 50vh; overflow-y: auto; }
+.ssync-reading { align-items: center; }
+.ssync-match-btns { display: flex; flex-direction: column; gap: 6px; }
+.ssync-actions { display: flex; gap: 10px; margin-top: 12px; }
+.ssync-actions .btn { flex: 1; margin-top: 0; }

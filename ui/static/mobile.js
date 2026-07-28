@@ -455,6 +455,9 @@
     content.appendChild(
       h("button", { class: "btn outline", onClick: () => go("/manage") }, "🗂  开始管理")
     );
+    content.appendChild(
+      h("button", { class: "btn ghost", onClick: () => go("/scale-sync") }, "⏱  天平校时（测试）")
+    );
 
     const recentCard = h("div", { class: "card", style: "margin-top:18px" });
     recentCard.appendChild(
@@ -2463,6 +2466,472 @@
     mount(screen);
   }
 
+  /* ================================================================== *
+   * 视图：天平校时（测试）  docs/SCALE_TIME_SYNC_MVP.md
+   *   新建会话 → 记开始锚点 → 记结束锚点 → 上传 CSV → 选两行 → 计算结果
+   * ================================================================== */
+
+  /* 手机时间格式化：精确到毫秒 */
+  function fmtPhoneTime(ms) {
+    const d = new Date(ms);
+    const p = (n, w) => String(n).padStart(w || 2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+  }
+
+  /* UTC 偏移分钟 -> +08:00 */
+  function fmtUtcOffset(min) {
+    if (min == null) return "";
+    const sign = min <= 0 ? "+" : "-";
+    const abs = Math.abs(min);
+    return `UTC${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+  }
+
+  function phoneTzInfo() {
+    let tz = "";
+    let offset = null;
+    try {
+      tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+      offset = -new Date().getTimezoneOffset();
+    } catch (_) {}
+    return { tz, offset };
+  }
+
+  /* 顶部手机时间条（100ms 刷新）。返回 { stop } 以便视图 cleanup。 */
+  function mountPhoneClock(parent) {
+    const timeEl = h("div", { class: "sclk-time" }, "--");
+    const tzEl = h("div", { class: "sclk-tz" }, "");
+    const card = h("div", { class: "card sclk-card" }, [
+      h("div", { class: "li-sub" }, "手机时间（用于匹配视频）"),
+      timeEl,
+      tzEl,
+    ]);
+    parent.appendChild(card);
+    const tick = () => {
+      timeEl.textContent = fmtPhoneTime(Date.now());
+      const { tz, offset } = phoneTzInfo();
+      tzEl.textContent = `${tz || "未知时区"}  ${fmtUtcOffset(offset)}`;
+    };
+    tick();
+    const timer = setInterval(tick, 100);
+    return { node: card, stop: () => clearInterval(timer) };
+  }
+
+  const SCALE_SYNC_API = {
+    createSession: (body) =>
+      api.json("/api/scale-sync/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    getSession: (sid) => api.json(`/api/scale-sync/sessions/${sid}`),
+    putAnchor: (sid, kind, body) =>
+      api.json(`/api/scale-sync/sessions/${sid}/anchors/${kind}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    deleteAnchor: (sid, kind) =>
+      api.json(`/api/scale-sync/sessions/${sid}/anchors/${kind}`, { method: "DELETE" }),
+    importCsv: (sid, file) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return api.json(`/api/scale-sync/sessions/${sid}/imports`, { method: "POST", body: fd });
+    },
+    readings: (sid, iid, q) =>
+      api.json(`/api/scale-sync/sessions/${sid}/imports/${iid}/readings` + (q ? `?query=${encodeURIComponent(q)}` : "")),
+    matchAnchor: (sid, kind, body) =>
+      api.json(`/api/scale-sync/sessions/${sid}/anchors/${kind}/match`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    calculate: (sid) => api.json(`/api/scale-sync/sessions/${sid}/calculate`, { method: "POST" }),
+  };
+
+  function fmtOffsetSec(ms) {
+    const s = (ms || 0) / 1000;
+    const sign = s >= 0 ? "慢" : "快";
+    return `天平比手机${sign} ${Math.abs(s).toFixed(1)} s`;
+  }
+
+  function fmtDrift(ppm) {
+    const perHour = ((ppm || 0) / 1_000_000) * 3600;
+    const sign = perHour >= 0 ? "快" : "慢";
+    return `天平每小时再${sign} ${Math.abs(perHour).toFixed(2)} s（${(ppm || 0).toFixed(0)} ppm）`;
+  }
+
+  async function viewScaleSync() {
+    const screen = h("div", { class: "screen" });
+    screen.appendChild(appbar("天平校时（测试）", { back: "/" }));
+    const content = h("div", { class: "content" });
+    screen.appendChild(content);
+    mount(screen);
+
+    const clockCtl = mountPhoneClock(content);
+
+    // 会话恢复：URL ?session_id= 优先，其次 sessionStorage
+    const urlSid = new URLSearchParams(location.search).get("session_id");
+    let sessionId = urlSid || sessionStorage.getItem("mv.scaleSync.sid") || "";
+
+    const statusEl = h("div", { class: "li-sub" }, "正在加载…");
+    content.appendChild(statusEl);
+    const bodyEl = h("div", {});
+    content.appendChild(bodyEl);
+
+    function persistSid(sid) {
+      sessionId = sid;
+      if (sid) {
+        sessionStorage.setItem("mv.scaleSync.sid", sid);
+        if (!urlSid) {
+          const u = new URL(location.href);
+          u.searchParams.set("session_id", sid);
+          history.replaceState({}, "", u.toString());
+        }
+      } else {
+        sessionStorage.removeItem("mv.scaleSync.sid");
+      }
+    }
+
+    async function refresh() {
+      if (!sessionId) {
+        statusEl.textContent = "";
+        renderNew();
+        return;
+      }
+      try {
+        const sess = await SCALE_SYNC_API.getSession(sessionId);
+        statusEl.textContent = "";
+        renderSession(sess);
+      } catch (err) {
+        statusEl.textContent = "";
+        bodyEl.innerHTML = "";
+        bodyEl.appendChild(sessionErrBox(err));
+      }
+    }
+
+    function sessionErrBox(err) {
+      const box = h("div", { class: "card" }, [
+        h("div", { class: "empty" }, err.message || "会话加载失败"),
+        h("button", { class: "btn outline", onClick: () => { persistSid(""); refresh(); } }, "新建校时"),
+      ]);
+      return box;
+    }
+
+    function renderNew() {
+      bodyEl.innerHTML = "";
+      bodyEl.appendChild(
+        h("div", { class: "card" }, [
+          h("div", { class: "li-sub" },
+            "为本次称量建立天平时钟与手机时间的换算关系。流程：放物体→记锚点→上传 CSV→选对应行→计算。"),
+          h("button", {
+            class: "btn primary",
+            onClick: async () => {
+              try {
+                const { tz } = phoneTzInfo();
+                const sess = await SCALE_SYNC_API.createSession({
+                  project_id: state.projectId || "default",
+                  scale_timezone: "Asia/Shanghai",
+                });
+                persistSid(sess.session_id);
+                void tz;
+                refresh();
+              } catch (err) { toast(err.message); }
+            },
+          }, "新建本次校时"),
+        ])
+      );
+    }
+
+    function progressBar(state) {
+      // state ∈ created / has-start / has-end / has-import / matched / calculated
+      const steps = ["新建会话", "记开始锚点", "记结束锚点", "上传 CSV", "选两条行", "计算结果"];
+      let idx = 0;
+      if (state === "calculated") idx = 5;
+      else if (state === "matched") idx = 4;
+      else if (state === "has-import") idx = 3;
+      else if (state === "has-end") idx = 2;
+      else if (state === "has-start") idx = 1;
+      return h("div", { class: "ssync-progress" }, [
+        h("div", { class: "ssync-steps" },
+          steps.map((s, i) =>
+            h("div", { class: "ssync-step" + (i <= idx ? " done" : "") + (i === idx ? " current" : "") }, [
+              h("span", { class: "ssync-dot" }, String(i + 1)),
+              h("span", { class: "ssync-label" }, s),
+            ])
+          )
+        ),
+      ]);
+    }
+
+    function sessionPhase(sess) {
+      const a = {};
+      (sess.anchors || []).forEach((x) => (a[x.kind] = x));
+      const hasImport = (sess.imports || []).length > 0;
+      if (sess.state === "calculated" || sess.calculated_model) return "calculated";
+      if (a.start && a.start.matched_row && a.end && a.end.matched_row) return "matched";
+      if (hasImport && a.start && a.end) return "has-import";
+      if (a.start && a.end) return "has-end";
+      if (a.start) return "has-start";
+      return "created";
+    }
+
+    function renderSession(sess) {
+      bodyEl.innerHTML = "";
+      bodyEl.appendChild(progressBar(sessionPhase(sess)));
+      const a = {};
+      (sess.anchors || []).forEach((x) => (a[x.kind] = x));
+      bodyEl.appendChild(anchorCard(sess, "start", a.start));
+      bodyEl.appendChild(anchorCard(sess, "end", a.end));
+      if (a.start && a.end) {
+        bodyEl.appendChild(importCard(sess));
+      }
+      if (a.start && a.start.matched_row && a.end && a.end.matched_row) {
+        bodyEl.appendChild(calculateCard(sess));
+      }
+      if (sess.calculated_model) {
+        bodyEl.appendChild(resultCard(sess));
+      }
+    }
+
+    function anchorCard(sess, kind, anchor) {
+      const title = kind === "start" ? "开始锚点" : "结束锚点";
+      const card = h("div", { class: "card ssync-card" });
+      card.appendChild(h("div", { class: "section-head" }, [h("h2", {}, title)]));
+      if (anchor) {
+        card.appendChild(h("div", { class: "li-sub" }, `手机时间：${fmtPhoneTime(anchor.client_epoch_ms)}`));
+        if (anchor.observed_weight_g != null)
+          card.appendChild(h("div", { class: "li-sub" }, `观察重量：${anchor.observed_weight_g} g`));
+        if (anchor.matched_row) {
+          const m = anchor.matched_row;
+          const phoneDelta = (anchor.client_epoch_ms - m.scale_epoch_ms) / 1000;
+          card.appendChild(
+            h("div", { class: "li-sub" },
+              `已绑定行 #${m.source_line_no}：天平 ${new Date(m.scale_epoch_ms).toLocaleString("zh-CN")} · ${m.weight_g} ${m.unit}（按钮与行相差 ${phoneDelta.toFixed(1)} s）`)
+          );
+        } else {
+          card.appendChild(h("div", { class: "li-sub ssync-pending" }, "尚未绑定 CSV 行"));
+        }
+        card.appendChild(
+          h("button", {
+            class: "btn ghost ssync-mini",
+            onClick: async () => {
+              if (!confirm(`确认删除${title}并重记？此操作会写审计记录。`)) return;
+              try {
+                await SCALE_SYNC_API.deleteAnchor(sess.session_id, kind);
+                refresh();
+              } catch (err) { toast(err.message); }
+            },
+          }, "删除并重记")
+        );
+      } else {
+        const weightInput = h("input", {
+          type: "number", step: "0.01", placeholder: "可选：观察到的稳定重量（g）", autocomplete: "off",
+        });
+        const nowLabel = h("div", { class: "li-sub" }, "");
+        const recBtn = h("button", { class: "btn outline" }, "确认记录");
+        const tick = () => (nowLabel.textContent = `当前手机时间：${fmtPhoneTime(Date.now())}`);
+        tick();
+        const t = setInterval(tick, 100);
+        recBtn.addEventListener("click", async () => {
+          if (!confirm(`确认记录${title}？`)) return;
+          try {
+            const { tz, offset } = phoneTzInfo();
+            await SCALE_SYNC_API.putAnchor(sess.session_id, kind, {
+              client_epoch_ms: Date.now(),
+              client_perf_ms: Math.round(performance.now() * 1000) / 1000,
+              client_timezone: tz,
+              client_utc_offset_minutes: offset,
+              observed_weight_g: weightInput.value ? parseFloat(weightInput.value) : null,
+              note: "",
+            });
+            clearInterval(t);
+            refresh();
+          } catch (err) { toast(err.message); }
+        });
+        card.appendChild(nowLabel);
+        card.appendChild(h("div", { class: "field" }, [weightInput]));
+        card.appendChild(recBtn);
+        // end anchor disabled until start exists is enforced by only showing
+        // this card when appropriate; here we also block if start missing.
+        if (kind === "end") {
+          const hasStart = (sess.anchors || []).some((x) => x.kind === "start");
+          if (!hasStart) {
+            recBtn.disabled = true;
+            recBtn.textContent = "需先记录开始锚点";
+          }
+        }
+      }
+      return card;
+    }
+
+    function importCard(sess) {
+      const card = h("div", { class: "card ssync-card" });
+      card.appendChild(h("div", { class: "section-head" }, [h("h2", {}, "从 U 盘上传 CSV")]));
+      const imports = sess.imports || [];
+      if (imports.length) {
+        imports.forEach((imp) => {
+          const s = imp.summary || {};
+          card.appendChild(
+            h("div", { class: "list-item", onClick: () => showReadings(sess, imp) }, [
+              h("div", { class: "li-main" }, [
+                h("div", { class: "li-title" }, imp.original_filename),
+                h("div", { class: "li-sub" },
+                  `${imp.sha256.slice(0, 12)}… · ${imp.byte_count} B · ${s.row_count} 行 · ${s.encoding || "?"}`),
+              ]),
+              h("span", { class: "count-pill" }, "查看读数"),
+            ])
+          );
+        });
+      }
+      const fileInput = h("input", { type: "file", accept: ".csv,text/csv" });
+      const uploadBtn = h("button", { class: "btn primary", onClick: async () => {
+        const f = fileInput.files && fileInput.files[0];
+        if (!f) { toast("请先选择文件"); return; }
+        try {
+          await SCALE_SYNC_API.importCsv(sess.session_id, f);
+          toast("上传成功");
+          refresh();
+        } catch (err) { toast(err.message); }
+      } }, "上传");
+      card.appendChild(h("div", { class: "field" }, [fileInput]));
+      card.appendChild(uploadBtn);
+      return card;
+    }
+
+    function calculateCard(sess) {
+      return h("div", { class: "card ssync-card" }, [
+        h("button", {
+          class: "btn primary",
+          onClick: async () => {
+            try { await SCALE_SYNC_API.calculate(sess.session_id); refresh(); }
+            catch (err) { toast(err.message); }
+          },
+        }, "计算校时"),
+      ]);
+    }
+
+    function resultCard(sess) {
+      const m = sess.calculated_model;
+      const level = (sess.warnings && sess.warnings.length) ? "yellow" : "green";
+      const lvl = (sess.calculated_model && sess.warnings && sess.warnings.some(w => w.includes("ppm") || w.includes("时区"))) ? "red" : level;
+      const card = h("div", { class: `card ssync-card ssync-result ${lvl}` });
+      card.appendChild(h("div", { class: "section-head" }, [h("h2", {}, "校时结果")]));
+      card.appendChild(h("div", { class: "li-main" }, `开始：${fmtOffsetSec(m.start_offset_ms)}`));
+      card.appendChild(h("div", { class: "li-main" }, `漂移：${fmtDrift(m.drift_ppm)}`));
+      const statusText = lvl === "red" ? "存在异常，请检查" : lvl === "yellow" ? "可用于本会话（有提醒）" : "可用于本会话的时间匹配";
+      card.appendChild(h("div", { class: `ssync-badge ${lvl}` }, statusText));
+      if (sess.warnings && sess.warnings.length) {
+        const w = h("ul", { class: "ssync-warn" });
+        sess.warnings.forEach((x) => w.appendChild(h("li", {}, x)));
+        card.appendChild(w);
+      }
+      // 映射预览
+      const preview = sess.readings_preview || [];
+      if (preview.length) {
+        card.appendChild(h("div", { class: "li-sub" }, "映射后读数预览（最多 20 行）："));
+        const tbl = h("table", { class: "ssync-table" });
+        tbl.appendChild(h("thead", {}, [h("tr", {}, [
+          h("th", {}, "行"), h("th", {}, "天平时间"), h("th", {}, "重量"),
+          h("th", {}, "手机时间"), h("th", {}, "状态"),
+        ])]));
+        const tb = h("tbody", {});
+        preview.forEach((r) => {
+          tb.appendChild(h("tr", {}, [
+            h("td", {}, String(r.source_line_no)),
+            h("td", {}, new Date(r.scale_epoch_ms).toLocaleString("zh-CN")),
+            h("td", {}, `${r.weight_g} ${r.unit || ""}`),
+            h("td", {}, fmtPhoneTime(r.phone_epoch_ms)),
+            h("td", {}, r.within_window ? "窗口内" : "窗口外·不可用"),
+          ]));
+        });
+        tbl.appendChild(tb);
+        card.appendChild(h("div", { class: "ssync-table-wrap" }, [tbl]));
+      }
+      // 下载摘要 + 新建
+      const dlBtn = h("button", { class: "btn outline" }, "下载校时摘要 JSON");
+      dlBtn.addEventListener("click", () => {
+        const blob = new Blob([JSON.stringify(sess, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `scale-sync-${sess.session_id.slice(0, 8)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+      card.appendChild(h("div", { class: "ssync-actions" }, [
+        dlBtn,
+        h("button", { class: "btn ghost", onClick: () => { persistSid(""); refresh(); } }, "开始新的校时"),
+      ]));
+      return card;
+    }
+
+    async function showReadings(sess, imp) {
+      const overlay = h("div", {
+        class: "ssync-modal",
+        onClick: (e) => { if (e.target === overlay) overlay.remove(); },
+      }, []);
+      const box = h("div", { class: "card ssync-modal-card" });
+      box.appendChild(h("div", { class: "section-head" }, [
+        h("h2", {}, `读数 · ${imp.original_filename}`),
+        h("button", { class: "link", onClick: () => overlay.remove() }, "关闭 ✕"),
+      ]));
+      const a = {};
+      (sess.anchors || []).forEach((x) => (a[x.kind] = x));
+      const filterInput = h("input", { placeholder: "筛选（重量/行内容）", autocomplete: "off" });
+      const defaultW = a.start && a.start.observed_weight_g;
+      if (defaultW) filterInput.value = String(defaultW);
+      const listWrap = h("div", { class: "ssync-readings" }, [h("div", { class: "empty" }, "加载中…")]);
+      box.appendChild(h("div", { class: "field" }, [filterInput]));
+      box.appendChild(listWrap);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      async function loadList() {
+        listWrap.innerHTML = "";
+        listWrap.appendChild(h("div", { class: "empty" }, "加载中…"));
+        try {
+          const q = filterInput.value.trim();
+          const data = await SCALE_SYNC_API.readings(sess.session_id, imp.import_id, q);
+          listWrap.innerHTML = "";
+          if (!data.items.length) {
+            listWrap.appendChild(h("div", { class: "empty" }, "没有匹配的读数"));
+            return;
+          }
+          data.items.forEach((r) => {
+            listWrap.appendChild(
+              h("div", { class: "list-item ssync-reading" }, [
+                h("div", { class: "li-main" }, [
+                  h("div", { class: "li-title" }, `#${r.source_line_no} · ${r.weight_g} ${r.unit || ""}`),
+                  h("div", { class: "li-sub" }, `${new Date(r.scale_epoch_ms).toLocaleString("zh-CN")} · ${r.raw_line}`),
+                ]),
+                h("div", { class: "ssync-match-btns" }, [
+                  h("button", { class: "btn ghost ssync-mini", onClick: () => doMatch("start", r) }, "设为开始"),
+                  h("button", { class: "btn ghost ssync-mini", onClick: () => doMatch("end", r) }, "设为结束"),
+                ]),
+              ])
+            );
+          });
+        } catch (err) { listWrap.innerHTML = ""; listWrap.appendChild(h("div", { class: "empty" }, err.message)); }
+      }
+
+      async function doMatch(kind, r) {
+        try {
+          await SCALE_SYNC_API.matchAnchor(sess.session_id, kind, {
+            import_id: imp.import_id, source_line_no: r.source_line_no,
+          });
+          toast(`${kind === "start" ? "开始" : "结束"}锚点已绑定行 #${r.source_line_no}`);
+          overlay.remove();
+          refresh();
+        } catch (err) { toast(err.message); }
+      }
+
+      filterInput.addEventListener("input", () => { clearTimeout(filterInput._t); filterInput._t = setTimeout(loadList, 250); });
+      loadList();
+    }
+
+    await refresh();
+    return () => clockCtl.stop();
+  }
+
   /* ------------------------------------------------------------------ *
    * 路由注册
    * ------------------------------------------------------------------ */
@@ -2475,6 +2944,7 @@
   route("/manage", viewManage);
   route("/manage/new", viewBoxNew);
   route("/settings", viewSettings);
+  route("/scale-sync", viewScaleSync);
 
   const HERO_SVG = `
 <svg viewBox="0 0 320 180" fill="none" xmlns="http://www.w3.org/2000/svg">

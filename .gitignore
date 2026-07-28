@@ -51,3 +51,4 @@ compose.deploy.yaml
 # 本地凭证 / 环境
 .env
 .env.*
+gui-test-screenshots/
