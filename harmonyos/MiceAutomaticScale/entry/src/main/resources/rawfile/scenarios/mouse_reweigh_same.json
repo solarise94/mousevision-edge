@@ -1,0 +1,22 @@
+{
+  "name": "mouse_reweigh_same",
+  "repeat": false,
+  "description": "同一只鼠称两次：上秤 → 稳定 26.3g → 离开 → 短暂空秤 → 再次上秤稳定 26.3g（计划 §9.2 场景 4）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 1500, "grams": 8.1 },
+    { "atMs": 1900, "grams": 19.7 },
+    { "atMs": 2400, "grams": 26.2 },
+    { "atMs": 2800, "grams": 26.3 },
+    { "atMs": 3200, "grams": 26.3 },
+    { "atMs": 3600, "grams": 26.3 },
+    { "atMs": 6000, "grams": 0.0 },
+    { "atMs": 7500, "grams": 9.4 },
+    { "atMs": 8000, "grams": 22.5 },
+    { "atMs": 8500, "grams": 26.2 },
+    { "atMs": 8900, "grams": 26.3 },
+    { "atMs": 9300, "grams": 26.3 },
+    { "atMs": 9700, "grams": 26.3 },
+    { "atMs": 12000, "grams": 0.0 }
+  ]
+}

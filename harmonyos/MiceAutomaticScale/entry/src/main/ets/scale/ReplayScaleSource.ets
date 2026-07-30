@@ -17,7 +17,7 @@
 import type { ScaleSourceKind } from './ScaleReading';
 import { ScaleSourceBase, type MonotonicClock } from './ScaleSource';
 import {
-  parse, fromHexSpaces, ParseOk, ParseResult,
+  parse, fromHexSpaces, ParseOk, ParseReject, ParseResult,
 } from './K797AdvertisementParser';
 import type { ScaleDiagnostics } from '../diagnostics/ScaleDiagnostics';
 
@@ -144,7 +144,7 @@ export class ReplayScaleSource extends ScaleSourceBase {
     const waitReal = offsetMs / this.speed;
     const elapsedReal = this.clock.nowMs() - this.playbackStartMonoMs;
     const remain = Math.max(0, waitReal - elapsedReal);
-    this.timerId = setTimeout(() => this.flushDue(), remain) as unknown as number;
+    this.timerId = setTimeout(() => this.flushDue(), remain) as number;
   }
 
   private flushDue(): void {
@@ -173,7 +173,7 @@ export class ReplayScaleSource extends ScaleSourceBase {
 
   private cancelTimer(): void {
     if (this.timerId !== -1 && typeof clearTimeout !== 'undefined') {
-      clearTimeout(this.timerId as unknown as ReturnType<typeof setTimeout>);
+      clearTimeout(this.timerId);
       this.timerId = -1;
     }
   }
@@ -196,7 +196,7 @@ export class ReplayScaleSource extends ScaleSourceBase {
       if (result.ok) {
         this.diagnostics.recordAccepted();
       } else {
-        this.diagnostics.recordReject(result.reason);
+        this.diagnostics.recordReject((result as ParseReject).reason);
       }
     }
     if (result.ok) {

@@ -1,0 +1,15 @@
+{
+  "name": "mouse_normal_26_3g",
+  "repeat": false,
+  "description": "单只鼠正常上秤 → 爬升 → 稳定 26.3g → 离开归零（计划 §9.2 场景 1）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 1500, "grams": 8.1 },
+    { "atMs": 1900, "grams": 19.7 },
+    { "atMs": 2400, "grams": 26.2 },
+    { "atMs": 2800, "grams": 26.3 },
+    { "atMs": 3200, "grams": 26.3 },
+    { "atMs": 3600, "grams": 26.3 },
+    { "atMs": 9000, "grams": 0.0 }
+  ]
+}
