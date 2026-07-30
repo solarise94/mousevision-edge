@@ -159,10 +159,12 @@ export function fromHexSpaces(hex: string): Uint8Array {
   return out;
 }
 
-/** 构造设备主键：k797:<manufacturerIdHex>:<prefixHex>。 */
+/** 构造设备主键：k797:<manufacturerIdHex>:<prefixHex>。
+ *  hex 必须小写，与 Python 侧 _DEVICE_KEY 及计划 §5.1 契约
+ *  （k797:0000:cae803280895ca0210）保持一致；payloadHex 显示另用大写。 */
 export function buildDeviceKey(manufacturerId: number, prefix: number[]): string {
-  const idHex = manufacturerId.toString(16).toUpperCase().padStart(4, '0');
-  const prefixHex = prefix.map(b => b.toString(16).toUpperCase().padStart(2, '0')).join('');
+  const idHex = manufacturerId.toString(16).toLowerCase().padStart(4, '0');
+  const prefixHex = prefix.map(b => b.toString(16).toLowerCase().padStart(2, '0')).join('');
   return `k797:${idHex}:${prefixHex}`;
 }
 
