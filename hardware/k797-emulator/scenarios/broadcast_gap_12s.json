@@ -1,0 +1,12 @@
+{
+  "name": "broadcast_gap_12s",
+  "repeat": false,
+  "_note": "稳定 26.3g 后产生 12000ms 广播中断，用于验证 receiver 的 stale 判定（>10s 无合法包即 stale，不得误判为 0g）与广播恢复后自动回 active。本 JSON 与 src/scenarios.h 中 kBroadcastGap12s 完全一致：静默事件在 atMs 触发，停止广播 durationMs，结束后自动恢复到上一个固定重量。",
+  "description": "稳定重量后产生 12 秒广播中断，验证 stale 与恢复（计划 §9.2 场景 6）。",
+  "events": [
+    { "atMs": 2000, "grams": 26.3 },
+    { "atMs": 4000, "silence": true, "durationMs": 12000 },
+    { "atMs": 16000, "grams": 26.3 },
+    { "atMs": 20000, "grams": 0.0 }
+  ]
+}

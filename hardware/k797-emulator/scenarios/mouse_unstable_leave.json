@@ -1,0 +1,17 @@
+{
+  "name": "mouse_unstable_leave",
+  "repeat": false,
+  "description": "鼠未稳定就离开：重量爬到约 24g 后持续抖动、无法连续 3 次稳定，随后直接归零（计划 §9.2 场景 3）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 1200, "grams": 14.5 },
+    { "atMs": 1600, "grams": 22.8 },
+    { "atMs": 2000, "grams": 24.0 },
+    { "atMs": 2400, "grams": 23.7 },
+    { "atMs": 2800, "grams": 24.2 },
+    { "atMs": 3200, "grams": 23.9 },
+    { "atMs": 3600, "grams": 24.1 },
+    { "atMs": 4000, "grams": 23.6 },
+    { "atMs": 5000, "grams": 0.0 }
+  ]
+}

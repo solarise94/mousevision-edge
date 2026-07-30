@@ -1,0 +1,17 @@
+{
+  "name": "repeated_out_of_order",
+  "repeat": false,
+  "_note": "同一重量连续重复、随后一次倒序跳变，再恢复正确读数。序列的有序性与重复性是在 receiver 侧（后端按单调 sequence 与新鲜度过滤）校验的，模拟器本身只按 atMs 时间线回放固定重量，因此本场景只负责产生这种原始时序。",
+  "description": "重复与乱序读数（计划 §9.2 场景 7）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 1500, "grams": 26.2 },
+    { "atMs": 1900, "grams": 26.3 },
+    { "atMs": 2300, "grams": 26.3 },
+    { "atMs": 2700, "grams": 26.3 },
+    { "atMs": 3100, "grams": 25.9 },
+    { "atMs": 3500, "grams": 26.3 },
+    { "atMs": 3900, "grams": 26.3 },
+    { "atMs": 6000, "grams": 0.0 }
+  ]
+}

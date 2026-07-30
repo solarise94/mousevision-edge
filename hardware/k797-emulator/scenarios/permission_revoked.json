@@ -1,0 +1,15 @@
+{
+  "name": "permission_revoked",
+  "repeat": false,
+  "_note": "模拟运行中扫描权限被撤销：receiver 进入 unauthorized 状态。固件侧用最后一个事件后停止广播来表达（无恢复事件），receiver 应据此触发权限/停止扫描路径，而不是误判为 stale 或 0g。",
+  "description": "运行中权限撤销：正常读数后停止广播且不再恢复（计划 §9.2 场景 8）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 1500, "grams": 8.1 },
+    { "atMs": 2400, "grams": 26.2 },
+    { "atMs": 2800, "grams": 26.3 },
+    { "atMs": 3200, "grams": 26.3 },
+    { "atMs": 3600, "grams": 26.3 },
+    { "atMs": 6000, "silence": true, "durationMs": 600000 }
+  ]
+}

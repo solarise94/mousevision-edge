@@ -1,0 +1,18 @@
+{
+  "name": "mouse_batch_5",
+  "repeat": false,
+  "description": "连续五只鼠，每只之间以空秤归零间隔（计划 §9.2 场景 5）。本 JSON 与 src/scenarios.h 中 kMouseBatch5 完全一致（18.2/21.0/24.6/26.3/29.9g）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 1000, "grams": 18.2 },
+    { "atMs": 3000, "grams": 0.0 },
+    { "atMs": 4500, "grams": 21.0 },
+    { "atMs": 6500, "grams": 0.0 },
+    { "atMs": 8000, "grams": 24.6 },
+    { "atMs": 10000, "grams": 0.0 },
+    { "atMs": 11500, "grams": 26.3 },
+    { "atMs": 13500, "grams": 0.0 },
+    { "atMs": 15000, "grams": 29.9 },
+    { "atMs": 17000, "grams": 0.0 }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "mouse_fast_jump",
+  "repeat": false,
+  "description": "重量快速跳变后稳定：直接冲到约 25g，再小幅收敛到 26.3g 后离开（计划 §9.2 场景 2）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 600, "grams": 25.0 },
+    { "atMs": 1200, "grams": 26.2 },
+    { "atMs": 1600, "grams": 26.3 },
+    { "atMs": 2000, "grams": 26.3 },
+    { "atMs": 2400, "grams": 26.3 },
+    { "atMs": 2401, "grams": 26.3 },
+    { "atMs": 7000, "grams": 0.0 }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "soak_cycle_60s",
+  "repeat": true,
+  "description": "60 秒称量/清零循环，专为 LOOP 设计，用于 4 小时长时浸泡（计划 §9.2 场景 9）。60000ms 周期 × 240 次 ≈ 4 小时。本 JSON 与 src/scenarios.h 中 kSoakCycle60s 完全一致：末事件 atMs=60000 与起点 0.0 对齐，保证循环边界重量连续。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 5000, "grams": 25.0 },
+    { "atMs": 15000, "grams": 25.0 },
+    { "atMs": 17000, "grams": 0.0 },
+    { "atMs": 30000, "grams": 30.0 },
+    { "atMs": 40000, "grams": 30.0 },
+    { "atMs": 42000, "grams": 0.0 },
+    { "atMs": 60000, "grams": 0.0 }
+  ]
+}

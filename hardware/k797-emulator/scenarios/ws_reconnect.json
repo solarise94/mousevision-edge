@@ -1,0 +1,17 @@
+{
+  "name": "ws_reconnect",
+  "repeat": false,
+  "_note": "模拟网页/WebSocket 断线重连：稳定 26.3g 期间产生一次短暂静默（广播仍在但 receiver 暂时不收），恢复后重量不变。latest-only 发送语义（重连后只发最新一条读数、不补发整段过期队列）是在页面侧校验的，本场景只负责产生连续重量与一次短暂中断。",
+  "description": "网页/WebSocket 断线重连：稳定期间一次短暂中断后恢复同重量（计划 §9.2 场景 10）。",
+  "events": [
+    { "atMs": 0, "grams": 0.0 },
+    { "atMs": 1500, "grams": 8.1 },
+    { "atMs": 2400, "grams": 26.2 },
+    { "atMs": 2800, "grams": 26.3 },
+    { "atMs": 3200, "grams": 26.3 },
+    { "atMs": 4000, "silence": true, "durationMs": 3000 },
+    { "atMs": 7001, "grams": 26.3 },
+    { "atMs": 9000, "grams": 26.3 },
+    { "atMs": 11000, "grams": 0.0 }
+  ]
+}
