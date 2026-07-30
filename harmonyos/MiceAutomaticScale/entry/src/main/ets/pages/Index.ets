@@ -25,6 +25,7 @@ import { ScaleDiagnostics } from '../diagnostics/ScaleDiagnostics';
 import { ScaleSource, WallClock, type MonotonicClock } from '../scale/ScaleSource';
 import { ScriptScaleSource, type Scenario, type ScenarioEvent, type GramsEvent, type GapEvent, type RevokeEvent } from '../scale/ScriptScaleSource';
 import { ReplayScaleSource } from '../scale/ReplayScaleSource';
+import { BleK797Source } from '../scale/BleK797Source';
 import type { ScaleStatus } from '../scale/ScaleStatus';
 import type { ScaleReading } from '../scale/ScaleReading';
 
@@ -39,6 +40,7 @@ const SCENARIO_NAMES: string[] = [
   'repeated_out_of_order',
   'permission_revoked',
   'ws_reconnect',
+  'soak_cycle_60s',
 ];
 
 /**
@@ -191,8 +193,17 @@ struct Index {
     this.bridge = new ScaleWebBridge(this.webController, host, this.diagnostics);
     this.diagnostics.setSource(this.scaleSource.sourceName);
     this.attachCallbacks(this.scaleSource);
-    // 默认 script 源预加载一个场景，便于点 start 即可演练。
-    this.loadScenarioInto('mouse_normal_26_3g');
+    // 默认源：EntryAbility 已请求蓝牙权限并把结果存 AppStorage('bluetoothGranted')。
+    // 已授权则默认 BLE 实时源（不自动 start，等用户/网页触发，避免无谓扫描耗电）；
+    // 未授权则用 script 源并预加载场景，便于无 BLE 环境演练全部异常场景。
+    const granted = AppStorage.get<boolean>('bluetoothGranted');
+    if (granted === true) {
+      const b = new BleK797Source(this.clock, this.diagnostics);
+      this.switchSource(b, 'ble');
+      this.currentScenario = '(BLE 实时扫描)';
+    } else {
+      this.loadScenarioInto('mouse_normal_26_3g');
+    }
   }
 
   /** 给某个源绑定读数/状态回调（切源时对新源重新绑定）。 */
@@ -257,8 +268,11 @@ struct Index {
       this.loadReplayInto(r);
       this.switchSource(r, 'replay');
     } else {
-      // 'ble'：阶段 3 接入 BleK797Source；此处仅提示，不实例化以免引入未就绪源。
-      this.statusText = 'BLE 源待阶段 3 接入';
+      // 'ble'：真实 BLE 扫描源（K797 不可连接广播）。start 时才真正扫描，
+      // 此处仅实例化与切换；蓝牙未开/权限不足会在 start 时转 bluetooth_off/unauthorized。
+      const b = new BleK797Source(this.clock, this.diagnostics);
+      this.switchSource(b, 'ble');
+      this.currentScenario = '(BLE 实时扫描)';
     }
   }
 
@@ -333,6 +347,12 @@ struct Index {
         Row({ space: 8 }) {
           Button('脚本源').onClick(() => this.selectSource('script')).fontSize(12).layoutWeight(1)
           Button('回放源').onClick(() => this.selectSource('replay')).fontSize(12).layoutWeight(1)
+          Button('BLE源').onClick(() => this.selectSource('ble')).fontSize(12).layoutWeight(1)
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, bottom: 4 })
+
+        Row({ space: 8 }) {
           Button('开始').onClick(() => this.startScan()).fontSize(12).layoutWeight(1)
           Button('停止').onClick(() => this.stopScan()).fontSize(12).layoutWeight(1)
         }
