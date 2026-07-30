@@ -20,10 +20,81 @@
 import { webview } from '@kit.ArkWeb';
 import { ScaleWebBridge, type BridgeHost, type SourceSelector, TRUSTED_URL } from '../bridge/ScaleWebBridge';
 import { ScaleDiagnostics } from '../diagnostics/ScaleDiagnostics';
-import type { ScaleSource } from '../scale/ScaleSource';
+import { ScaleSource, WallClock } from '../scale/ScaleSource';
 import { ScriptScaleSource } from '../scale/ScriptScaleSource';
 import type { ScaleStatus } from '../scale/ScaleStatus';
 import type { ScaleReading } from '../scale/ScaleReading';
+
+/**
+ * BridgeHost 的 ArkTS 合规实现。
+ * arkts-no-untyped-obj-literals 要求：含方法的对象字面量必须对应 class。
+ * 通过构造注入闭包把命令转发给外层 struct。
+ */
+class IndexBridgeHost implements BridgeHost {
+  private readonly startScaleScanCb: () => void;
+  private readonly stopScaleScanCb: () => void;
+  private readonly getScaleStatusJsonCb: () => string;
+  private readonly selectScaleSourceCb: (name: SourceSelector) => void;
+  private readonly loadScaleScenarioCb: (name: string) => void;
+
+  constructor(
+    startScaleScanCb: () => void,
+    stopScaleScanCb: () => void,
+    getScaleStatusJsonCb: () => string,
+    selectScaleSourceCb: (name: SourceSelector) => void,
+    loadScaleScenarioCb: (name: string) => void,
+  ) {
+    this.startScaleScanCb = startScaleScanCb;
+    this.stopScaleScanCb = stopScaleScanCb;
+    this.getScaleStatusJsonCb = getScaleStatusJsonCb;
+    this.selectScaleSourceCb = selectScaleSourceCb;
+    this.loadScaleScenarioCb = loadScaleScenarioCb;
+  }
+
+  startScaleScan(): void {
+    this.startScaleScanCb();
+  }
+
+  stopScaleScan(): void {
+    this.stopScaleScanCb();
+  }
+
+  getScaleStatusJson(): string {
+    return this.getScaleStatusJsonCb();
+  }
+
+  selectScaleSource(name: SourceSelector): void {
+    this.selectScaleSourceCb(name);
+  }
+
+  loadScaleScenario(name: string): void {
+    this.loadScaleScenarioCb(name);
+  }
+}
+
+/**
+ * javaScriptProxy 参数的 ArkTS 合规实现。
+ * API 24 起 javaScriptProxy 只接收单个 JavaScriptProxy 类型对象，
+ * 且 ArkTS 禁止无类型对象字面量，故实现该接口的 class。
+ */
+class ScaleJavaScriptProxy implements JavaScriptProxy {
+  object: object;
+  name: string;
+  methodList: Array<string>;
+  controller: webview.WebviewController;
+
+  constructor(
+    object: object,
+    name: string,
+    methodList: Array<string>,
+    controller: webview.WebviewController,
+  ) {
+    this.object = object;
+    this.name = name;
+    this.methodList = methodList;
+    this.controller = controller;
+  }
+}
 
 /** EntryAbility 与页面共享的能力通道（AppStorage key = 'scaleAbilityContext'）。 */
 export interface ScaleAbilityContext {
@@ -41,7 +112,7 @@ struct Index {
   private webController: webview.WebviewController = new webview.WebviewController();
   private bridge: ScaleWebBridge | null = null;
   private diagnostics: ScaleDiagnostics = new ScaleDiagnostics();
-  private scaleSource: ScaleSource = new ScriptScaleSource();
+  private scaleSource: ScaleSource = new ScriptScaleSource(new WallClock());
 
   /** 页面顶部展示的当前天平状态（简化；详细重量在网页内显示）。 */
   @State statusText: string = '未启动';
@@ -50,13 +121,13 @@ struct Index {
   private lastReadingAtEpochMs: number | null = null;
 
   aboutToAppear(): void {
-    const host: BridgeHost = {
-      startScaleScan: () => this.startScan(),
-      stopScaleScan: () => this.stopScan(),
-      getScaleStatusJson: () => this.currentStatusJson(),
-      selectScaleSource: (name: SourceSelector) => this.selectSource(name),
-      loadScaleScenario: (name: string) => this.loadScenario(name),
-    };
+    const host: BridgeHost = new IndexBridgeHost(
+      () => this.startScan(),
+      () => this.stopScan(),
+      () => this.currentStatusJson(),
+      (name: SourceSelector) => this.selectSource(name),
+      (name: string) => this.loadScenario(name),
+    );
     this.bridge = new ScaleWebBridge(this.webController, host, this.diagnostics);
     this.diagnostics.setSource(this.scaleSource.sourceName);
 
@@ -123,14 +194,16 @@ struct Index {
 
       Web({ src: TRUSTED_URL, controller: this.webController })
         .javaScriptAccess(true)
-        .javaScriptProxy({
-          object: this.bridge?.getProxyObject(),
-          name: 'MiceAutomaticScale',
-          methodList: this.bridge
-            ? this.bridge.getReleaseMethodNames().concat(this.bridge.getDebugMethodNames())
-            : ['startScaleScan', 'stopScaleScan', 'getScaleStatus'],
-          controller: this.webController,
-        })
+        .javaScriptProxy(
+          new ScaleJavaScriptProxy(
+            this.bridge !== null ? this.bridge.getProxyObject() : new Object(),
+            'MiceAutomaticScale',
+            this.bridge !== null
+              ? this.bridge.getReleaseMethodNames().concat(this.bridge.getDebugMethodNames())
+              : ['startScaleScan', 'stopScaleScan', 'getScaleStatus'],
+            this.webController,
+          ),
+        )
         .domStorageAccess(true)
         .onPageEnd(() => {
           // 页面加载完成后重新握手，重推当前状态。

@@ -24,6 +24,27 @@ export type ScaleSourceKind = 'ble' | 'replay' | 'script' | 'hardware_emulator';
 export type StableSource = 'derived_repeat';
 
 /**
+ * ScaleReading 构造参数。提取为独立 interface，避免 ArkTS 严格模式下
+ * 禁止把对象字面量类型直接用作参数类型（arkts-no-obj-literals-as-types），
+ * 同时让所有 `new ScaleReading({...})` 调用处自动获得类型，无需内联标注。
+ */
+export interface ScaleReadingParams {
+  device: string;
+  deviceKey: string;
+  grams: number;
+  raw: number;
+  rssi: number | null;
+  receivedAt: string;
+  receivedAtEpochMs: number;
+  sequence: number;
+  stable: boolean;
+  stableSource: StableSource | null;
+  source: ScaleSourceKind;
+  address: string;
+  payloadHex: string;
+}
+
+/**
  * 不可变读数。ArkTS 严格模式下使用 class + 只读字段；
  * 构造完成后不再可变，所有变更由来源重新生成新实例。
  */
@@ -57,21 +78,7 @@ export class ScaleReading {
   /** 完整 payload 的空格分隔大写十六进制，仅诊断与数据集积累。 */
   readonly payloadHex: string;
 
-  constructor(params: {
-    device: string;
-    deviceKey: string;
-    grams: number;
-    raw: number;
-    rssi: number | null;
-    receivedAt: string;
-    receivedAtEpochMs: number;
-    sequence: number;
-    stable: boolean;
-    stableSource: StableSource | null;
-    source: ScaleSourceKind;
-    address: string;
-    payloadHex: string;
-  }) {
+  constructor(params: ScaleReadingParams) {
     this.device = params.device;
     this.deviceKey = params.deviceKey;
     this.grams = params.grams;

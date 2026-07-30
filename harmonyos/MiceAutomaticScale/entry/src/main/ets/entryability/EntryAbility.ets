@@ -15,25 +15,62 @@
  */
 
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
-import { abilityAccessController, Permissions } from '@kit.AbilityKit';
+import { abilityAccessCtrl, Permissions, PermissionRequestResult } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import type { ScaleAbilityContext } from '../pages/Index';
 
+/**
+ * ScaleAbilityContext 的 ArkTS 合规实现。
+ * arkts-no-untyped-obj-literals 要求：含方法的对象字面量必须对应 class。
+ * 把三个回调以构造注入方式实现为方法。
+ */
+class AbilityContextImpl implements ScaleAbilityContext {
+  private readonly onForegroundCb: () => void;
+  private readonly onBackgroundCb: () => void;
+  private readonly requestBluetoothPermissionCb: () => void;
+
+  constructor(
+    onForegroundCb: () => void,
+    onBackgroundCb: () => void,
+    requestBluetoothPermissionCb: () => void,
+  ) {
+    this.onForegroundCb = onForegroundCb;
+    this.onBackgroundCb = onBackgroundCb;
+    this.requestBluetoothPermissionCb = requestBluetoothPermissionCb;
+  }
+
+  onForeground(): void {
+    this.onForegroundCb();
+  }
+
+  onBackground(): void {
+    this.onBackgroundCb();
+  }
+
+  requestBluetoothPermission(): void {
+    this.requestBluetoothPermissionCb();
+  }
+}
+
 export default class EntryAbility extends UIAbility {
   private scaleContext: ScaleAbilityContext | null = null;
+  private windowStage: window.WindowStage | null = null;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     // 应用创建；可在此初始化全局对象。
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
+    // 缓存 windowStage 供 handleForeground/handleBackground 调用。
+    this.windowStage = windowStage;
+
     // 把 ability 引用通过 'entryAbility' 全局通道暴露给页面，
     // 页面用它接收前后台事件与权限结果。
-    const ctx: ScaleAbilityContext = {
-      onForeground: () => this.handleForeground(),
-      onBackground: () => this.handleBackground(),
-      requestBluetoothPermission: () => this.requestBluetoothPermission(),
-    };
+    const ctx: ScaleAbilityContext = new AbilityContextImpl(
+      () => this.handleForeground(),
+      () => this.handleBackground(),
+      () => this.requestBluetoothPermission(),
+    );
     this.scaleContext = ctx;
     AppStorage.setOrCreate<ScaleAbilityContext>('scaleAbilityContext', ctx);
 
@@ -49,6 +86,7 @@ export default class EntryAbility extends UIAbility {
 
   onWindowStageDestroy(): void {
     this.scaleContext = null;
+    this.windowStage = null;
   }
 
   onForeground(): void {
@@ -86,13 +124,15 @@ export default class EntryAbility extends UIAbility {
   private requestBluetoothPermission(): void {
     const permissions: Permissions[] = ['ohos.permission.ACCESS_BLUETOOTH'];
     try {
-      const controller = abilityAccessController.create(this.context);
-      controller.requestPermissionsFromUser(permissions).then((data) => {
-        const granted = data.authResults.every((r) => r === 0);
-        AppStorage.setOrCreate<boolean>('bluetoothGranted', granted);
-      }).catch(() => {
-        AppStorage.setOrCreate<boolean>('bluetoothGranted', false);
-      });
+      const controller: abilityAccessCtrl.AtManager = abilityAccessCtrl.createAtManager();
+      controller.requestPermissionsFromUser(this.context, permissions)
+        .then((data: PermissionRequestResult) => {
+          const granted: boolean = data.authResults.every((r: number) => r === 0);
+          AppStorage.setOrCreate<boolean>('bluetoothGranted', granted);
+        })
+        .catch((reason: Object) => {
+          AppStorage.setOrCreate<boolean>('bluetoothGranted', false);
+        });
     } catch (e) {
       AppStorage.setOrCreate<boolean>('bluetoothGranted', false);
     }

@@ -184,8 +184,15 @@ export function toIsoUtc(epochMs: number): string {
   return `${yyyy}-${MM}-${dd}T${hh}:${mm}:${ss}.${sss}Z`;
 }
 
+/** civilFromDays 的返回结构。提取为 interface，避免对象字面量类型用作返回类型。 */
+interface CivilDate {
+  year: number;
+  month: number;
+  day: number;
+}
+
 /** Howard Hinnant 的 civil_from_days 算法，无时区依赖。 */
-function civilFromDays(z: number): { year: number; month: number; day: number } {
+function civilFromDays(z: number): CivilDate {
   const Z = z + 719468;
   const era = Math.floor(Z >= 0 ? Z : Z - 146096) / 146097;
   const doe = Math.floor(Z - era * 146097);
@@ -196,5 +203,6 @@ function civilFromDays(z: number): { year: number; month: number; day: number } 
   const d = doy - Math.floor((153 * mp + 2) / 5) + 1;
   const m = mp < 10 ? mp + 3 : mp - 9;
   const year = m <= 2 ? y + 1 : y;
-  return { year, month: m, day: d };
+  const result: CivilDate = { year, month: m, day: d };
+  return result;
 }

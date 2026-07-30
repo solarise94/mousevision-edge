@@ -24,6 +24,19 @@ export type ScaleState =
   | 'bluetooth_off'
   | 'error';
 
+/**
+ * ScaleStatus 构造参数。提取为独立 interface，避免 ArkTS 严格模式下
+ * 禁止把对象字面量类型直接用作参数类型（arkts-no-obj-literals-as-types），
+ * 同时让所有 `new ScaleStatus({...})` 调用处自动获得类型。
+ */
+export interface ScaleStatusParams {
+  device: string;
+  state: ScaleState;
+  message: string;
+  lastReadingAtEpochMs: number | null;
+  source: ScaleSourceKind | null;
+}
+
 /** 不可变状态快照。 */
 export class ScaleStatus {
   readonly device: string;
@@ -34,13 +47,7 @@ export class ScaleStatus {
   /** 当前读数来源。 */
   readonly source: ScaleSourceKind | null;
 
-  constructor(params: {
-    device: string;
-    state: ScaleState;
-    message: string;
-    lastReadingAtEpochMs: number | null;
-    source: ScaleSourceKind | null;
-  }) {
+  constructor(params: ScaleStatusParams) {
     this.device = params.device;
     this.state = params.state;
     this.message = params.message;

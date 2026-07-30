@@ -34,10 +34,13 @@ import {
 /** 速度倍率。 */
 export type SpeedMultiplier = 0.5 | 1 | 2 | 4;
 
-/** 场景中的事件（联合类型）。 */
-export interface GramsEvent { atMs: number; grams: number; seqOverride?: number; }
-export interface GapEvent { atMs: number; gap: number; }
-export interface RevokeEvent { atMs: number; revoke: 'permission'; }
+/**
+ * 场景中的事件（联合类型）。ArkTS 禁止类型谓词（`x is Y`），
+ * 故用 `type` 字面量判别字段区分联合分支；场景 JSON 加载时由调用方注入 type。
+ */
+export interface GramsEvent { type: 'grams'; atMs: number; grams: number; seqOverride?: number; }
+export interface GapEvent { type: 'gap'; atMs: number; gap: number; }
+export interface RevokeEvent { type: 'revoke'; atMs: number; revoke: 'permission'; }
 export type ScenarioEvent = GramsEvent | GapEvent | RevokeEvent;
 
 /** 场景定义。 */
@@ -50,14 +53,15 @@ export interface Scenario {
 /** 广播间隔（毫秒），对应 ~5 Hz。 */
 const BROADCAST_INTERVAL_MS: number = 200;
 
-function isGramsEvent(e: ScenarioEvent): e is GramsEvent {
-  return (e as GramsEvent).grams !== undefined;
+/** 判别函数：基于 `type` 字段返回 boolean（ArkTS 禁止类型谓词）。 */
+function isGramsEvent(e: ScenarioEvent): boolean {
+  return e.type === 'grams';
 }
-function isGapEvent(e: ScenarioEvent): e is GapEvent {
-  return (e as GapEvent).gap !== undefined;
+function isGapEvent(e: ScenarioEvent): boolean {
+  return e.type === 'gap';
 }
-function isRevokeEvent(e: ScenarioEvent): e is RevokeEvent {
-  return (e as RevokeEvent).revoke !== undefined;
+function isRevokeEvent(e: ScenarioEvent): boolean {
+  return e.type === 'revoke';
 }
 
 /**
@@ -143,12 +147,12 @@ export class ScriptScaleSource extends ScaleSourceBase {
     if (typeof setTimeout === 'undefined') {
       return;
     }
-    this.timerId = setTimeout(() => this.tick(), BROADCAST_INTERVAL_MS) as unknown as number;
+    this.timerId = setTimeout(() => this.tick(), BROADCAST_INTERVAL_MS) as number;
   }
 
   private cancelTimer(): void {
     if (this.timerId !== -1 && typeof clearTimeout !== 'undefined') {
-      clearTimeout(this.timerId as unknown as ReturnType<typeof setTimeout>);
+      clearTimeout(this.timerId);
       this.timerId = -1;
     }
   }
@@ -197,7 +201,8 @@ export class ScriptScaleSource extends ScaleSourceBase {
 
     // gap 事件：在 gap 窗口内静默（不发广播），让 stale 检查自然触发。
     if (isGapEvent(ev)) {
-      const gapEnd = ev.atMs + ev.gap;
+      const gapEv = ev as GapEvent;
+      const gapEnd = gapEv.atMs + gapEv.gap;
       if (this.virtualNowMs < gapEnd) {
         // 静默中；不发包，依赖 ScaleSourceBase 的 stale 检查。
         return;
@@ -205,14 +210,16 @@ export class ScriptScaleSource extends ScaleSourceBase {
       // gap 已过，但没有 grams 字段；尝试用下一个事件的 grams 继续。
       const next = events[this.currentEventIndex + 1];
       if (next !== undefined && isGramsEvent(next)) {
-        this.emitGrams(next.grams, next.seqOverride);
+        const nextG = next as GramsEvent;
+        this.emitGrams(nextG.grams, nextG.seqOverride);
       }
       return;
     }
 
     // grams 事件：发出一次广播（每个 tick 一次，~5 Hz）。
     if (isGramsEvent(ev)) {
-      this.emitGrams(ev.grams, ev.seqOverride);
+      const gramsEv = ev as GramsEvent;
+      this.emitGrams(gramsEv.grams, gramsEv.seqOverride);
     }
 
     // 到达场景末尾：若 repeat 则循环，否则停止时间轴（保持最后读数直至 stale）。

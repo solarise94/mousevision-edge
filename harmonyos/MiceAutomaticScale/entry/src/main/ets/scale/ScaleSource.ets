@@ -15,6 +15,12 @@ import { ScaleReading, type ScaleSourceKind, type StableSource } from './ScaleRe
 import { ScaleStatus, type ScaleState } from './ScaleStatus';
 import { ParseResult, ParseOk } from './K797AdvertisementParser';
 
+/**
+ * setTimeout 句柄类型。ArkUI 宿主下 setTimeout 返回 number，
+ * 故统一用 number 表示定时器句柄，无需 any/unknown 转换或 ReturnType 查询。
+ */
+type TimerHandle = number;
+
 /** 读数回调。 */
 export type ReadingCallback = (reading: ScaleReading) => void;
 /** 状态回调。 */
@@ -285,13 +291,13 @@ export abstract class ScaleSourceBase implements ScaleSource {
     // TODO(Phase-0): 真机优先用 @ohos.workScheduler 或 ability 内定时器，
     //   并核实后台时定时器是否被冻结。
     if (typeof setTimeout !== 'undefined') {
-      this.staleTimerId = setTimeout(() => this.checkStale(), STALE_THRESHOLD_MS) as unknown as number;
+      this.staleTimerId = setTimeout(() => this.checkStale(), STALE_THRESHOLD_MS) as number;
     }
   }
 
   private cancelStaleCheck(): void {
     if (this.staleTimerId !== -1 && typeof clearTimeout !== 'undefined') {
-      clearTimeout(this.staleTimerId as unknown as ReturnType<typeof setTimeout>);
+      clearTimeout(this.staleTimerId);
       this.staleTimerId = -1;
     }
   }
@@ -314,7 +320,7 @@ export abstract class ScaleSourceBase implements ScaleSource {
       // 还没到阈值，继续等待剩余时间。
       const remain = STALE_THRESHOLD_MS - elapsed;
       if (typeof setTimeout !== 'undefined') {
-        this.staleTimerId = setTimeout(() => this.checkStale(), remain) as unknown as number;
+        this.staleTimerId = setTimeout(() => this.checkStale(), remain) as number;
       }
     }
   }
