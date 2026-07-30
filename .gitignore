@@ -77,3 +77,8 @@ android/**/build/
 android/.gradle/
 android/local.properties
 android/**/*.iml
+
+# 鸿蒙签名私钥与 Profile（含密钥，不入库；.cer 证书链可入库）
+harmonyos/MiceAutomaticScale/signature/*.p12
+harmonyos/MiceAutomaticScale/signature/*.p7b
+harmonyos/MiceAutomaticScale/signature/*.csr

@@ -9,6 +9,10 @@
   //   兼容版，不在此 HAP 工程中降级 compatibleSdkVersion。
   // =====================================================================
   "app": {
+    // 签名采用 hap-sign-tool 命令行单独完成（见 signature/sign.sh），
+    // hvigor 只产出未签名 HAP。原因：hvigor 的 signingConfigs 期望密文密码
+    // + signature/material 加密目录（DevEco IDE 生成），纯 CLT 无加密生成工具；
+    // 而 hap-sign-tool sign-app -mode localSign 接受明文密码直接签名，更可控。
     "signingConfigs": [],
     "products": [
       {
