@@ -1,0 +1,85 @@
+[
+  {
+    "name": "zero",
+    "file": "zero.hex",
+    "inline_hex": null,
+    "local_name": "K797",
+    "manufacturer_id": 0,
+    "rssi": -60,
+    "expect": { "grams": 0.0, "raw": 0 },
+    "reject": null
+  },
+  {
+    "name": "26_3g",
+    "file": "26_3g.hex",
+    "inline_hex": null,
+    "local_name": "K797",
+    "manufacturer_id": 0,
+    "rssi": -49,
+    "expect": { "grams": 26.3, "raw": 263 },
+    "reject": null
+  },
+  {
+    "name": "little_endian_guard",
+    "file": null,
+    "inline_hex": "CA E8 03 28 08 95 CA 02 10 01 07 00 00 00 00 00 00 00",
+    "local_name": "K797",
+    "manufacturer_id": 0,
+    "rssi": -49,
+    "expect": { "grams": 179.3, "raw": 1793 },
+    "reject": null,
+    "comment": "weight bytes 01 07 must decode little-endian to raw=0x0701=1793 -> 179.3 g, NOT 26.3"
+  },
+  {
+    "name": "wrong_prefix",
+    "file": "wrong_prefix.hex",
+    "inline_hex": null,
+    "local_name": "K797",
+    "manufacturer_id": 0,
+    "rssi": -49,
+    "expect": null,
+    "reject": "wrong_prefix"
+  },
+  {
+    "name": "short_payload",
+    "file": "short_payload.hex",
+    "inline_hex": null,
+    "local_name": "K797",
+    "manufacturer_id": 0,
+    "rssi": -49,
+    "expect": null,
+    "reject": "payload_too_short"
+  },
+  {
+    "name": "wrong_name",
+    "file": "26_3g.hex",
+    "inline_hex": null,
+    "local_name": "K798",
+    "manufacturer_id": 0,
+    "rssi": -49,
+    "expect": null,
+    "reject": "wrong_name"
+  },
+  {
+    "name": "wrong_manufacturer_id",
+    "file": "26_3g.hex",
+    "inline_hex": null,
+    "local_name": "K797",
+    "manufacturer_id": 76,
+    "rssi": -49,
+    "expect": null,
+    "reject": "wrong_manufacturer_id",
+    "comment": "0x004C (Apple) must be rejected before payload inspection"
+  },
+  {
+    "name": "trailing_bytes_ignored",
+    "file": null,
+    "inline_hex": "CA E8 03 28 08 95 CA 02 10 07 01 AA BB CC DD EE FF 00",
+    "local_name": "K797",
+    "manufacturer_id": 0,
+    "rssi": -49,
+    "expect": { "grams": 26.3, "raw": 263 },
+    "reject": null,
+    "comment": "bytes [11..17] are nonzero but must not affect parsing"
+  }
+]

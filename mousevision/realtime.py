@@ -24,13 +24,14 @@ separate task. A :class:`threading.Lock` guards every mutation.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -110,6 +111,10 @@ class RealtimeConfig:
     announce_hold_s: float = 0.0  # 播报后自动接受的等待时间（0 = 关闭）
     clear_timeout_s: float = 30.0  # 等待清秤超时（秒）
 
+    # BLE 天平（K797）。超过 ble_stale_s 未收到广播即视为「天平广播中断」，
+    # 不再用过期读数作为重量证据，只下放 scale_stale 质量提示。
+    ble_stale_s: float = 10.0
+
 
 @dataclass
 class RealtimeRawRead:
@@ -157,6 +162,9 @@ class Attempt:
     client_ts_ms: float
     state: str  # "announced" | "accepted" | "rejected"
     created_at: float  # time.time()
+    # BLE 原始 raw（K797 uint16）。OCR 路径不设置（保持 None）；仅 BLE 读数
+    # 形成的 attempt 携带，供 finalize 写入 record.json 的 weight_raw。
+    weight_raw: int | None = None
 
     def mark_accepted(self) -> None:
         self.state = "accepted"
@@ -182,6 +190,9 @@ class RealtimeFrameResult:
     accepted_weight: float | None = None  # 仅在本帧某 Attempt 被接受时设置
     frame_seq: int = 0
     epoch: int = 0
+    # BLE 会话下，原生 stable 标志（天平自报稳定）。None 表示非 BLE 或本帧无读数；
+    # 仅供客户端展示，绝不参与后端稳定窗判定。
+    ble_stable: bool | None = None
 
 
 def validate_realtime_config(cfg: RealtimeConfig) -> None:
@@ -224,12 +235,20 @@ class RealtimeSession:
         reader: TemplateReader,
         fusion: TemporalWeightFusion,
         mouse_detect_config: dict | None = None,
+        *,
+        weight_source: str = "ocr",
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         validate_realtime_config(config)
         self.config = config
         self.reader = reader
         self.fusion = fusion
         self.mouse_detect_config: dict = dict(mouse_detect_config or {})
+        # 重量来源：OCR（手机拍 LCD）或 ble_k797（天平蓝牙广播）。BLE 模式下
+        # _read_weight_once 不再调用 OCR reader，改读 BLE 缓存。
+        self.weight_source: str = weight_source
+        # 可注入的单调时钟，便于测试控制 BLE 读数新鲜度而无需 sleep。
+        self._clock: Callable[[], float] = clock
 
         # 状态 + 计数器
         self._state: RealtimeState = RealtimeState.CALIBRATING
@@ -266,6 +285,13 @@ class RealtimeSession:
         # 最近一次 weight_candidate（用于 ANNOUNCED 时回填）
         self._last_candidate: float | None = None
         self._last_confidence: float = 0.0
+
+        # BLE（K797）最新读数缓存。ingest_scale_reading 写入，_read_weight_once
+        # 在 BLE 模式下读取。None 表示尚无任何 BLE 读数。
+        self._ble_reading: dict[str, Any] | None = None  # {grams, raw, stable, ...}
+        self._ble_received_monotonic: float = 0.0  # clock() 读数到达时刻
+        self._ble_received_epoch_ms: int = 0
+        self._last_ble_sequence: int = -1  # 单调校验用；-1 表示尚未收到
 
     # ----------------------------------------------------------------- #
     # Public API
@@ -354,6 +380,76 @@ class RealtimeSession:
         """返回本会话产生的全部 Attempt（含被拒绝/已被取代的）。"""
         with self._lock:
             return list(self._attempts)
+
+    # ----------------------------------------------------------------- #
+    # BLE (K797) ingest
+    # ----------------------------------------------------------------- #
+
+    def ingest_scale_reading(
+        self,
+        *,
+        grams: float,
+        raw: int,
+        sequence: int,
+        received_at_epoch_ms: int,
+        stable: bool | None = None,
+        rssi: int | None = None,
+    ) -> bool:
+        """缓存一条 BLE 天平读数，供 BLE 模式下的 _read_weight_once 消费。
+
+        线程安全：与 process_frame 共用 ``self._lock``（process_frame 在
+        ``_process_locked`` 内持锁读取缓存，故此处必须用同一把锁写入）。
+
+        校验（任一失败即抛 ``ValueError``，缓存不变）：
+          * grams 有限且在 [0, 6553.5]；
+          * raw 为 int 且在 [0, 65535]；
+          * |grams - raw/10| <= 0.05（前后端读数一致）；
+          * sequence 严格大于上一次（单调递增）。
+
+        Returns:
+            True 表示读数已更新缓存；False 表示因序列号非单调被忽略。
+        """
+        # --- 类型 / 范围校验（在锁外做纯函数校验，失败即抛） ------------- #
+        if isinstance(grams, bool) or not isinstance(grams, (int, float)):
+            raise ValueError(f"grams must be a finite number, got {grams!r}")
+        if not math.isfinite(float(grams)):
+            raise ValueError(f"grams must be finite, got {grams!r}")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(f"raw must be int, got {raw!r}")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            raise ValueError(f"sequence must be int, got {sequence!r}")
+        if isinstance(received_at_epoch_ms, bool) or not isinstance(
+            received_at_epoch_ms, int
+        ):
+            raise ValueError(
+                f"received_at_epoch_ms must be int, got {received_at_epoch_ms!r}"
+            )
+        if sequence < 0:
+            raise ValueError(f"sequence must be >= 0, got {sequence}")
+        if not (0.0 <= float(grams) <= 6553.5):
+            raise ValueError(f"grams out of range [0, 6553.5]: {grams}")
+        if not (0 <= raw <= 65535):
+            raise ValueError(f"raw out of range [0, 65535]: {raw}")
+        if abs(float(grams) - raw / 10.0) > 0.05:
+            raise ValueError(
+                f"grams/raw mismatch: grams={grams} raw={raw} (raw/10={raw / 10.0})"
+            )
+
+        with self._lock:
+            # 序列号必须严格单调递增；相等或倒序视为重复/乱序，忽略。
+            if sequence <= self._last_ble_sequence:
+                return False
+            self._last_ble_sequence = sequence
+            self._ble_reading = {
+                "grams": float(grams),
+                "raw": int(raw),
+                "stable": bool(stable) if stable is not None else None,
+                "rssi": rssi,
+                "received_at_epoch_ms": received_at_epoch_ms,
+            }
+            self._ble_received_monotonic = self._clock()
+            self._ble_received_epoch_ms = received_at_epoch_ms
+            return True
 
     # ----------------------------------------------------------------- #
     # Internal helpers (all called under self._lock)
@@ -511,10 +607,62 @@ class RealtimeSession:
     def _read_weight_once(
         self, image: np.ndarray
     ) -> tuple[float | None, float, Any]:
-        """定位一次 LCD，同时供鼠检测与重量读取复用。"""
+        """定位一次 LCD，同时供鼠检测与重量读取复用。
+
+        OCR 模式：调用 reader.read_weight 做 LCD 识别。
+        BLE 模式：重量来自 BLE 缓存（ingest_scale_reading 写入），新鲜
+        （age <= ble_stale_s）返回 ``(grams, 1.0, lcd_box)``，过期/缺失返回
+        ``(None, 0.0, lcd_box)``。OCR reader 绝不被调用于重量读取。LCD 定位
+        仍会执行，因为鼠检测需要 lcd_box 作为 ROI。
+        """
         lcd_box = self.reader.lcd_box(image)
+        if self.weight_source == "ble_k797":
+            grams = self._fresh_ble_grams()
+            if grams is None:
+                return None, 0.0, lcd_box
+            return float(grams), 1.0, lcd_box
         weight, conf = self.reader.read_weight(image, lcd_box=lcd_box)
         return weight, float(conf), lcd_box
+
+    def _fresh_ble_grams(self) -> float | None:
+        """返回新鲜（age <= ble_stale_s）的 BLE 重量，否则 None。
+
+        必须在 ``self._lock`` 内调用（读缓存）。过期/缺失一律返回 None：
+        调用方据此跳过本帧的证据追加并下放 scale_stale 提示，绝不把过期
+        读数当证据写入 _raw_window。
+        """
+        r = self._ble_reading
+        if r is None:
+            return None
+        age_s = self._clock() - self._ble_received_monotonic
+        if age_s > self.config.ble_stale_s:
+            return None
+        return float(r["grams"])
+
+    def _ble_stale_or_missing(self) -> bool:
+        """True 表示 BLE 模式下当前无新鲜读数（缓存空或过期）。
+
+        必须在 ``self._lock`` 内调用。供 _process_locked 决定是否下放
+        scale_stale 提示。
+        """
+        if self.weight_source != "ble_k797":
+            return False
+        return self._fresh_ble_grams() is None
+
+    def _read_clear_weight(self, image: np.ndarray) -> float | None:
+        """WAIT_CLEAR / RETRY_REQUESTED 用的重量读取（统一 OCR/BLE 路径）。
+
+        OCR 模式：reader.read_weight。
+        BLE 模式：新鲜缓存 grams，过期/缺失返回 None（保持现状，等下一帧）。
+
+        所有重量消费路径（ARMED / WEIGHING 经 _read_weight_once；WAIT_CLEAR /
+        RETRY_REQUESTED 经此方法）都经过 BLE 缓存，BLE 会话绝不调用 OCR
+        reader 读取重量。
+        """
+        if self.weight_source == "ble_k797":
+            return self._fresh_ble_grams()
+        weight, _conf = self.reader.read_weight(image)
+        return weight
 
     # ----------------------------------------------------------------- #
     # State handlers
@@ -568,6 +716,25 @@ class RealtimeSession:
             result.weight_candidate = self._last_candidate
         if result.confidence <= 0.0 and self._last_confidence > 0.0:
             result.confidence = self._last_confidence
+
+        # BLE 会话：在需要重量的状态（ARMED/WEIGHING/WAIT_CLEAR/RETRY_REQUESTED）
+        # 下若缓存无新鲜读数，下放 scale_stale 提示。过期读数已被各 handler
+        # 当作 None 处理（不写入 _raw_window），状态推进自然暂停。
+        stale_states = {
+            RealtimeState.ARMED,
+            RealtimeState.WEIGHING,
+            RealtimeState.WAIT_CLEAR,
+            RealtimeState.RETRY_REQUESTED,
+        }
+        if self._state in stale_states and self._ble_stale_or_missing():
+            result.quality_hints.append(
+                QualityHint(code="scale_stale", message="天平广播中断")
+            )
+
+        # 透传原生 stable 标志（仅供客户端展示，不参与后端稳定窗判定）。
+        if self.weight_source == "ble_k797" and self._ble_reading is not None:
+            result.ble_stable = self._ble_reading.get("stable")
+
         result.state = self._state
         result.epoch = self._weighing_epoch
         return result
@@ -755,6 +922,13 @@ class RealtimeSession:
             client_ts_ms=float(client_ts_ms),
             state="announced",
             created_at=now,
+            # BLE 会话：把当前缓存的 raw 挂到 attempt 上，供 finalize 写
+            # record.json 的 weight_raw。OCR 会话保持 None。
+            weight_raw=(
+                int(self._ble_reading["raw"])
+                if (self.weight_source == "ble_k797" and self._ble_reading is not None)
+                else None
+            ),
         )
         self._attempts.append(attempt)
         self._current_attempt = attempt
@@ -803,7 +977,7 @@ class RealtimeSession:
             return
 
         # 不强求 OCR 成功：读不到就保持现状，等下一帧。
-        weight, _conf = self.reader.read_weight(image)
+        weight = self._read_clear_weight(image)
         if weight is not None:
             result.weight_candidate = float(weight)
         if weight is not None and weight <= cfg.empty_max:
@@ -842,7 +1016,7 @@ class RealtimeSession:
             self._transition(RealtimeState.ARMED)
             return
 
-        weight, _conf = self.reader.read_weight(image)
+        weight = self._read_clear_weight(image)
         if weight is not None:
             result.weight_candidate = float(weight)
         if weight is not None and weight <= cfg.empty_max:

@@ -828,6 +828,7 @@ html.camera-mode.record-light body {
 }
 .rt-weight-display {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: center;
   margin: 4px 0;
@@ -846,6 +847,27 @@ html.camera-mode.record-light body {
   margin-left: 6px;
   color: #9aa0a6;
   transition: color 0.2s ease;
+}
+/* 蓝牙天平源标签 + RSSI/广播间隔：堆叠在体重数值下方，OCR 模式隐藏 */
+.rt-scale-source {
+  flex-basis: 100%;
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1a73e8;
+  letter-spacing: 0.2px;
+}
+.rt-scale-meta {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+}
+/* 广播中断提示：复用 .rt-hint，追加更醒目的琥珀色 */
+.rt-hint.rt-scale-stale {
+  color: #b26a00;
+  font-weight: 500;
 }
 .rt-quality-hints {
   text-align: center;

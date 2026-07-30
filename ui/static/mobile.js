@@ -923,10 +923,13 @@
       { class: "rt-weight-unit", style: "font-size:20px;margin-left:6px;color:#9aa0a6" },
       "g"
     );
+    // 蓝牙天平源标签 + RSSI/广播间隔（仅 native_ble 模式可见）
+    const scaleSourceLabel = h("div", { class: "rt-scale-source", hidden: true }, "蓝牙天平 K797");
+    const scaleMeta = h("div", { class: "rt-scale-meta", hidden: true });
     const weightDisplay = h(
       "div",
       { class: "rt-weight-display", style: "text-align:center;margin:2px 0" },
-      [weightValue, weightUnit]
+      [weightValue, weightUnit, scaleSourceLabel, scaleMeta]
     );
 
     const qualityHints = h("div", {
@@ -1025,6 +1028,14 @@
     let announcedWeight = null;
     let finished = false;
     let abandoned = false;
+
+    // 蓝牙天平桥接：原生外壳注入 window.MiceAutomaticScale 时启用 BLE 源，
+    // 否则全程走 OCR（行为与改造前逐字节一致）。
+    const scaleAvailable = ScaleBridge.detectNativeBridge();
+    const weightSource = scaleAvailable ? "native_ble" : "ocr";
+    let scaleChannel = null;          // ScaleBridge.createScaleChannel() 实例
+    let scaleSender = null;           // createLatestOnlySender：断线仅缓存最新一条
+    let scaleReadingInvalidCount = 0; // 后端拒绝计数（scale_reading_invalid）
 
     // Adaptive JPEG encode profiles (realtime path only; archive video untouched).
     const ENCODE_PROFILES = {
@@ -1300,6 +1311,10 @@
       ws.addEventListener("open", () => {
         showReconnect(false);
         if (rtState === "connecting") setState("calibrating", {});
+        // 蓝牙天平：重连后 flush 最新缓存的读数（仅一条），不补发过期队列
+        if (weightSource === "native_ble" && scaleSender) {
+          scaleSender.flush();
+        }
       });
       ws.addEventListener("message", (ev) => {
         if (typeof ev.data !== "string") return;
@@ -1611,6 +1626,12 @@
           if (!retryInFlight) startFrameLoop();
         }
       } else if (t === "error") {
+        // 蓝牙读数被后端判为无效：仅记录计数 + 控制台告警，不重试循环
+        if (msg.code === "scale_reading_invalid" || msg.code === "scale_reading_rejected") {
+          scaleReadingInvalidCount += 1;
+          console.warn("scale_reading rejected:", msg.code, msg.message || "");
+          return;
+        }
         toast(msg.message || "实时分析出错");
       }
     }
@@ -1787,10 +1808,14 @@
 
     async function startRealtime() {
       try {
+        // 原生 BLE 桥存在时，向会话声明 weight_source=ble_k797，后端据此
+        // 接收 scale_reading 文本消息；OCR 模式不带该字段，行为不变。
+        const body = { cage_id: box.cageId, project_id: state.projectId };
+        if (weightSource === "native_ble") body.weight_source = "ble_k797";
         const res = await api.json("/api/realtime/session", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cage_id: box.cageId, project_id: state.projectId }),
+          body: JSON.stringify(body),
         });
         rtSession = res;
         // Apply server-side client_config BEFORE starting the frame loop so
@@ -1798,11 +1823,117 @@
         applyClientConfig(res && res.client_config);
         connectWs();
         startFrameLoop();
+        // native_ble：WS 打开后由 connectWs 的 open 回调 flush 最新读数。
+        if (weightSource === "native_ble") startScaleChannel();
       } catch (err) {
         toast(err && err.message ? err.message : "无法启动实时称重");
         showReconnect(true);
         scheduleReconnect();
       }
+    }
+
+    /* --- 蓝牙天平通道：仅在 weightSource === 'native_ble' 时生效 --- */
+    function bleClientTsMs() {
+      // 复用帧时序基准（recordingT0 = 开始录像的 Date.now()），与帧 client_ts 同源
+      if (!recordingT0) return 0;
+      return Date.now() - recordingT0;
+    }
+
+    function updateScaleMeta(reading) {
+      if (!reading) return;
+      // RSSI + 广播年龄（秒），信息行
+      const parts = [];
+      if (typeof reading.rssi === "number") parts.push(`${reading.rssi} dBm`);
+      const st = scaleChannel && scaleChannel.getState();
+      if (st && st.lastReadingAtMs) {
+        const ageSec = Math.max(0, Math.round((performance.now() - st.lastReadingAtMs) / 1000));
+        parts.push(`${ageSec}s 前`);
+      }
+      scaleMeta.textContent = parts.join(" · ");
+      scaleMeta.hidden = false;
+    }
+
+    function showScaleStaleHint(stale) {
+      if (!stale) return;
+      // 复用 qualityHints 展示广播中断提示；真实 0g 由读数直接渲染
+      setQualityHints(["天平广播中断"]);
+    }
+
+    // BLE 读数显示（一位小数）：raw=0 → "0.0"；不改动 OCR 的 setWeightValue
+    function setBleWeightDisplay(grams) {
+      if (grams == null || typeof grams !== "number" || !isFinite(grams)) {
+        weightValue.textContent = "--";
+        weightValue.style.color = "#9aa0a6";
+        weightUnit.style.color = "#9aa0a6";
+        return;
+      }
+      weightValue.textContent = grams.toFixed(1);
+      weightValue.style.color = "#5f6368";
+      weightUnit.style.color = "#5f6368";
+    }
+
+    function sendScaleReadingToWs(reading) {
+      if (!rtSession || rtSession.weight_source !== "ble_k797") return;
+      const msg = ScaleBridge.buildScaleReadingMessage(reading, bleClientTsMs());
+      // WS 打开则直发；断开期间由 sender 仅缓存最新一条，重连 flush。
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        rtSend(msg);
+      } else {
+        scaleSender.offer(msg);
+      }
+    }
+
+    function startScaleChannel() {
+      if (scaleChannel || weightSource !== "native_ble") return;
+      scaleSender = ScaleBridge.createLatestOnlySender(function (m) { rtSend(m); });
+      scaleChannel = ScaleBridge.createScaleChannel();
+      // 新读数 → 直显（一位小数）+ 转发 WS；announced 态不改写（由引擎驱动）
+      scaleChannel.onReading(function (reading) {
+        if (rtState !== "announced" && rtState !== "accepted") {
+          const fmt = ScaleBridge.formatScaleDisplay(scaleChannel.getState());
+          if (!fmt.stale) setBleWeightDisplay(reading.grams);
+        }
+        updateScaleMeta(reading);
+        sendScaleReadingToWs(reading);
+      });
+      // stale 切换 → 显示 "--" + 中断提示
+      scaleChannel.onStaleChange(function (isStale) {
+        if (isStale && rtState !== "announced" && rtState !== "accepted") {
+          setWeightValue(null, false);
+          showScaleStaleHint(true);
+        }
+      });
+      // 状态 → 反映未授权/蓝牙关闭/异常到状态文本
+      scaleChannel.onStatus(function (detail) {
+        const bad = detail.state === "unauthorized" || detail.state === "bluetooth_off" ||
+          detail.state === "error";
+        if (bad && detail.message) {
+          stateText.textContent = detail.message;
+        }
+      });
+      scaleSourceLabel.hidden = false;
+      scaleChannel.start();
+      // 立即同步一次原生状态
+      try {
+        const native = window.MiceAutomaticScale;
+        if (native && typeof native.getScaleStatus === "function") {
+          const raw = native.getScaleStatus();
+          if (raw) {
+            let parsed; try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+            if (parsed) {
+              window.dispatchEvent(new CustomEvent("miceautomatic:scale-status", { detail: parsed }));
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    function stopScaleChannel() {
+      if (scaleChannel) {
+        try { scaleChannel.stop(); } catch (_) {}
+        scaleChannel = null;
+      }
+      scaleSender = null;
     }
 
     // --- Finish: stop recording → upload video → finalize session with job_id ---
@@ -1814,6 +1945,7 @@
       finished = true;
       finishBtn.disabled = true;
       teardownFrameProtocol();
+      stopScaleChannel();
       wsClosedByUs = true;
       if (ws) {
         try { ws.close(); } catch (_) {}
@@ -1898,6 +2030,7 @@
       paintedReady = false;
       stopDraw();
       teardownFrameProtocol();
+      stopScaleChannel();
       wsClosedByUs = true;
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
       if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }
@@ -1951,6 +2084,7 @@
       clearInterval(clockTimer);
       stopDraw();
       teardownFrameProtocol();
+      stopScaleChannel();
       wsClosedByUs = true;
       if (ws) { try { ws.close(); } catch (_) {} ws = null; }
       if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }
