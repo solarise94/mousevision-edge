@@ -135,10 +135,10 @@ def test_finalize_creates_records_for_accepted_only(tmp_path: Path) -> None:
     assert (run_dir / "mouse_002").exists()
     assert not (run_dir / "mouse_003").exists()
 
-    # record.json has realtime weight source.
+    # record.json has realtime weight source (default ocr when not specified).
     rec1 = json.loads((run_dir / "mouse_001" / "record.json").read_text())
     assert rec1["weight"] == 23.48
-    assert rec1["weight_source"] == "realtime_announced"
+    assert rec1["weight_source"] == "ocr"
     assert rec1["cage_id"] == "CAGE1"
     assert rec1["realtime_session_id"] == "s1"
     assert rec1["ordinal"] == 1
@@ -148,6 +148,7 @@ def test_finalize_creates_records_for_accepted_only(tmp_path: Path) -> None:
     assert manifest["mode"] == "realtime"
     assert manifest["realtime_session_id"] == "s1"
     assert manifest["record_count"] == 2
+    assert manifest["weight_source"] == "ocr"
     assert manifest["status"] == "realtime_finalized"
     assert len(manifest["rejected_attempts"]) == 1
     assert manifest["rejected_attempts"][0]["attempt_id"] == "att2"

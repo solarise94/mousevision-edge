@@ -119,8 +119,11 @@ def _make_app(tmp_path, scripted_results, monkeypatch) -> TestClient:
     realtime_api.configure(str(cfg_path), str(tmp_path))
 
     # Force _create_engine to return our stub regardless of the config.
+    # _create_engine now takes a weight_source kwarg (ocr/ble_k797); accept it.
     monkeypatch.setattr(
-        realtime_api, "_create_engine", lambda config: _StubEngine(scripted_results)
+        realtime_api,
+        "_create_engine",
+        lambda config, *, weight_source="ocr": _StubEngine(scripted_results),
     )
     # No token required for the test.
     monkeypatch.setattr(realtime_api, "_check_ws_token", lambda token: True)
@@ -435,11 +438,12 @@ def test_finish_persists_accepted_record(tmp_path, monkeypatch) -> None:
     assert len(run_dirs) == 1
     rec = json.loads((run_dirs[0] / "mouse_001" / "record.json").read_text())
     assert rec["weight"] == 19.5
-    assert rec["weight_source"] == "realtime_announced"
+    assert rec["weight_source"] == "ocr"
     assert rec["cage_id"] == "C1"
     manifest = json.loads((run_dirs[0] / "manifest.json").read_text())
     assert manifest["video_upload_job_id"] == "job-xyz"
     assert manifest["mode"] == "realtime"
+    assert manifest["weight_source"] == "ocr"
 
 
 # --------------------------------------------------------------------------- #
@@ -650,7 +654,9 @@ def test_create_session_returns_client_config(tmp_path, monkeypatch) -> None:
     )
     realtime_api.configure(str(cfg_path), str(tmp_path))
     monkeypatch.setattr(
-        realtime_api, "_create_engine", lambda config: _StubEngine([])
+        realtime_api,
+        "_create_engine",
+        lambda config, *, weight_source="ocr": _StubEngine([]),
     )
     monkeypatch.setattr(realtime_api, "_check_ws_token", lambda token: True)
     app = FastAPI()
@@ -685,7 +691,9 @@ def test_create_session_rejects_invalid_encode_profile(tmp_path, monkeypatch) ->
     )
     realtime_api.configure(str(cfg_path), str(tmp_path))
     monkeypatch.setattr(
-        realtime_api, "_create_engine", lambda config: _StubEngine([])
+        realtime_api,
+        "_create_engine",
+        lambda config, *, weight_source="ocr": _StubEngine([]),
     )
     monkeypatch.setattr(realtime_api, "_check_ws_token", lambda token: True)
     app = FastAPI()

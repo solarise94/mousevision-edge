@@ -51,6 +51,7 @@ def finalize_session(
     video_upload_job_id: str | None = None,
     capture_meta: dict[str, Any] | None = None,
     timing_summary: dict[str, Any] | None = None,
+    weight_source: str = "ocr",
 ) -> dict[str, Any]:
     """Turn accepted attempts into durable records under a new run dir.
 
@@ -64,6 +65,10 @@ def finalize_session(
         upload_queue: If provided, enqueue each accepted record for sync.
         video_upload_job_id: The job id of the uploaded full video, if any.
             Recorded in the manifest so the clip extractor can find the source.
+        weight_source: Provenance of the weight value — ``"ocr"`` or
+            ``"ble_k797"``. Stamped into every ``record.json`` and the run
+            manifest so the source of truth survives restart/recovery and is
+            auditable downstream (plan §8.2 / §16).
 
     Returns:
         Summary dict with ``run_dir``, ``records`` (paths), ``count``.
@@ -100,7 +105,10 @@ def finalize_session(
             "photo": None,  # Photo attached later by offline clip extractor.
             "ordinal": ordinal,
             "actual_ordinal": ordinal,
-            "weight_source": "realtime_announced",
+            # Provenance of the weight value: "ocr" or "ble_k797". Carried from
+            # the session so a BLE session's records are unambiguously tagged
+            # ble_k797 (plan §8.2: final record must record weight_source).
+            "weight_source": weight_source,
             "realtime_session_id": session_id,
             "attempt_frame_seq": attempt.frame_seq,
             "attempt_client_ts_ms": attempt.client_ts_ms,
@@ -141,6 +149,7 @@ def finalize_session(
         manifest["video_upload_job_id"] = video_upload_job_id
     manifest["realtime_session_id"] = session_id
     manifest["record_count"] = len(accepted)
+    manifest["weight_source"] = weight_source
     if timing_summary:
         manifest["timing_summary"] = timing_summary
     write_manifest(run_dir, manifest)

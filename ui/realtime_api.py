@@ -45,13 +45,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import struct
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -114,6 +115,7 @@ class ActiveSession:
     journal: AttemptJournal
     output_root: str
     created_at: float
+    weight_source: str = "ocr"  # "ocr" | "ble_k797"
     last_frame_at: float = 0.0
     recording_t0_ms: float = 0.0  # client's recording start time (future use)
     device_id: str = "scale01"
@@ -280,6 +282,7 @@ def _build_realtime_config(config: dict[str, Any]) -> RealtimeConfig:
         frame_seq_dedupe=_b("frame_seq_dedupe", True),
         announce_hold_s=_f("announce_hold_s", 0.0),
         clear_timeout_s=_f("clear_timeout_s", 30.0),
+        ble_stale_s=_f("ble_stale_s", 10.0),
     )
 
 
@@ -308,12 +311,15 @@ def _build_client_config(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _create_engine(config: dict[str, Any]) -> RealtimeSession:
+def _create_engine(
+    config: dict[str, Any], *, weight_source: str = "ocr"
+) -> RealtimeSession:
     """Build a fresh :class:`RealtimeSession` from a parsed config dict.
 
     Each session gets its own reader + fusion instance — they are stateful
     (fusion maintains a sliding window) and must not be shared across
-    concurrent sessions.
+    concurrent sessions. ``weight_source`` selects whether weight comes from
+    OCR (phone LCD) or the BLE K797 cache (ingest_scale_reading).
     """
     templates_dir = config.get("templates_dir", "assets/templates")
     reader = TemplateReader(
@@ -339,7 +345,13 @@ def _create_engine(config: dict[str, Any]) -> RealtimeSession:
 
     rt_config = _build_realtime_config(config)
     mouse_cfg = config.get("mouse_detect", {}) or {}
-    return RealtimeSession(rt_config, reader, fusion, mouse_detect_config=mouse_cfg)
+    return RealtimeSession(
+        rt_config,
+        reader,
+        fusion,
+        mouse_detect_config=mouse_cfg,
+        weight_source=weight_source,
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -596,11 +608,13 @@ def _state_payload(
     *,
     accepted_weight: float | None,
     timing: dict[str, Any] | None = None,
+    weight_source: str = "ocr",
 ) -> dict[str, Any]:
     """Build the JSON "state" message sent to the client."""
     payload: dict[str, Any] = {
         "type": "state",
         "state": result.state.value,
+        "weight_source": weight_source,
         "weight_candidate": (
             round(float(result.weight_candidate), 2)
             if result.weight_candidate is not None
@@ -617,6 +631,9 @@ def _state_payload(
         ),
         "frame_seq": result.frame_seq,
         "epoch": int(getattr(result, "epoch", 0) or 0),
+        # BLE 原生稳定标志（仅供客户端展示，不参与后端稳定窗判定）。None 表示
+        # 非 BLE 会话或本帧无读数。
+        "ble_stable": getattr(result, "ble_stable", None),
     }
     if timing:
         payload["timing"] = timing
@@ -633,6 +650,7 @@ def _status_payload(session: ActiveSession) -> dict[str, Any]:
         "session_id": session.session_id,
         "cage_id": session.cage_id,
         "project_id": session.project_id,
+        "weight_source": session.weight_source,
         "state": engine.state.value,
         "created_at": session.created_at,
         "last_frame_at": session.last_frame_at,
@@ -693,11 +711,14 @@ def _touch(session: ActiveSession) -> None:
 class CreateSessionRequest(BaseModel):
     cage_id: str = Field(..., min_length=1, max_length=64)
     project_id: str = Field("default", max_length=64)
+    # 重量来源：OCR（手机拍 LCD，默认）或 ble_k797（天平蓝牙广播）。
+    weight_source: Literal["ocr", "ble_k797"] = "ocr"
 
 
 class CreateSessionResponse(BaseModel):
     session_id: str
     state: str
+    weight_source: Literal["ocr", "ble_k797"] = "ocr"
     # Tuning knobs the phone client should apply (P2). The client clamps
     # these to safe ranges before use; absent fields fall back to client
     # defaults so older clients keep working.
@@ -724,7 +745,13 @@ def create_realtime_router(
 router = APIRouter(prefix="/api/realtime", tags=["realtime"])
 
 
-def _build_journal(session_id: str, cage_id: str, project_id: str, device_id: str) -> AttemptJournal:
+def _build_journal(
+    session_id: str,
+    cage_id: str,
+    project_id: str,
+    device_id: str,
+    weight_source: str = "ocr",
+) -> AttemptJournal:
     """Create an append-only journal for this session and write its meta."""
     out_root = _get_output_root()
     jpath = journal_path(out_root, session_id)
@@ -736,6 +763,7 @@ def _build_journal(session_id: str, cage_id: str, project_id: str, device_id: st
             project_id=project_id,
             created_at=time.time(),
             device_id=device_id,
+            weight_source=weight_source,
         )
     )
     return j
@@ -754,7 +782,7 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
     """
     config = _get_config()
     try:
-        engine = _create_engine(config)
+        engine = _create_engine(config, weight_source=req.weight_source)
     except ValueError as exc:
         log.error("realtime: invalid realtime config: %s", exc)
         raise HTTPException(status_code=400, detail=f"invalid realtime config: {exc}") from exc
@@ -765,7 +793,9 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
     session_id = uuid.uuid4().hex
     now = time.time()
     device_id = str(config.get("device_id", "scale01"))
-    journal = _build_journal(session_id, req.cage_id, req.project_id, device_id)
+    journal = _build_journal(
+        session_id, req.cage_id, req.project_id, device_id, req.weight_source
+    )
     session = ActiveSession(
         session_id=session_id,
         cage_id=req.cage_id,
@@ -774,6 +804,7 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
         journal=journal,
         output_root=_get_output_root(),
         created_at=now,
+        weight_source=req.weight_source,
         last_frame_at=0.0,
         device_id=device_id,
     )
@@ -781,12 +812,13 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
         _cleanup_expired_locked(now)
         _sessions[session_id] = session
     log.info(
-        "realtime: created session %s (cage=%s project=%s)",
-        session_id, req.cage_id, req.project_id,
+        "realtime: created session %s (cage=%s project=%s weight_source=%s)",
+        session_id, req.cage_id, req.project_id, req.weight_source,
     )
     return CreateSessionResponse(
         session_id=session_id,
         state=engine.state.value,
+        weight_source=req.weight_source,
         client_config=_build_client_config(config),
     )
 
@@ -903,6 +935,7 @@ def session_finish(
             video_upload_job_id=(req.video_upload_job_id if req else None),
             capture_meta=(req.capture_meta if req else None),
             timing_summary=timing_summary,
+            weight_source=session.weight_source,
         )
     except Exception:  # noqa: BLE001
         log.exception("realtime: finalize_session failed (session=%s)", session_id)
@@ -1056,10 +1089,188 @@ async def _process_one_frame(
     # Buffer server-side timing for the session summary (P50/P95 at finish).
     _record_server_timing(session, timing)
     payload = _state_payload(
-        result, accepted_weight=result.accepted_weight, timing=timing
+        result,
+        accepted_weight=result.accepted_weight,
+        timing=timing,
+        weight_source=session.weight_source,
     )
     payload["session_id"] = session.session_id
     await _send_state(websocket, payload)
+
+
+# Acceptable payload source tags on a ``scale_reading`` message. The page
+# (scale-bridge.js) always sends ``"ble_k797"``; we tolerate the native
+# abstractions (``ble``) but reject anything else so a stale page can't push
+# OCR-shaped payloads through the BLE path.
+_SCALE_READING_SOURCES = {"ble_k797", "ble"}
+
+
+def _coerce_int(value: Any, *, name: str) -> int | None:
+    """Best-effort int coercion for a scale_reading field.
+
+    JSON ints decode as ``int`` already; we also accept numeric strings and
+    floats with an integer value. ``bool`` is excluded (Python ``bool`` is an
+    ``int`` subclass and must not slip through as 0/1). Returns ``None`` when
+    the value is missing or not coercible.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            return None
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 10)
+        except ValueError:
+            try:
+                f = float(value.strip())
+            except ValueError:
+                return None
+            if not math.isfinite(f) or f != int(f):
+                return None
+            return int(f)
+    return None
+
+
+def _coerce_float(value: Any, *, name: str) -> float | None:
+    """Best-effort finite-float coercion for a scale_reading field.
+
+    Accepts ``int``/``float``/numeric-string; rejects ``bool``, ``None``,
+    non-finite (NaN/Inf) and unparseable strings. Returns ``None`` on rejection.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+    elif isinstance(value, str):
+        try:
+            f = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return f if math.isfinite(f) else None
+
+
+async def _handle_scale_reading(session: ActiveSession, cmd: dict[str, Any]) -> None:
+    """Ingest one BLE scale reading pushed from the page (plan §8.2).
+
+    Only honoured for ``weight_source="ble_k797"`` sessions; OCR sessions
+    ignore it (and log) so a BLE payload can never silently take over an OCR
+    weighing (plan §12). Runs in a worker thread because
+    :meth:`ingest_scale_reading` takes the engine lock.
+
+    Validation mirrors the contract documented in the engine: finite grams in
+    [0, 6553.5], integer raw/sequence ≥ 0, |grams − raw/10| ≤ 0.05, and a
+    monotonic sequence. Every rejection is fire-and-forget — no ACK — and the
+    socket stays open so the page keeps streaming subsequent readings.
+    """
+    if session.weight_source != "ble_k797":
+        log.debug(
+            "realtime: ignoring scale_reading on non-BLE session %s (source=%s)",
+            session.session_id,
+            session.weight_source,
+        )
+        return
+
+    source = str(cmd.get("source", "")).strip().lower()
+    if source not in _SCALE_READING_SOURCES:
+        log.debug(
+            "realtime: scale_reading rejected: bad source=%r (session=%s)",
+            cmd.get("source"),
+            session.session_id,
+        )
+        return
+
+    grams = _coerce_float(cmd.get("grams"), name="grams")
+    raw = _coerce_int(cmd.get("raw"), name="raw")
+    sequence = _coerce_int(cmd.get("sequence"), name="sequence")
+    received_at_epoch_ms = _coerce_int(
+        cmd.get("received_at_epoch_ms"), name="received_at_epoch_ms"
+    )
+    rssi = _coerce_int(cmd.get("rssi"), name="rssi")
+
+    if grams is None or raw is None or sequence is None or received_at_epoch_ms is None:
+        log.debug(
+            "realtime: scale_reading rejected: missing/non-numeric fields "
+            "(grams=%r raw=%r seq=%r ts=%r session=%s)",
+            cmd.get("grams"), cmd.get("raw"), cmd.get("sequence"),
+            cmd.get("received_at_epoch_ms"), session.session_id,
+        )
+        return
+
+    if sequence < 0 or raw < 0 or received_at_epoch_ms < 0:
+        log.debug(
+            "realtime: scale_reading rejected: negative field (raw=%d seq=%d ts=%d session=%s)",
+            raw, sequence, received_at_epoch_ms, session.session_id,
+        )
+        return
+
+    if not (0.0 <= grams <= 6553.5):
+        log.debug(
+            "realtime: scale_reading rejected: grams out of range [0, 6553.5]: %s (session=%s)",
+            grams, session.session_id,
+        )
+        return
+
+    if not (0 <= raw <= 65535):
+        log.debug(
+            "realtime: scale_reading rejected: raw out of range [0, 65535]: %d (session=%s)",
+            raw, session.session_id,
+        )
+        return
+
+    if abs(grams - raw / 10.0) > 0.05:
+        log.debug(
+            "realtime: scale_reading rejected: grams/raw mismatch grams=%s raw=%d (session=%s)",
+            grams, raw, session.session_id,
+        )
+        return
+
+    # `stable` is advisory only (native-derived), never authoritative. Coerce
+    # loosely: absent/None -> None, anything truthy/falsy -> bool.
+    stable_raw = cmd.get("stable")
+    stable: bool | None
+    if stable_raw is None:
+        stable = None
+    elif isinstance(stable_raw, bool):
+        stable = stable_raw
+    else:
+        stable = bool(stable_raw)
+
+    def _ingest_locked() -> bool:
+        with session.frame_lock:
+            return session.engine.ingest_scale_reading(
+                grams=grams,
+                raw=raw,
+                sequence=sequence,
+                received_at_epoch_ms=received_at_epoch_ms,
+                stable=stable,
+                rssi=rssi,
+            )
+
+    try:
+        accepted = await run_in_threadpool(_ingest_locked)
+    except ValueError:
+        # Engine's own range/consistency guard rejected it. Already logged at
+        # debug above for the common cases; keep this defensive.
+        log.debug(
+            "realtime: scale_reading rejected by engine (raw=%d seq=%d session=%s)",
+            raw, sequence, session.session_id,
+        )
+        return
+
+    if not accepted:
+        # Non-monotonic sequence: an older/duplicate reading arrived (e.g. a
+        # buffered frame flushed after reconnect). Silently drop — the engine
+        # already holds the newer reading.
+        log.debug(
+            "realtime: scale_reading dropped (non-monotonic seq=%d session=%s)",
+            sequence, session.session_id,
+        )
 
 
 async def _handle_ws_command(
@@ -1067,7 +1278,7 @@ async def _handle_ws_command(
     websocket: WebSocket,
     cmd: dict[str, Any],
 ) -> None:
-    """Dispatch a JSON text command (retry / accept).
+    """Dispatch a JSON text command (retry / accept / scale_reading).
 
     Engine calls are blocking-but-cheap (no OCR); they run in a worker thread
     alongside the journal append so neither holds the asyncio loop and the
@@ -1139,6 +1350,10 @@ async def _handle_ws_command(
                 _record_client_timing(session, samples)
             except Exception:  # noqa: BLE001
                 log.debug("realtime: client_timing merge failed", exc_info=True)
+    elif ctype == "scale_reading":
+        # BLE 天平读数（K797）。仅在会话声明 weight_source="ble_k797" 时接受；
+        # OCR 会话收到则忽略并记录（计划 §12：非 BLE 会话不得静默接受天平读数）。
+        await _handle_scale_reading(session, cmd)
     else:
         log.debug("realtime: ignoring unknown ws command %r", ctype)
 
@@ -1152,7 +1367,8 @@ async def realtime_ws(
     """Live weighing socket.
 
     * Binary messages: ``[frame_seq u32 LE][client_ts_ms u32 LE][JPEG]``.
-    * Text messages: JSON commands ``{"type": "retry"}`` / ``{"type": "accept"}``.
+    * Text messages: JSON commands ``{"type": "retry"}`` / ``{"type": "accept"}``
+      / ``{"type": "scale_reading"}`` (BLE sessions only).
     * Server replies: JSON ``state`` / ``ack`` text messages.
 
     On disconnect the session is left in memory (the phone may reconnect);
