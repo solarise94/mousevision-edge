@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "0.1.0",
+  "description": "MiceAutomatic 蓝牙天平称量 entry 模块",
+  "main": "",
+  "author": "pingoodmice",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}

@@ -1,0 +1,40 @@
+{
+  // =====================================================================
+  // 阶段 0 真机确认（2026-07-30，hdc 实测）：
+  //   设备:  HUAWEI MatePad Mini (TEST_TABLET)，tablet
+  //   系统:  HarmonyOS 6.1.0.135，const.ohos.apiversion = 24，arm64-v8a
+  //   SDK:   Command Line Tools 6.1.1.300，Ohos_sdk_public API 24 Release
+  // 三者（compatible/compile/target）与真机 API Level 24 一致。
+  // 如需支持更低版本的畅享 70 Pro（HarmonyOS 4.2），走 Android APK
+  //   兼容版，不在此 HAP 工程中降级 compatibleSdkVersion。
+  // =====================================================================
+  "app": {
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "compileSdkVersion": "6.1.1(24)",
+        "targetSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS"
+      }
+    ],
+    "buildModeSet": [
+      { "name": "debug" },
+      { "name": "release" }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": ["default"]
+        }
+      ]
+    }
+  ]
+}

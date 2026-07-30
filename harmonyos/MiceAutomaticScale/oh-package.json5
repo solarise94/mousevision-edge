@@ -1,0 +1,12 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "miceautomatic-scale",
+  "version": "0.1.0",
+  "description": "MiceAutomatic 鸿蒙原生 HAP：K797 蓝牙天平广播读取 + H5 Bridge",
+  "main": "",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.21"
+  }
+}
