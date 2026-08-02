@@ -1,5 +1,5 @@
 // =============================================================================
-// K797 BLE 虚拟硬件固件 (ESP32-C3 + NimBLE-Arduino 2.x)
+// K797 BLE 虚拟硬件固件 (ESP32-C6 + NimBLE-Arduino 2.x)
 // -----------------------------------------------------------------------------
 // 模拟真实 K797 不可连接蓝牙天平的广播，供鸿蒙/Android 扫描器与解析器联调。
 //
@@ -261,7 +261,7 @@ static void initAdvertising() {
     g_adv->enableScanResponse(false);
     // 名称必须在 ADV PDU 内（31B 预算正好放得下），不依赖 scan response
     g_adv->setName(K797_NAME);
-    g_adv->setAdvertisementInterval(msToAdvUnits(g_advIntervalMs));
+    g_adv->setAdvertisingInterval(msToAdvUnits(g_advIntervalMs));
     // 初始载荷：0.0g
     buildManufDataRaw(0);
     applyPayloadAndRefresh();
@@ -715,7 +715,7 @@ void setup() {
     delay(100);  // 让 NimBLE 稳定
     Serial.println();
     Serial.println(F("========================================"));
-    Serial.println(F("K797 BLE emulator (ESP32-C3, NimBLE 2.x)"));
+    Serial.println(F("K797 BLE emulator (ESP32-C6, NimBLE 2.x)"));
     Serial.println(F("non-connectable ADV_NONCONN_IND, no GATT"));
     Serial.printf("interval %lu ms, payload %u bytes, name \"%s\", mfgId 0x%04X\n",
                   (unsigned long)g_advIntervalMs, K797_PAYLOAD_LEN,
@@ -735,7 +735,7 @@ void loop() {
     tickScenario();
     tickNoise();
 
-    // 轻量让出：避免 100% CPU；ESP32-C3 单核 Arduino 无 RTOS yield 需求，
+    // 轻量让出：避免 100% CPU；ESP32-C6 单核 Arduino 无 RTOS yield 需求，
     // 但 delay(1) 给 NimBLE 协议栈留出处理窗口。
     delay(1);
 }
