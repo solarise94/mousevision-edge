@@ -56,6 +56,15 @@
           "abilities": ["EntryAbility"],
           "when": "inuse"
         }
+      },
+      {
+        // 网页 getUserMedia 录制称重视频；另需 Web 组件 onPermissionRequest 放行。
+        "name": "ohos.permission.CAMERA",
+        "reason": "$string:reason_camera",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "inuse"
+        }
       }
     ]
   }

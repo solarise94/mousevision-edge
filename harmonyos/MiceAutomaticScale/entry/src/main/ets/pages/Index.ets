@@ -192,7 +192,23 @@ struct Index {
   @State statusState: string = 'off';
   @State currentSourceName: string = 'script';
   @State currentScenario: string = '(无)';
+  /** 调试面板默认折叠（生产界面保持干净），点状态行右侧「调试」展开。 */
+  @State showDebug: boolean = false;
+  /** 权限结果异步到达：冷启动时 aboutToAppear 读到的大概率是 undefined，
+   *  用 @StorageLink + @Watch 在权限落定后自动切到 BLE 源。 */
+  @StorageLink('bluetoothGranted') @Watch('onBluetoothGrantedChanged') bluetoothGranted: boolean = false;
+  /** 用户/网页显式切过源（debug 面板或 selectScaleSource）后不再自动切换。 */
+  private userSwitchedSource: boolean = false;
   private lastReadingAtEpochMs: number | null = null;
+
+  /** 权限结果落定回调：已授权且仍在默认 script 源 → 自动切 BLE 实时源。 */
+  private onBluetoothGrantedChanged(): void {
+    if (this.bluetoothGranted && !this.userSwitchedSource && this.currentSourceName === 'script') {
+      const b = new BleK797Source(this.clock, this.diagnostics);
+      this.switchSource(b, 'ble');
+      this.currentScenario = '(BLE 实时扫描)';
+    }
+  }
 
   aboutToAppear(): void {
     const host: BridgeHost = new IndexBridgeHost(
@@ -317,6 +333,7 @@ struct Index {
   }
 
   private selectSource(name: SourceSelector): void {
+    this.userSwitchedSource = true;
     if (name === 'script') {
       const s = new ScriptScaleSource(this.clock);
       this.switchSource(s, 'script');
@@ -390,18 +407,24 @@ struct Index {
 
   build() {
     Column() {
-      // 状态条。
+      // 状态条（右侧「调试」展开/收起 debug 面板，默认折叠保持界面干净）。
       Row() {
         Text(`[${this.currentSourceName}] ${this.statusText}`)
           .fontSize(13)
           .fontColor('#333333')
           .layoutWeight(1)
+        if (DEBUG_ENABLED) {
+          Text(this.showDebug ? '收起' : '调试')
+            .fontSize(13)
+            .fontColor('#007AFF')
+            .onClick(() => { this.showDebug = !this.showDebug; })
+        }
       }
       .width('100%')
       .padding({ left: 12, right: 12, top: 8, bottom: 4 })
 
-      // debug 面板：源切换 / 启停。
-      if (DEBUG_ENABLED) {
+      // debug 面板：源切换 / 启停（默认折叠）。
+      if (DEBUG_ENABLED && this.showDebug) {
         Row({ space: 8 }) {
           Button('脚本源').onClick(() => this.selectSource('script')).fontSize(12).layoutWeight(1)
           Button('回放源').onClick(() => this.selectSource('replay')).fontSize(12).layoutWeight(1)
@@ -443,6 +466,14 @@ struct Index {
           ),
         )
         .domStorageAccess(true)
+        // 网页 getUserMedia（摄像头/麦克风）权限请求：页面来源已被白名单约束，
+        // 且宿主已申请 ohos.permission.CAMERA，这里按网页请求的资源直接放行；
+        // 不放行时 ArkWeb 默认拒绝，getUserMedia 报 NotAllowedError。
+        .onPermissionRequest((event: OnPermissionRequestEvent) => {
+          if (event !== null && event.request !== null) {
+            event.request.grant(event.request.getAccessibleResource());
+          }
+        })
         .onPageEnd(() => {
           if (this.bridge !== null) {
             this.bridge.onPageFinish();

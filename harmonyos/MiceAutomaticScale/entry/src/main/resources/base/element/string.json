@@ -1,11 +1,36 @@
 {
   "string": [
-    { "name": "module_desc", "value": "MiceAutomatic 蓝牙天平称量" },
-    { "name": "EntryAbility_desc", "value": "MiceAutomatic 蓝牙天平称量" },
-    { "name": "EntryAbility_label", "value": "小鼠称量" },
-    { "name": "app_name", "value": "小鼠称量" },
-    { "name": "reason_bluetooth", "value": "需要蓝牙扫描以读取 K797 天平广播" },
-    { "name": "reason_location", "value": "部分系统版本要求定位权限才能扫描蓝牙" },
-    { "name": "reason_internet", "value": "需要联网加载称量页面" }
+    {
+      "name": "module_desc",
+      "value": "MiceAutomatic 蓝牙天平称量"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "MiceAutomatic 蓝牙天平称量"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "小鼠称量"
+    },
+    {
+      "name": "app_name",
+      "value": "小鼠称量"
+    },
+    {
+      "name": "reason_bluetooth",
+      "value": "需要蓝牙扫描以读取 K797 天平广播"
+    },
+    {
+      "name": "reason_location",
+      "value": "部分系统版本要求定位权限才能扫描蓝牙"
+    },
+    {
+      "name": "reason_internet",
+      "value": "需要联网加载称量页面"
+    },
+    {
+      "name": "reason_camera",
+      "value": "需要摄像头录制称重过程视频"
+    }
   ]
 }

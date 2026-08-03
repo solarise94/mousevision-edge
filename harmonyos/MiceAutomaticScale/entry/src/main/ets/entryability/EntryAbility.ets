@@ -120,21 +120,31 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
-  /** 请求蓝牙权限；结果通过 AppStorage 通道通知页面。 */
+  /** 请求应用权限（蓝牙 + 摄像头）；结果通过 AppStorage 通道通知页面。
+   *  摄像头：网页 getUserMedia 录制视频需要 ohos.permission.CAMERA，
+   *  且需 Web 组件 onPermissionRequest 放行（见 Index.ets）。 */
   private requestBluetoothPermission(): void {
-    const permissions: Permissions[] = ['ohos.permission.ACCESS_BLUETOOTH'];
+    const permissions: Permissions[] = [
+      'ohos.permission.ACCESS_BLUETOOTH',
+      'ohos.permission.CAMERA',
+    ];
     try {
       const controller: abilityAccessCtrl.AtManager = abilityAccessCtrl.createAtManager();
       controller.requestPermissionsFromUser(this.context, permissions)
         .then((data: PermissionRequestResult) => {
-          const granted: boolean = data.authResults.every((r: number) => r === 0);
-          AppStorage.setOrCreate<boolean>('bluetoothGranted', granted);
+          // authResults 与 permissions 顺序对齐；分开判定，互不影响。
+          const bleGranted: boolean = data.authResults.length > 0 && data.authResults[0] === 0;
+          const camGranted: boolean = data.authResults.length > 1 && data.authResults[1] === 0;
+          AppStorage.setOrCreate<boolean>('bluetoothGranted', bleGranted);
+          AppStorage.setOrCreate<boolean>('cameraGranted', camGranted);
         })
         .catch((reason: Object) => {
           AppStorage.setOrCreate<boolean>('bluetoothGranted', false);
+          AppStorage.setOrCreate<boolean>('cameraGranted', false);
         });
     } catch (e) {
       AppStorage.setOrCreate<boolean>('bluetoothGranted', false);
+      AppStorage.setOrCreate<boolean>('cameraGranted', false);
     }
   }
 }

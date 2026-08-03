@@ -2780,7 +2780,8 @@
           class: "btn primary",
           onClick: () => {
             setCurrentBox({ cageId: cage, strain: strain || "其他", mouseNoPad: box ? box.mouse_no_pad : 2 });
-            go("/record");
+            // 与首页「开始录制」一致：先选记录模式（后匹配/即时报数/手动）再进录制。
+            go("/mode");
           },
         }, "继续录制"),
       ])
