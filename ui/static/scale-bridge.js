@@ -30,8 +30,10 @@
   // 读数校验上下界（K797 量程相关，与后端一致）
   var MAX_GRAMS = 6553.5;
   var MAX_RAW = 65535;
-  // stale 判定窗口：超过该毫秒数无有效读数即视为广播中断
-  var DEFAULT_STALE_MS = 10000;
+  // stale 判定窗口：超过该毫秒数无有效读数即视为广播中断。
+  // 与原生侧（ScaleSource STALE_THRESHOLD_MS）一致取 15s——卓易通等容器
+  // 扫描投递比原生更稀疏/突发，10s 偏紧会误判 stale 导致克数频繁闪 --。
+  var DEFAULT_STALE_MS = 15000;
   // stale 看门狗检查间隔
   var STALE_CHECK_MS = 1000;
   // 一旦原生状态处于下列取值且无新鲜读数，通道直接视为 stale

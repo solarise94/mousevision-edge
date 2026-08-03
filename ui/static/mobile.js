@@ -95,7 +95,9 @@
     });
     ch.onStaleChange(function (isStale) {
       scaleConn.state = isStale ? "stale" : "connected";
-      if (isStale) scaleConn.lastGrams = null;
+      // 短暂 stale 时**保留**上一个有效克数：状态点已表达"广播中断"，
+      // 数字不应清空，否则读数间隙（卓易通容器扫描投递比原生更稀疏/突发）
+      // 会让卡片在 26.3 与 -- g 之间闪烁。彻底清空只发生在 disconnect/error。
       notifyScaleConn();
     });
     ch.onStatus(function (detail) {
@@ -860,8 +862,9 @@
       error: scaleConn.errorMsg || "天平异常",
     };
     statusText.textContent = labels[s] || s;
-    // connected 时副标题显示 设备名 · 实时克数
-    if (s === "connected") {
+    // connected/stale 时副标题显示 设备名 · 实时克数（stale 保留最近一次有效读数，
+    // 仅状态点变橙表达"广播中断"，数字不闪烁）。
+    if (s === "connected" || s === "stale") {
       const name = scaleConn.selectedDeviceName || "";
       const g = scaleConn.lastGrams !== null ? Number(scaleConn.lastGrams).toFixed(1) + " g" : "—";
       weightText.textContent = name ? `${name} · ${g}` : g;
@@ -2407,10 +2410,10 @@
         updateScaleMeta(reading);
         sendScaleReadingToWs(reading);
       });
-      // stale 切换 → 显示 "--" + 中断提示
+      // stale 切换 → 保留上一个有效读数（数字不闪），仅提示"广播中断"；
+      // 读数间隙（卓易通容器扫描稀疏）若清数字会在 26.3 与 -- 间反复闪烁。
       scaleChannel.onStaleChange(function (isStale) {
         if (isStale && rtState !== "announced" && rtState !== "accepted") {
-          setWeightValue(null, false);
           showScaleStaleHint(true);
         }
       });
