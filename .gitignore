@@ -61,7 +61,10 @@ harmonyos/MiceAutomaticScale/.deveco-env.sh
 # Command Line Tools（华为官方下载，~6GB，含 SDK/hdc/hvigor，不入库）
 command-line-tools/
 
-# 本地工具链暂存目录
+# Android SDK 根目录（本地下载的 cmdline-tools + platforms/build-tools/platform-tools）
+android-sdk/
+
+# 本地工具链暂存目录（含本地 Gradle 发行版 .toolchain/gradle-*/）
 .toolchain/
 
 # 鸿蒙 hvigor 构建产物与缓存

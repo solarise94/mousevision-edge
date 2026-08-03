@@ -305,7 +305,7 @@ export abstract class ScaleSourceBase implements ScaleSource {
     }
   }
 
-  /** 安排一次 stale 检查（10s 后），覆盖之前的。 */
+  /** 安排一次 stale 检查（STALE_THRESHOLD_MS 后），覆盖之前的。 */
   private scheduleStaleCheck(): void {
     this.cancelStaleCheck();
     // setTimeout 在 ArkTS/浏览器宿主可用；如目标环境无全局 setTimeout，
@@ -337,7 +337,7 @@ export abstract class ScaleSourceBase implements ScaleSource {
     const elapsed = this.clock.nowMs() - this.lastReadingAtMonotonicMs;
     if (elapsed >= STALE_THRESHOLD_MS) {
       // stale 绝不产生 0 g 读数：这里只切状态，不派发任何读数。
-      this.transition('stale', '超过 10 秒未收到合法 K797 广播');
+      this.transition('stale', '超过 15 秒未收到合法 K797 广播');
     } else {
       // 还没到阈值，继续等待剩余时间。
       const remain = STALE_THRESHOLD_MS - elapsed;
