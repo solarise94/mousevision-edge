@@ -1903,15 +1903,19 @@
           setQualityHints(
             msg.hints && msg.hints.length ? msg.hints : ["请调整手机，使显示屏位于画面内"]
           );
-          setWeightValue(msg.weight != null ? msg.weight : null, false);
+          // 仅当 msg.weight 有效时才写数字；state 消息无 weight 字段（只有
+          // weight_candidate），msg.weight 恒 undefined，否则每帧都把数字清成
+          // "--" 与 BLE 直读（10Hz）打架造成 26.3 ↔ -- 高频闪烁。数字显示统一
+          // 由上面的 weight_candidate 分支与 BLE setBleWeightDisplay 负责。
+          if (msg.weight != null) setWeightValue(msg.weight, false);
           break;
         case "armed":
           setQualityHints(["请将小鼠放上秤盘"]);
-          setWeightValue(msg.weight != null ? msg.weight : null, false);
+          if (msg.weight != null) setWeightValue(msg.weight, false);
           break;
         case "weighing":
           setQualityHints([]);
-          setWeightValue(msg.weight != null ? msg.weight : null, false);
+          if (msg.weight != null) setWeightValue(msg.weight, false);
           break;
         case "announced":
           setQualityHints([]);
@@ -1920,7 +1924,8 @@
           break;
         case "wait_clear":
           setQualityHints(["请取走小鼠"]);
-          setWeightValue(null, false);
+          // wait_clear 保留最近读数（取走小鼠过程中 BLE 直读仍会刷新为真实值，
+          // 包括回到 0.0）；不再强制清 "--"，避免与 BLE 直读打架闪烁。
           break;
         case "accepted":
           setQualityHints([]);
@@ -2042,9 +2047,15 @@
         const newState = msg.state || rtState;
 
         // Weight display: use weight_candidate (backend field name).
+        // BLE 模式（native_ble）：非 announced 态的数字由 BLE 直读独占
+        // （setBleWeightDisplay，1 位小数），引擎候选值不介入，避免
+        // 26.3(BLE) ↔ 26.30(引擎2位小数) 的格式/来源抖动；announced 态
+        // 仍以引擎确认值为准（权威，2 位小数）。OCR 模式引擎是唯一来源，全量写。
         if (typeof msg.weight_candidate === "number") {
           const confirmed = newState === "announced";
-          setWeightValue(msg.weight_candidate, confirmed);
+          if (weightSource !== "native_ble" || confirmed) {
+            setWeightValue(msg.weight_candidate, confirmed);
+          }
           if (confirmed) announcedWeight = msg.weight_candidate;
         }
 
