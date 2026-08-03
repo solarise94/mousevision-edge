@@ -32,6 +32,70 @@
   loadCurrentBox();
 
   /* ------------------------------------------------------------------ *
+   * 全局天平连接管理（首页连接一次，整 app 共享；record 复用）。
+   * K797 不可连接广播秤必须持续被动扫描，所以连接 = 持续扫描 + 监听状态。
+   * ------------------------------------------------------------------ */
+  const scaleConn = {
+    channel: null,            // ScaleBridge.createScaleChannel() 实例
+    state: "disconnected",    // disconnected | connecting | connected | stale | error
+    lastGrams: null,          // 最近读数克数（显示用）
+    lastReading: null,        // 最近读数 detail
+    errorMsg: "",
+    _subs: [],                // 状态变更订阅者（首页卡片等）
+  };
+  function notifyScaleConn() {
+    scaleConn._subs.forEach((fn) => { try { fn(); } catch (_) {} });
+  }
+  function connectScale() {
+    if (!ScaleBridge.detectNativeBridge()) {
+      scaleConn.state = "error";
+      scaleConn.errorMsg = "未检测到天平桥（请在原生外壳中打开）";
+      notifyScaleConn();
+      return;
+    }
+    if (scaleConn.channel) return; // 已在连接
+    scaleConn.state = "connecting";
+    scaleConn.errorMsg = "";
+    notifyScaleConn();
+    const ch = ScaleBridge.createScaleChannel();
+    ch.onReading(function (reading) {
+      scaleConn.lastReading = reading;
+      scaleConn.lastGrams = reading.grams;
+      if (scaleConn.state !== "connected") {
+        scaleConn.state = "connected";
+        notifyScaleConn();
+      }
+    });
+    ch.onStaleChange(function (isStale) {
+      scaleConn.state = isStale ? "stale" : "connected";
+      if (isStale) scaleConn.lastGrams = null;
+      notifyScaleConn();
+    });
+    ch.onStatus(function (detail) {
+      const bad = detail.state === "unauthorized" || detail.state === "bluetooth_off" ||
+        detail.state === "off" || detail.state === "error";
+      if (bad) {
+        scaleConn.state = "error";
+        scaleConn.errorMsg = detail.message || "天平异常";
+        notifyScaleConn();
+      }
+    });
+    ch.start();
+    scaleConn.channel = ch;
+  }
+  function disconnectScale() {
+    if (scaleConn.channel) {
+      try { scaleConn.channel.stop(); } catch (_) {}
+      scaleConn.channel = null;
+    }
+    scaleConn.state = "disconnected";
+    scaleConn.lastGrams = null;
+    scaleConn.lastReading = null;
+    scaleConn.errorMsg = "";
+    notifyScaleConn();
+  }
+
+  /* ------------------------------------------------------------------ *
    * API
    * ------------------------------------------------------------------ */
   const api = {
@@ -448,10 +512,14 @@
       })
     );
     const content = h("div", { class: "content" });
+
+    // 天平连接卡片（全局连接入口）
+    const connectCard = renderScaleConnectCard();
+    content.appendChild(connectCard);
+
     content.appendChild(h("div", { class: "hero-illus", html: HERO_SVG }));
-    content.appendChild(
-      h("button", { class: "btn primary", onClick: startRecording }, "📷  开始录制")
-    );
+    const startBtn = h("button", { class: "btn primary", onClick: startRecording }, "📷  开始录制");
+    content.appendChild(startBtn);
     content.appendChild(
       h("button", { class: "btn outline", onClick: () => go("/manage") }, "🗂  开始管理")
     );
@@ -472,6 +540,14 @@
     screen.appendChild(content);
     mount(screen);
 
+    // 连接卡片订阅全局连接状态实时刷新
+    const updater = renderScaleConnectCard._updater(connectCard, startBtn);
+    scaleConn._subs.push(updater);
+    return () => {
+      const i = scaleConn._subs.indexOf(updater);
+      if (i >= 0) scaleConn._subs.splice(i, 1);
+    };
+
     try {
       const data = await api.recentBoxes();
       listWrap.innerHTML = "";
@@ -484,6 +560,59 @@
       listWrap.innerHTML = "";
       listWrap.appendChild(h("div", { class: "empty" }, err.message));
     }
+  }
+
+  // 天平连接卡片渲染 + 状态→DOM 更新器（返回一个订阅函数）
+  function renderScaleConnectCard() {
+    const card = h("div", { class: "card scale-connect-card" });
+    const dot = h("span", { class: "connect-dot" });
+    const statusText = h("div", { class: "connect-status-text" }, "天平未连接");
+    const weightText = h("div", { class: "connect-weight" }, "");
+    const info = h("div", { class: "connect-info" }, [statusText, weightText]);
+    const actionBtn = h("button", { class: "btn outline connect-action" }, "连接天平");
+    actionBtn.addEventListener("click", () => {
+      if (scaleConn.state === "disconnected" || scaleConn.state === "error") connectScale();
+      else disconnectScale();
+    });
+    card.appendChild(h("div", { class: "connect-row" }, [h("div", { class: "connect-left" }, [dot, info]), actionBtn]));
+    // 立即按当前状态渲染一次
+    applyConnectState(card, dot, statusText, weightText, actionBtn);
+    return card;
+  }
+  renderScaleConnectCard._updater = function (card, startBtn) {
+    return function () {
+      const dot = card.querySelector(".connect-dot");
+      const statusText = card.querySelector(".connect-status-text");
+      const weightText = card.querySelector(".connect-weight");
+      const actionBtn = card.querySelector(".connect-action");
+      applyConnectState(card, dot, statusText, weightText, actionBtn);
+      // 开始录制按钮：未连接时仍允许（手动模式可用），但给出提示样式
+      if (startBtn) {
+        const connected = scaleConn.state === "connected";
+        startBtn.classList.toggle("btn-primary-dim", !connected);
+      }
+    };
+  };
+  function applyConnectState(card, dot, statusText, weightText, actionBtn) {
+    const s = scaleConn.state;
+    dot.className = "connect-dot " + s;
+    const labels = {
+      disconnected: "天平未连接",
+      connecting: "正在连接天平…",
+      connected: "天平已连接",
+      stale: "天平广播中断",
+      error: scaleConn.errorMsg || "天平异常",
+    };
+    statusText.textContent = labels[s] || s;
+    if (s === "connected" && scaleConn.lastGrams !== null) {
+      weightText.textContent = Number(scaleConn.lastGrams).toFixed(1) + " g";
+      weightText.hidden = false;
+    } else {
+      weightText.textContent = "";
+      weightText.hidden = true;
+    }
+    actionBtn.textContent = (s === "disconnected" || s === "error") ? "连接天平" : "断开";
+    actionBtn.disabled = (s === "connecting");
   }
 
   function recentRow(b) {
@@ -502,8 +631,54 @@
   }
 
   function startRecording() {
-    if (state.currentBox) go("/record");
+    if (state.currentBox) go("/mode");
     else go("/scan");
+  }
+
+  /* ================================================================== *
+   * 视图：录制模式选择（选笼号后、进录制前）
+   * 三模式：后匹配 / 即时报数 / 手动。未连接天平时仅允许手动。
+   * ================================================================== */
+  function viewMode() {
+    const screen = h("div", { class: "screen" });
+    const box = state.currentBox || { cageId: "-" };
+    screen.appendChild(appbar("选择录制模式", { back: "/scan" }));
+    const content = h("div", { class: "content" });
+    content.appendChild(h("div", { class: "card mode-info-card" },
+      h("div", { class: "li-sub" }, `本次录制：箱 ${box.cageId}`)
+    ));
+
+    const connected = scaleConn.state === "connected";
+    const modes = [
+      { id: "post_match", label: "后匹配", desc: "连续录像，自动记录每只，事后审核", requireScale: true },
+      { id: "announce", label: "即时报数", desc: "每只暂停确认重量，语音报数", requireScale: true },
+      { id: "manual", label: "手动", desc: "人工输入每只克数，无需天平", requireScale: false },
+    ];
+    const chips = h("div", { class: "mode-chips" });
+    modes.forEach((m) => {
+      const disabled = m.requireScale && !connected;
+      const chip = h("button", {
+        class: "mode-chip" + (disabled ? " disabled" : ""),
+        onClick: () => {
+          if (disabled) { toast("请先在首页连接天平"); return; }
+          sessionStorage.setItem("mv.recordMode", m.id);
+          go("/record");
+        },
+      }, [
+        h("div", { class: "mode-chip-label" }, m.label),
+        h("div", { class: "mode-chip-desc" }, m.desc),
+      ]);
+      chips.appendChild(chip);
+    });
+    content.appendChild(chips);
+    if (!connected) {
+      content.appendChild(h("div", { class: "mode-hint" }, "天平未连接：后匹配/即时报数需先连接天平；可选择手动模式。"));
+    }
+    screen.appendChild(content);
+    mount(screen);
+  }
+  function currentRecordMode() {
+    return sessionStorage.getItem("mv.recordMode") || "announce";
   }
 
   /* ================================================================== *
@@ -822,7 +997,7 @@
         strain: box ? box.strain : "其他",
         mouseNoPad: box ? box.mouse_no_pad : 2,
       });
-      go("/record");
+      go("/mode");
     }
 
     return () => {
@@ -851,6 +1026,13 @@
     }
     document.documentElement.classList.add("camera-mode", "record-light");
     const box = state.currentBox;
+    // 录制模式与重量来源：必须在所有引用 recordMode/weightSource 的 DOM 构造之前计算
+    // （manualPanel、weightSource 判断等都在下方同步执行，TDZ 要求先声明）。
+    const scaleAvailable = ScaleBridge.detectNativeBridge();
+    const recordMode = currentRecordMode();
+    const weightSource = recordMode === "manual"
+      ? "manual"
+      : (scaleAvailable ? "native_ble" : "ocr");
     const titleEl = h("h1", {}, `实时称重 · ${box.cageId}`);
     function setTitle(text) { titleEl.textContent = text; }
     const switchCamBtn = h(
@@ -959,10 +1141,40 @@
       "已记录 0 只"
     );
 
+    // 手动模式：克数输入 + 确认本只（替代 BLE 自动读数）
+    const manualInput = h("input", {
+      class: "field manual-weight-input", type: "number", inputmode: "decimal",
+      step: "0.1", min: "0", max: "6553.5", placeholder: "输入克数，如 25.4",
+    });
+    const manualSubmit = h("button", { class: "btn primary manual-submit-btn", type: "button" }, "确认本只");
+    const manualPanel = h("div", { class: "manual-panel", hidden: recordMode !== "manual" },
+      [manualInput, manualSubmit]);
+    manualSubmit.addEventListener("click", () => {
+      const val = parseFloat(manualInput.value);
+      if (!isFinite(val) || val < 0 || val > 6553.5) {
+        toast("请输入有效克数（0 ~ 6553.5）");
+        return;
+      }
+      const sent = rtSend({ type: "manual_weight", weight_g: val });
+      if (sent) {
+        rtMouseCount += 1;
+        mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
+        setWeightValue(val, true);
+        manualInput.value = "";
+      } else {
+        toast("发送失败，请检查网络");
+      }
+    });
+    manualInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); manualSubmit.click(); }
+    });
+
+    const dockChildren = [stateIndicator, weightDisplay, qualityHints, actionButtons, mouseCount];
+    if (recordMode === "manual") dockChildren.push(manualPanel);
     const dock = h(
       "div",
       { class: "realtime-dock", style: "padding:8px 16px 16px" },
-      [stateIndicator, weightDisplay, qualityHints, actionButtons, mouseCount]
+      dockChildren
     );
 
     const stage = h("div", { class: "camera-stage record-stage realtime-stage" }, [
@@ -1031,8 +1243,7 @@
 
     // 蓝牙天平桥接：原生外壳注入 window.MiceAutomaticScale 时启用 BLE 源，
     // 否则全程走 OCR（行为与改造前逐字节一致）。
-    const scaleAvailable = ScaleBridge.detectNativeBridge();
-    const weightSource = scaleAvailable ? "native_ble" : "ocr";
+    // （recordMode / weightSource 已在 viewRecord 开头计算，见上方。）
     let scaleChannel = null;          // ScaleBridge.createScaleChannel() 实例
     let scaleDedup = null;            // createDedupSender：值变化去重 + 2s 心跳 + 重连 flush
     let scaleReadingInvalidCount = 0; // 后端拒绝计数（scale_reading_invalid）
@@ -1572,11 +1783,14 @@
           setQualityHints([]);
         }
 
-        // New attempt announced → speak + show action buttons.
+        // New attempt announced → speak + show action buttons (announce mode)。
+        // post_match 模式自动 accept（在 setState 之后，确保 rtState 已是 announced）。
         if (msg.attempt && newState === "announced") {
           announcedWeight = msg.attempt.weight_g;
           setWeightValue(announcedWeight, true);
-          speakWeight(announcedWeight);
+          if (recordMode !== "post_match") {
+            speakWeight(announcedWeight);
+          }
         }
 
         // Weight accepted (auto or explicit) → update count.
@@ -1587,6 +1801,11 @@
         }
 
         setState(newState, msg);
+
+        // post_match：状态置好后自动确认（sendAccept 守卫 rtState==="announced"）。
+        if (msg.attempt && newState === "announced" && recordMode === "post_match") {
+          sendAccept();
+        }
       } else if (t === "ack") {
         // Response to a retry/accept command — never releases a frame lock.
         if (msg.cmd === "accept") {
@@ -1663,7 +1882,9 @@
       }
       // Do not optimistic-switch to armed; wait for applied ACK.
     });
-    acceptBtn.addEventListener("click", async () => {
+    acceptBtn.addEventListener("click", sendAccept);
+    async function sendAccept() {
+      if (rtState !== "announced") return;
       stopFrameLoop();
       await waitForPendingFrameClear(FRAME_ACK_TIMEOUT_MS);
       const sent = rtSend({ type: "accept" });
@@ -1671,7 +1892,7 @@
         toast("发送失败，请检查网络");
         startFrameLoop();
       }
-    });
+    }
 
     // --- Frame sending: strict single in-flight + 5fps ceiling ---
     function encodeRealtimeBlob(cb) {
@@ -1808,10 +2029,10 @@
 
     async function startRealtime() {
       try {
-        // 原生 BLE 桥存在时，向会话声明 weight_source=ble_k797，后端据此
-        // 接收 scale_reading 文本消息；OCR 模式不带该字段，行为不变。
+        // 重量来源按录制模式决定：manual → manual；native_ble → ble_k797；OCR 不带字段。
         const body = { cage_id: box.cageId, project_id: state.projectId };
         if (weightSource === "native_ble") body.weight_source = "ble_k797";
+        else if (weightSource === "manual") body.weight_source = "manual";
         const res = await api.json("/api/realtime/session", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1824,6 +2045,7 @@
         connectWs();
         startFrameLoop();
         // native_ble：WS 打开后由 connectWs 的 open 回调 flush 最新读数。
+        // manual：不连天平通道，重量由操作员手输。
         if (weightSource === "native_ble") startScaleChannel();
       } catch (err) {
         toast(err && err.message ? err.message : "无法启动实时称重");
@@ -1882,6 +2104,8 @@
 
     function startScaleChannel() {
       if (scaleChannel || weightSource !== "native_ble") return;
+      // 录制期间由本视图独占 BLE 扫描；暂停首页的全局连接通道，避免双扫描冲突。
+      if (scaleConn.channel) disconnectScale();
       // 传输层：WS 开着直发，断开时由 dedup 暂存最新一条待重连 flush。
       scaleDedup = ScaleBridge.createDedupSender(
         function (m) {
@@ -2108,6 +2332,11 @@
       if (recorder && recording) try { recorder.stop(); } catch (_) {}
       if (canvasStream) canvasStream.getTracks().forEach((t) => t.stop());
       stopStream(stream);
+      // 录制期间为避免双扫描暂停了首页全局天平连接；BLE 模式下录制结束自动恢复，
+      // 连续录多箱时回到首页无需重新点"连接天平"。
+      if (weightSource === "native_ble" && ScaleBridge.detectNativeBridge()) {
+        connectScale();
+      }
     };
   }
 
@@ -3078,6 +3307,7 @@
    * ------------------------------------------------------------------ */
   route("/", viewHome);
   route("/scan", viewScan);
+  route("/mode", viewMode);
   route("/record", viewRecord);
   route("/done", viewDone);
   route("/box/:cageId", viewBoxRecords);
