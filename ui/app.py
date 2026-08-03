@@ -773,6 +773,19 @@ app.include_router(realtime_api.router)
 scale_sync_api.configure(str(DEFAULT_OUTPUT))
 app.include_router(scale_sync_api.router)
 
+# Device-direct weighing report (pure-app: phone judges, server only persists).
+# Shares the same registry / records_meta / upload_queue singletons so reported
+# records appear everywhere offline-analysed records do.
+import ui.report_api as report_api  # noqa: E402
+
+report_api.configure(
+    registry=registry,
+    records_meta=records_meta,
+    upload_queue=upload_queue,
+    output_root=str(DEFAULT_OUTPUT),
+)
+app.include_router(report_api.router)
+
 
 class _NoCacheStaticFiles(StaticFiles):
     """StaticFiles that always sends Cache-Control: no-cache.
