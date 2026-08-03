@@ -49,6 +49,7 @@
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 #include "scenarios.h"
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,38 @@ static uint32_t              g_scenarioSilenceUntilMs = 0; // 场景内静默结
 
 // 调试统计（单调递增，便于 host 校验无丢步）
 static uint32_t      g_updateCount = 0;
+
+// ---------------------------------------------------------------------------
+// NVS 持久化（Preferences 库）：把 g_lastRaw 写入 flash，板子重启后恢复，
+// 避免重启/重插后广播静默归零（0.0g）导致 host 误判链路异常。
+// namespace "k797"，key "raw"，uint16。仅在用户命令导致固定重量变化时写
+// （enterFixed 末尾、cmdNoise 设中心值处），不在 loop/场景/噪声抖动里写，
+// 以免 flash 写磨损。
+// ---------------------------------------------------------------------------
+static constexpr const char* K797_NVS_NAMESPACE = "k797";
+static constexpr const char* K797_NVS_KEY_RAW   = "raw";
+
+// 把 g_lastRaw 写入 NVS（带 begin/end，每次写都正确开关节点）
+static void saveLastRaw() {
+    Preferences prefs;
+    if (!prefs.begin(K797_NVS_NAMESPACE, false)) {
+        Serial.println(F("ERR NVS begin(rw) failed"));
+        return;
+    }
+    prefs.putUShort(K797_NVS_KEY_RAW, g_lastRaw);
+    prefs.end();
+}
+
+// 读取 NVS 中持久化的 raw（默认 0）
+static uint16_t loadLastRaw() {
+    Preferences prefs;
+    if (!prefs.begin(K797_NVS_NAMESPACE, true)) {
+        return 0;  // 读模式打开失败按默认 0 处理
+    }
+    uint16_t v = prefs.getUShort(K797_NVS_KEY_RAW, 0);
+    prefs.end();
+    return v;
+}
 
 // ---------------------------------------------------------------------------
 // 工具：grams <-> raw
@@ -356,6 +389,8 @@ static void enterFixed(uint16_t raw) {
     // 若处于静默，恢复广播
     g_silenceActive = false;
     startAdv();
+    // 持久化最新固定重量，板子重启后可恢复（覆盖 GRAMS/RAW/ZERO/STOP 恢复）
+    saveLastRaw();
 }
 
 // ---- GRAMS <float> ---------------------------------------------------------
@@ -436,6 +471,8 @@ static void cmdNoise(const char* a1, const char* a2) {
     applyPayloadAndRefresh();
     g_silenceActive = false;
     startAdv();
+    // 持久化中心值（STOP/重启恢复用）
+    saveLastRaw();
     Serial.printf("OK NOISE center %.1f amp +-%.1f g (raw %u +-%u)\n",
                   (double)g, (double)amp, (unsigned)g_noiseCenter, (unsigned)g_noiseAmp);
 }
@@ -494,6 +531,22 @@ static void cmdStop() {
                   (double)rawToGrams(g_lastRaw), (unsigned)g_lastRaw);
 }
 
+// ---- FACTORY ----------------------------------------------------------------
+// 清除 NVS（preferences.clear()），g_lastRaw=0，重新广播 0.0g。
+// 用于测试复位：保证重启后不会从 NVS 恢复旧重量。
+static void cmdFactory() {
+    Preferences prefs;
+    if (!prefs.begin(K797_NVS_NAMESPACE, false)) {
+        Serial.println(F("ERR NVS begin(rw) failed"));
+        return;
+    }
+    prefs.clear();   // 清除整个 k797 命名空间
+    prefs.end();
+    // 回到 0.0g 固定广播（enterFixed 内会再次写 NVS=0，保持一致）
+    enterFixed(0);
+    Serial.println(F("OK FACTORY (cleared NVS, 0.0 g)"));
+}
+
 // ---- PLAY <name> [LOOP] ----------------------------------------------------
 static void cmdPlay(const char* a1, const char* a2) {
     if (!a1) { Serial.println(F("ERR PLAY <scenario> [LOOP]")); return; }
@@ -536,9 +589,12 @@ static void cmdStatus() {
     const char* malStr =
         g_malKind == MalformedKind::Short  ? "short"  :
         g_malKind == MalformedKind::Prefix ? "prefix" : "none";
+    // 读 NVS 当前持久化值（只读打开，不影响写入）
+    uint16_t persistedRaw = loadLastRaw();
     Serial.printf(
         "{\"device\":\"K797\",\"mode\":\"%s\",\"running\":%s,"
         "\"silenced\":%s,\"intervalMs\":%lu,\"lastRaw\":%u,\"lastGrams\":%.1f,"
+        "\"persistedRaw\":%u,"
         "\"noiseCenter\":%u,\"noiseAmp\":%u,\"malformed\":\"%s\","
         "\"scenario\":\"%s\",\"scenarioLoop\":%s,"
         "\"updateCount\":%lu,\"freeHeap\":%lu}\n",
@@ -547,6 +603,7 @@ static void cmdStatus() {
         g_silenceActive ? "true" : "false",
         (unsigned long)g_advIntervalMs,
         (unsigned)g_lastRaw, (double)rawToGrams(g_lastRaw),
+        (unsigned)persistedRaw,
         (unsigned)g_noiseCenter, (unsigned)g_noiseAmp,
         malStr,
         g_scenario ? g_scenario->name : "",
@@ -568,7 +625,8 @@ static void cmdHelp() {
     Serial.println(F("  MALFORMED prefix   corrupted prefix byte (CB) until STOP"));
     Serial.println(F("  INTERVAL <ms>      advertising interval (100..1000)"));
     Serial.println(F("  STOP               stop noise/scenario/malformed, resume"));
-    Serial.println(F("  STATUS             print state JSON"));
+    Serial.println(F("  FACTORY            clear NVS + reset weight to 0.0 g"));
+    Serial.println(F("  STATUS             print state JSON (incl. persistedRaw)"));
     Serial.println(F("  HELP               this list"));
     Serial.println(F("scenarios:"));
     for (size_t i = 0; i < k797::kScenarioCount; ++i) {
@@ -596,6 +654,7 @@ static void dispatchCommand(const String& line) {
     else if (cmd == "malformed") cmdMalformed(a1);
     else if (cmd == "interval")  cmdInterval(a1);
     else if (cmd == "stop")      cmdStop();
+    else if (cmd == "factory")   cmdFactory();
     else if (cmd == "status")    cmdStatus();
     else if (cmd == "help" || cmd == "?") cmdHelp();
     else {
@@ -712,6 +771,18 @@ void setup() {
 #endif
 
     initAdvertising();
+
+    // NVS 恢复上次固定重量：板子重启后立即广播上次重量，避免静默归零
+    // 导致 host 误判链路异常。默认 0（首次上电或 NVS 为空）。
+    {
+        uint16_t restored = loadLastRaw();
+        g_lastRaw = restored;
+        buildManufDataRaw(g_lastRaw);
+        applyPayloadAndRefresh();
+        Serial.printf("NVS restore raw %u (%.1f g)\n",
+                      (unsigned)restored, (double)rawToGrams(restored));
+    }
+
     startAdv();
 
     delay(100);  // 让 NimBLE 稳定
