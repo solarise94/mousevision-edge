@@ -81,6 +81,14 @@
     }
   })();
 
+  /* ------------------------------------------------------------------ *
+   * 离线记录上报队列（app 级单例）。纯 app 化后称重结果由本地控制器
+   * 入队，outbox 负责联网补传 POST /api/records/report。整个 app 生命周期
+   * 复用同一个实例（localStorage 持久化 + online 事件自动 flush）。
+   * ------------------------------------------------------------------ */
+  const reportOutbox = ReportClient.createOutbox({ storage: localStorage });
+  reportOutbox.start();
+
   /* 构造并启动一个天平通道，挂载标准读数/状态/stale 回调。
    * deviceId 可选：支持设备选择 API 时传入以锁定设备；否则走旧直连。 */
   function startScaleConnChannel(deviceId) {
@@ -1317,11 +1325,10 @@
     const box = state.currentBox;
     // 录制模式与重量来源：必须在所有引用 recordMode/weightSource 的 DOM 构造之前计算
     // （manualPanel、weightSource 判断等都在下方同步执行，TDZ 要求先声明）。
+    // 纯 app 化：无天平桥时只允许 manual（OCR 视频判定已彻底移除）。
     const scaleAvailable = ScaleBridge.detectNativeBridge();
     const recordMode = currentRecordMode();
-    const weightSource = recordMode === "manual"
-      ? "manual"
-      : (scaleAvailable ? "native_ble" : "ocr");
+    const weightSource = recordMode === "manual" ? "manual" : (scaleAvailable ? "native_ble" : "manual");
     const titleEl = h("h1", {}, `实时称重 · ${box.cageId}`);
     function setTitle(text) { titleEl.textContent = text; }
     const switchCamBtn = h(
@@ -1346,8 +1353,8 @@
     const appbarRight = h("span", { class: "rt-appbar-right" }, [switchCamBtn, finishBtn]);
 
     // Hidden source video (camera decode). Visible canvas is what the user
-    // sees, what MediaRecorder captures, and what we JPEG-encode for the
-    // realtime WebSocket stream — same 720×1280 pixels.
+    // sees and what MediaRecorder captures — same 720×1280 pixels. The video
+    // is recorded as evidence (随 report 批次上报)；判定在本地 BLE 引擎完成。
     const video = h("video", {
       class: "camera-source",
       autoplay: "",
@@ -1433,14 +1440,13 @@
         toast("请输入有效克数（0 ~ 6553.5）");
         return;
       }
-      const sent = rtSend({ type: "manual_weight", weight_g: val });
-      if (sent) {
-        rtMouseCount += 1;
-        mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
-        setWeightValue(val, true);
+      // 纯 app 化：交给本地控制器校验并生成记录（控制器内部发 'accepted' 事件
+      // 驱动 mouseCount/weight 显示）。控制器校验失败（非 manual 模式 / 越界）→ toast。
+      const rec = ctrl && ctrl.submitManual(val);
+      if (rec) {
         manualInput.value = "";
       } else {
-        toast("发送失败，请检查网络");
+        toast("记录失败，请重试");
       }
     });
     manualInput.addEventListener("keydown", (e) => {
@@ -1498,61 +1504,13 @@
     let paintedReady = false;
     let viewportObserver = null;
 
-    // Realtime-specific state
-    let rtSession = null; // { session_id, ... }
-    let ws = null;
-    let wsClosedByUs = false;
-    let reconnectHandle = null;
-    let nextFrameTimer = null;
-    let frameSeq = 0;
-    let recordingT0 = 0;
-    // Strict single in-flight frame: only the matching frame_seq ACK releases.
-    let pendingFrameSeq = null;
-    let pendingFrameSentAt = 0;
-    let frameAckTimer = null;
-    let nextAllowedSendAt = 0;
-    let frameLoopActive = false;
-    let retryInFlight = false;
-    let rtState = "connecting";
-    let rtMouseCount = 0;
-    let announcedWeight = null;
-    let finished = false;
-    let abandoned = false;
-
-    // 蓝牙天平桥接：原生外壳注入 window.MiceAutomaticScale 时启用 BLE 源，
-    // 否则全程走 OCR（行为与改造前逐字节一致）。
-    // （recordMode / weightSource 已在 viewRecord 开头计算，见上方。）
-    let scaleChannel = null;          // ScaleBridge.createScaleChannel() 实例
-    let scaleDedup = null;            // createDedupSender：值变化去重 + 2s 心跳 + 重连 flush
-    let scaleReadingInvalidCount = 0; // 后端拒绝计数（scale_reading_invalid）
-
-    // Adaptive JPEG encode profiles (realtime path only; archive video untouched).
-    const ENCODE_PROFILES = {
-      high: { name: "high", w: 720, h: 1280, quality: 0.55 },
-      medium: { name: "medium", w: 540, h: 960, quality: 0.50 },
-      low: { name: "low", w: 480, h: 854, quality: 0.40 },
-    };
-    let encodeProfile = ENCODE_PROFILES.high;
-    let recentAckMs = [];
-    // These defaults are overridden by the server's client_config on session
-    // create (P2); declared with let so they can be clamped from YAML.
-    let MIN_FRAME_INTERVAL_MS = 200; // hard 5fps ceiling
-    let FRAME_ACK_TIMEOUT_MS = 3000;
-    // Client-side timing telemetry: per-ACK {frame_seq, encode_ms, rtt_ms,
-    // jpeg_bytes}. Flushed to the server in batches (P1-3) so the session
-    // finish summary can report client encode + RTT P50/P95.
-    let clientTimingSamples = [];
-    let clientTimingFlushTimer = null;
-    const CLIENT_TIMING_FLUSH_INTERVAL_MS = 2000;
-    const CLIENT_TIMING_FLUSH_BATCH = 10;
-    // Per-frame encode bookkeeping (set in sendFrame, consumed on ACK).
-    let lastEncodeStartedAt = 0;
-    let lastEncodeMs = 0;
-    let lastJpegBytes = 0;
-
-    // Offscreen canvas for downscaled realtime JPEG (archive stays 720×1280).
-    const encodeCanvas = document.createElement("canvas");
-    const encodeCtx = encodeCanvas.getContext("2d", { alpha: false });
+    // Local-weigh controller state（纯 app 化：判定/记录/上报全部本地完成）
+    let ctrl = null;                 // LocalWeigh.createController() 实例
+    let scaleChannel = null;          // ScaleBridge.createScaleChannel() 实例（announce/post_match）
+    let rtState = "connecting";       // 当前 UI 状态（沿用 STATE_LABELS）
+    let announcedWeight = null;       // 当前候选确认克数（announced 态）
+    let finished = false;             // 完成本箱已触发
+    let abandoned = false;            // 离开页面（非完成）→ 不上报
 
     // Pixel-exact 9:16 layout within the host (excludes bottom dock chrome).
     function layoutViewport() {
@@ -1741,7 +1699,8 @@
           canvasStream.getTracks().forEach((t) => t.stop());
           canvasStream = null;
         }
-        doUpload(blob, `mv-${Date.now()}.${extForMime(type)}`, durationSec, {
+        // 纯 app 化：视频证据随本地称重批次上报（不再 POST /api/jobs 做 OCR）。
+        finishBoxFlow(blob, `mv-${Date.now()}.${extForMime(type)}`, durationSec, {
           captureMode: "realtime",
           captureMeta: meta,
         });
@@ -1750,86 +1709,10 @@
       recorder.start();
       recording = true;
       startedAt = Date.now();
-      recordingT0 = startedAt;
       return true;
     }
 
-    function doUpload(blob, filename, durationSec, uploadOpts) {
-      stopDraw();
-      stopStream(stream);
-      stream = null;
-      setTitle("上传中");
-      renderUploading(box, blob, filename, durationSec, uploadOpts || {});
-    }
-
-    // --- Realtime session + WebSocket ---
-    function getToken() {
-      try {
-        const meta = document.querySelector('meta[name="mousevision-api-token"]');
-        return meta && meta.content ? meta.content.trim() : "";
-      } catch (_) {
-        return "";
-      }
-    }
-
-    function rtSend(obj) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify(obj)); return true; } catch (_) {}
-      }
-      return false;
-    }
-
-    function showReconnect(show) {
-      reconnectOverlay.hidden = !show;
-    }
-
-    function connectWs() {
-      if (!rtSession || !rtSession.session_id) return;
-      const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      const token = getToken();
-      const qs = `session_id=${encodeURIComponent(rtSession.session_id)}&token=${encodeURIComponent(token)}`;
-      const url = `${proto}//${location.host}/api/realtime/ws?${qs}`;
-      try {
-        ws = new WebSocket(url);
-        ws.binaryType = "arraybuffer";
-      } catch (err) {
-        showReconnect(true);
-        scheduleReconnect();
-        return;
-      }
-      ws.addEventListener("open", () => {
-        showReconnect(false);
-        if (rtState === "connecting") setState("calibrating", {});
-        // 蓝牙天平：重连后 flush 最新缓存的读数（仅一条），不补发过期队列
-        if (weightSource === "native_ble" && scaleDedup) {
-          scaleDedup.flush();
-        }
-      });
-      ws.addEventListener("message", (ev) => {
-        if (typeof ev.data !== "string") return;
-        let msg;
-        try { msg = JSON.parse(ev.data); } catch (_) { return; }
-        handleServerMessage(msg);
-      });
-      ws.addEventListener("close", () => {
-        releasePendingFrame();
-        if (wsClosedByUs || finished) return;
-        showReconnect(true);
-        scheduleReconnect();
-      });
-      ws.addEventListener("error", () => {
-        releasePendingFrame();
-        // The close handler will fire and trigger reconnect.
-      });
-    }
-
-    function scheduleReconnect() {
-      if (reconnectHandle || finished) return;
-      reconnectHandle = setTimeout(() => {
-        reconnectHandle = null;
-        connectWs();
-      }, 2000);
-    }
+    // --- UI 辅助（沿用既有 DOM 钩子与样式） ---
 
     function speakWeight(weight) {
       try {
@@ -1872,6 +1755,7 @@
       announced: "请确认",
       wait_clear: "等待清场",
       accepted: "已记录",
+      manual: "手动录入",
       retry_requested: "正在重测…",
     };
     const STATE_COLORS = {
@@ -1882,6 +1766,7 @@
       announced: "var(--green)",
       wait_clear: "var(--orange)",
       accepted: "var(--green)",
+      manual: "var(--blue)",
       retry_requested: "var(--orange)",
     };
 
@@ -1894,38 +1779,26 @@
       const showGuides = newState === "connecting" || newState === "calibrating";
       guides.style.display = showGuides ? "" : "none";
 
+      // announce 模式才显示确认/重测按钮；post_match 自动 accept、manual 无按钮。
       const showActions = newState === "announced";
       retryBtn.hidden = !showActions;
       acceptBtn.hidden = !showActions;
 
       switch (newState) {
         case "calibrating":
-          setQualityHints(
-            msg.hints && msg.hints.length ? msg.hints : ["请调整手机，使显示屏位于画面内"]
-          );
-          // 仅当 msg.weight 有效时才写数字；state 消息无 weight 字段（只有
-          // weight_candidate），msg.weight 恒 undefined，否则每帧都把数字清成
-          // "--" 与 BLE 直读（10Hz）打架造成 26.3 ↔ -- 高频闪烁。数字显示统一
-          // 由上面的 weight_candidate 分支与 BLE setBleWeightDisplay 负责。
-          if (msg.weight != null) setWeightValue(msg.weight, false);
+          setQualityHints(["请确保秤盘空载，等待校准"]);
           break;
         case "armed":
           setQualityHints(["请将小鼠放上秤盘"]);
-          if (msg.weight != null) setWeightValue(msg.weight, false);
           break;
         case "weighing":
           setQualityHints([]);
-          if (msg.weight != null) setWeightValue(msg.weight, false);
           break;
         case "announced":
           setQualityHints([]);
-          if (typeof msg.weight === "number") announcedWeight = msg.weight;
-          if (announcedWeight != null) setWeightValue(announcedWeight, true);
           break;
         case "wait_clear":
           setQualityHints(["请取走小鼠"]);
-          // wait_clear 保留最近读数（取走小鼠过程中 BLE 直读仍会刷新为真实值，
-          // 包括回到 0.0）；不再强制清 "--"，避免与 BLE 直读打架闪烁。
           break;
         case "accepted":
           setQualityHints([]);
@@ -1935,424 +1808,28 @@
             setTimeout(() => { weightDisplay.style.transform = "scale(1)"; }, 200);
           }
           break;
-      }
-    }
-
-    function maybeReleasePendingFrame(msg) {
-      // Only state/error that carries the matching frame_seq releases the lock.
-      // hello / retry ACK / accept ACK must never release a pending frame.
-      if (pendingFrameSeq == null) return;
-      if (msg.type !== "state" && msg.type !== "error") return;
-      if (Number(msg.frame_seq) !== pendingFrameSeq) return;
-      if (pendingFrameSentAt > 0) {
-        noteAckLatency(performance.now() - pendingFrameSentAt);
-      }
-      releasePendingFrame();
-      if (frameLoopActive && !retryInFlight) scheduleNextFrame();
-    }
-
-    function noteAckLatency(ms) {
-      recentAckMs.push(ms);
-      if (recentAckMs.length > 8) recentAckMs.shift();
-      const avg = recentAckMs.reduce((a, b) => a + b, 0) / recentAckMs.length;
-      // Soft adaptive: slow ACK → low; recover → medium. Stay off high by default.
-      if (avg > 1200 && encodeProfile.name !== "low") {
-        encodeProfile = ENCODE_PROFILES.low;
-      } else if (avg < 500 && encodeProfile.name === "low") {
-        encodeProfile = ENCODE_PROFILES.medium;
-      }
-      // Record a client-side timing sample tied to the just-ACKed frame.
-      if (pendingFrameSeq != null || lastEncodeMs > 0) {
-        clientTimingSamples.push({
-          frame_seq: frameSeq > 0 ? frameSeq - 1 : 0,
-          encode_ms: Math.round(lastEncodeMs * 10) / 10,
-          rtt_ms: Math.round(ms * 10) / 10,
-          jpeg_bytes: lastJpegBytes,
-        });
-        if (clientTimingSamples.length >= CLIENT_TIMING_FLUSH_BATCH) {
-          flushClientTiming();
-        } else if (!clientTimingFlushTimer) {
-          clientTimingFlushTimer = setTimeout(flushClientTiming, CLIENT_TIMING_FLUSH_INTERVAL_MS);
-        }
-      }
-    }
-
-    function flushClientTiming() {
-      clientTimingFlushTimer = null;
-      if (!clientTimingSamples.length) return;
-      const batch = clientTimingSamples.splice(0, clientTimingSamples.length);
-      rtSend({ type: "client_timing", samples: batch });
-    }
-
-    function releasePendingFrame() {
-      pendingFrameSeq = null;
-      pendingFrameSentAt = 0;
-      if (frameAckTimer) {
-        clearTimeout(frameAckTimer);
-        frameAckTimer = null;
-      }
-    }
-
-    function onFrameAckTimeout() {
-      frameAckTimer = null;
-      pendingFrameSeq = null;
-      pendingFrameSentAt = 0;
-      // P1 fix: a single ACK timeout means the old frame may still be queued
-      // in the network or server. Rather than send another frame on the same
-      // connection (which could re-introduce multi-frame queuing on weak
-      // networks), close the socket and let the reconnect path deliver only
-      // the freshest frame.
-      showReconnect(true);
-      stateText.textContent = "网络较慢，正在重连";
-      try {
-        if (ws) ws.close();
-      } catch (_) {}
-    }
-
-    function handleServerMessage(msg) {
-      if (!msg || typeof msg !== "object") return;
-      const t = msg.type;
-
-      // Release in-flight frame ONLY when frame_seq matches (state or error).
-      maybeReleasePendingFrame(msg);
-
-      if (t === "hello") {
-        // Initial state snapshot on WS connect — does not release frame lock.
-        if (msg.state) setState(msg.state, msg);
-        if (msg.accepted_count != null) {
-          rtMouseCount = msg.accepted_count;
-          mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
-        }
-        // P1 fix: full state recovery on (re)connect. A dropped retry ACK
-        // would otherwise leave retryInFlight stuck; and a reconnect during
-        // weighing/armed/wait_clear must resume the frame loop or the phone
-        // stops sending frames forever.
-        retryInFlight = false;
-        retryBtn.disabled = false;
-        retryBtn.textContent = "重测";
-        const helloState = msg.state;
-        if (
-          helloState === "weighing" ||
-          helloState === "armed" ||
-          helloState === "calibrating" ||
-          helloState === "wait_clear"
-        ) {
-          // These states need frames to progress. announced is handled by
-          // setState (shows the accept/retry buttons) and waits for user
-          // input, so it does NOT need the frame loop.
-          startFrameLoop();
-        }
-      } else if (t === "state") {
-        // Primary per-frame state update from the engine.
-        const newState = msg.state || rtState;
-
-        // Weight display: use weight_candidate (backend field name).
-        // BLE 模式（native_ble）：非 announced 态的数字由 BLE 直读独占
-        // （setBleWeightDisplay，1 位小数），引擎候选值不介入，避免
-        // 26.3(BLE) ↔ 26.30(引擎2位小数) 的格式/来源抖动；announced 态
-        // 仍以引擎确认值为准（权威，2 位小数）。OCR 模式引擎是唯一来源，全量写。
-        if (typeof msg.weight_candidate === "number") {
-          const confirmed = newState === "announced";
-          if (weightSource !== "native_ble" || confirmed) {
-            setWeightValue(msg.weight_candidate, confirmed);
-          }
-          if (confirmed) announcedWeight = msg.weight_candidate;
-        }
-
-        // Quality hints: array of {code, message}.
-        if (msg.quality_hints && msg.quality_hints.length) {
-          setQualityHints(msg.quality_hints.map(function (h) { return h.message || h.code; }));
-        } else if (newState === "calibrating") {
-          setQualityHints(["请调整手机，使显示屏位于画面内"]);
-        } else if (newState === "armed") {
-          setQualityHints(["请将小鼠放上秤盘"]);
-        } else if (newState === "wait_clear") {
-          setQualityHints(["请取走小鼠"]);
-        } else {
+        case "manual":
           setQualityHints([]);
-        }
-
-        // New attempt announced → speak + show action buttons (announce mode)。
-        // post_match 模式自动 accept（在 setState 之后，确保 rtState 已是 announced）。
-        if (msg.attempt && newState === "announced") {
-          announcedWeight = msg.attempt.weight_g;
-          setWeightValue(announcedWeight, true);
-          if (recordMode !== "post_match") {
-            speakWeight(announcedWeight);
-          }
-        }
-
-        // Weight accepted (auto or explicit) → update count.
-        if (msg.accepted_weight != null) {
-          rtMouseCount += 1;
-          mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
-          announcedWeight = null;
-        }
-
-        setState(newState, msg);
-
-        // post_match：状态置好后自动确认（sendAccept 守卫 rtState==="announced"）。
-        if (msg.attempt && newState === "announced" && recordMode === "post_match") {
-          sendAccept();
-        }
-      } else if (t === "ack") {
-        // Response to a retry/accept command — never releases a frame lock.
-        if (msg.cmd === "accept") {
-          if (msg.accepted) {
-            rtMouseCount += 1;
-            mouseCount.textContent = `已记录 ${rtMouseCount} 只`;
-            announcedWeight = null;
-            if (msg.state) setState(msg.state, msg);
-            // P0 fix: backend now sits in WAIT_CLEAR and needs more frames to
-            // see the weight return to zero for the next mouse. We must resume
-            // the frame loop on success — otherwise the flow stalls forever
-            // after the first mouse.
-            startFrameLoop();
-          } else {
-            // accept rejected (e.g. already accepted / stale state): restore
-            // the loop so the operator can try again.
-            if (msg.state) setState(msg.state, msg);
-            startFrameLoop();
-          }
-        } else if (msg.cmd === "retry") {
-          retryBtn.disabled = false;
-          retryBtn.textContent = "重测";
-          retryInFlight = false;
-          if (msg.applied) {
-            announcedWeight = null;
-            setState(msg.state || "weighing", msg);
-            startFrameLoop();
-          } else {
-            toast("当前无法重测，请稍后再试");
-            if (msg.state) setState(msg.state, msg);
-            startFrameLoop();
-          }
-        } else if (msg.state) {
-          setState(msg.state, msg);
-          // Any other ack must not leave the loop stopped, or the phone
-          // would freeze in weighing/announced/wait_clear.
-          if (!retryInFlight) startFrameLoop();
-        }
-      } else if (t === "error") {
-        // 蓝牙读数被后端判为无效：仅记录计数 + 控制台告警，不重试循环
-        if (msg.code === "scale_reading_invalid" || msg.code === "scale_reading_rejected") {
-          scaleReadingInvalidCount += 1;
-          console.warn("scale_reading rejected:", msg.code, msg.message || "");
-          return;
-        }
-        toast(msg.message || "实时分析出错");
+          break;
       }
     }
 
-    async function waitForPendingFrameClear(timeoutMs) {
-      const deadline = performance.now() + (timeoutMs || FRAME_ACK_TIMEOUT_MS);
-      while (pendingFrameSeq != null && performance.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 40));
-      }
-      if (pendingFrameSeq != null) releasePendingFrame();
-    }
-
-    retryBtn.addEventListener("click", async () => {
-      if (retryInFlight || rtState !== "announced") return;
-      retryInFlight = true;
-      retryBtn.disabled = true;
-      retryBtn.textContent = "正在重测…";
-      stopFrameLoop();
-      // Wait for the single in-flight frame ACK (or timeout) so retry is not
-      // queued behind a stale JPEG. Same-connection FIFO then puts retry next.
-      await waitForPendingFrameClear(FRAME_ACK_TIMEOUT_MS);
-      const sent = rtSend({ type: "retry" });
-      if (!sent) {
-        retryInFlight = false;
-        retryBtn.disabled = false;
-        retryBtn.textContent = "重测";
-        toast("发送失败，请检查网络");
-        startFrameLoop();
-      }
-      // Do not optimistic-switch to armed; wait for applied ACK.
-    });
-    acceptBtn.addEventListener("click", sendAccept);
-    async function sendAccept() {
-      if (rtState !== "announced") return;
-      stopFrameLoop();
-      await waitForPendingFrameClear(FRAME_ACK_TIMEOUT_MS);
-      const sent = rtSend({ type: "accept" });
-      if (!sent) {
-        toast("发送失败，请检查网络");
-        startFrameLoop();
-      }
-    }
-
-    // --- Frame sending: strict single in-flight + 5fps ceiling ---
-    function encodeRealtimeBlob(cb) {
-      const profile = encodeProfile;
-      try {
-        if (profile.w === CANVAS_W && profile.h === CANVAS_H) {
-          canvas.toBlob(cb, "image/jpeg", profile.quality);
-          return;
-        }
-        encodeCanvas.width = profile.w;
-        encodeCanvas.height = profile.h;
-        encodeCtx.drawImage(canvas, 0, 0, profile.w, profile.h);
-        encodeCanvas.toBlob(cb, "image/jpeg", profile.quality);
-      } catch (_) {
-        cb(null);
-      }
-    }
-
-    function sendFrame() {
-      if (!frameLoopActive || retryInFlight) return;
-      if (pendingFrameSeq != null) return;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if (!paintedReady) {
-        scheduleNextFrame();
+    /* --- BLE 读数显示（一位小数）：raw=0 → "0.0"。
+     * 控制器 'weight' 事件驱动；announced 态由引擎确认值（2 位小数）覆盖。 */
+    function setBleWeightDisplay(grams) {
+      if (grams == null || typeof grams !== "number" || !isFinite(grams)) {
+        weightValue.textContent = "--";
+        weightValue.style.color = "var(--label2)";
+        weightUnit.style.color = "var(--label2)";
         return;
       }
-      // Encode first; allocate frame_seq only immediately before ws.send().
-      lastEncodeStartedAt = performance.now();
-      encodeRealtimeBlob((blob) => {
-        if (!blob) {
-          scheduleNextFrame();
-          return;
-        }
-        // Capture encode duration (drawImage + JPEG encode) for telemetry.
-        lastEncodeMs = performance.now() - lastEncodeStartedAt;
-        lastJpegBytes = blob.size;
-        if (!frameLoopActive || retryInFlight) return;
-        if (pendingFrameSeq != null) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          scheduleNextFrame();
-          return;
-        }
-        const reader = new FileReader();
-        reader.onload = () => {
-          if (!frameLoopActive || retryInFlight) return;
-          if (pendingFrameSeq != null) return;
-          if (!ws || ws.readyState !== WebSocket.OPEN) {
-            scheduleNextFrame();
-            return;
-          }
-          const jpegBytes = new Uint8Array(reader.result);
-          const seq = frameSeq;
-          const buf = new ArrayBuffer(8 + jpegBytes.length);
-          const dv = new DataView(buf);
-          dv.setUint32(0, seq, true);
-          dv.setUint32(4, Date.now() - recordingT0, true);
-          new Uint8Array(buf, 8).set(jpegBytes);
-          try {
-            ws.send(buf);
-          } catch (_) {
-            scheduleNextFrame();
-            return;
-          }
-          frameSeq = seq + 1;
-          pendingFrameSeq = seq;
-          pendingFrameSentAt = performance.now();
-          nextAllowedSendAt = performance.now() + MIN_FRAME_INTERVAL_MS;
-          if (frameAckTimer) clearTimeout(frameAckTimer);
-          frameAckTimer = setTimeout(onFrameAckTimeout, FRAME_ACK_TIMEOUT_MS);
-          // Do NOT schedule next frame here — wait for matching ACK.
-        };
-        reader.onerror = () => {
-          scheduleNextFrame();
-        };
-        reader.readAsArrayBuffer(blob);
-      });
-    }
-
-    function scheduleNextFrame() {
-      if (!frameLoopActive || retryInFlight) return;
-      const delay = Math.max(0, nextAllowedSendAt - performance.now());
-      if (nextFrameTimer) clearTimeout(nextFrameTimer);
-      nextFrameTimer = setTimeout(sendFrame, delay);
-    }
-
-    function startFrameLoop() {
-      frameLoopActive = true;
-      scheduleNextFrame();
-    }
-
-    function stopFrameLoop() {
-      frameLoopActive = false;
-      if (nextFrameTimer) {
-        clearTimeout(nextFrameTimer);
-        nextFrameTimer = null;
-      }
-      // Keep pendingFrameSeq until ACK/timeout so retry can wait on it;
-      // full cleanup happens on WS close / session teardown.
-    }
-
-    function teardownFrameProtocol() {
-      // Flush any remaining client timing before the socket goes away so the
-      // session summary reflects the tail frames too.
-      if (clientTimingFlushTimer) {
-        clearTimeout(clientTimingFlushTimer);
-        clientTimingFlushTimer = null;
-      }
-      flushClientTiming();
-      stopFrameLoop();
-      releasePendingFrame();
-    }
-
-    // --- Create realtime session and open WS ---
-    function applyClientConfig(cc) {
-      // Apply server-provided tuning knobs with client-side clamping so a bad
-      // or stale YAML value cannot break the frame loop (P2).
-      if (!cc || typeof cc !== "object") return;
-      if (typeof cc.max_fps === "number" && cc.max_fps > 0) {
-        // Clamp to [1, 10] fps; floor of 100ms/frame.
-        const fps = Math.max(1, Math.min(10, Math.floor(cc.max_fps)));
-        MIN_FRAME_INTERVAL_MS = Math.max(100, Math.round(1000 / fps));
-      }
-      if (typeof cc.frame_ack_timeout_ms === "number" && cc.frame_ack_timeout_ms > 0) {
-        // Clamp to [1000, 10000] ms.
-        FRAME_ACK_TIMEOUT_MS = Math.max(1000, Math.min(10000, Math.round(cc.frame_ack_timeout_ms)));
-      }
-      if (
-        typeof cc.encode_profile === "string" &&
-        Object.prototype.hasOwnProperty.call(ENCODE_PROFILES, cc.encode_profile)
-      ) {
-        encodeProfile = ENCODE_PROFILES[cc.encode_profile];
-      }
-    }
-
-    async function startRealtime() {
-      try {
-        // 重量来源按录制模式决定：manual → manual；native_ble → ble_k797；OCR 不带字段。
-        const body = { cage_id: box.cageId, project_id: state.projectId };
-        if (weightSource === "native_ble") body.weight_source = "ble_k797";
-        else if (weightSource === "manual") body.weight_source = "manual";
-        const res = await api.json("/api/realtime/session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        rtSession = res;
-        // Apply server-side client_config BEFORE starting the frame loop so
-        // the first frame uses the configured fps / profile / ACK timeout.
-        applyClientConfig(res && res.client_config);
-        connectWs();
-        startFrameLoop();
-        // native_ble：WS 打开后由 connectWs 的 open 回调 flush 最新读数。
-        // manual：不连天平通道，重量由操作员手输。
-        if (weightSource === "native_ble") startScaleChannel();
-      } catch (err) {
-        toast(err && err.message ? err.message : "无法启动实时称重");
-        showReconnect(true);
-        scheduleReconnect();
-      }
-    }
-
-    /* --- 蓝牙天平通道：仅在 weightSource === 'native_ble' 时生效 --- */
-    function bleClientTsMs() {
-      // 复用帧时序基准（recordingT0 = 开始录像的 Date.now()），与帧 client_ts 同源
-      if (!recordingT0) return 0;
-      return Date.now() - recordingT0;
+      weightValue.textContent = grams.toFixed(1);
+      weightValue.style.color = "var(--label)";
+      weightUnit.style.color = "var(--label)";
     }
 
     function updateScaleMeta(reading) {
       if (!reading) return;
-      // RSSI + 广播年龄（秒），信息行
       const parts = [];
       if (typeof reading.rssi === "number") parts.push(`${reading.rssi} dBm`);
       const st = scaleChannel && scaleChannel.getState();
@@ -2366,69 +1843,131 @@
 
     function showScaleStaleHint(stale) {
       if (!stale) return;
-      // 复用 qualityHints 展示广播中断提示；真实 0g 由读数直接渲染
       setQualityHints(["天平广播中断"]);
     }
 
-    // BLE 读数显示（一位小数）：raw=0 → "0.0"；不改动 OCR 的 setWeightValue
-    function setBleWeightDisplay(grams) {
-      if (grams == null || typeof grams !== "number" || !isFinite(grams)) {
-        weightValue.textContent = "--";
-        weightValue.style.color = "var(--label2)";
-        weightUnit.style.color = "var(--label2)";
+    /* ================================================================== *
+     * 本地称重控制器事件 → UI 对接
+     * 控制器（LocalWeigh.createController）封装了 WeighEngine + 记录 + 草稿 +
+     * outbox；这里只把控制器事件映射到既有 DOM 更新函数。
+     * ================================================================== */
+    function handleLocalWeighEvent(type, payload) {
+      payload = payload || {};
+      if (type === "state") {
+        // calibrating/armed/weighing/announced/wait_clear/manual
+        setState(payload.state || rtState, {});
         return;
       }
-      weightValue.textContent = grams.toFixed(1);
-      weightValue.style.color = "var(--label)";
-      weightUnit.style.color = "var(--label)";
+      if (type === "weight") {
+        // BLE 直读（每次有效读数）。announced 态保留引擎确认值，不被直读覆盖。
+        if (rtState !== "announced" && rtState !== "accepted") {
+          setBleWeightDisplay(payload.grams);
+        }
+        return;
+      }
+      if (type === "announce") {
+        // 引擎判定稳定 → 候选重量。announce 模式：弹确认/重测 + 语音；
+        // post_match 模式：控制器内部已自动 accept，这里只刷新数字。
+        announcedWeight = payload.weight_g;
+        setWeightValue(announcedWeight, true);
+        setState("announced", {});
+        return;
+      }
+      if (type === "accepted") {
+        // 已确认一只（announce 人工 / post_match 自动 / manual 录入）
+        const count = payload.count != null ? payload.count : 0;
+        mouseCount.textContent = `已记录 ${count} 只`;
+        // 数字闪一下 + 切到 accepted 瞬态（ready_next 会再切回 armed/calibrating）
+        if (announcedWeight != null) {
+          setWeightValue(announcedWeight, true);
+        }
+        setState("accepted", {});
+        return;
+      }
+      if (type === "ready_next") {
+        // 清秤完成，准备下一只：隐藏按钮，候选清空
+        announcedWeight = null;
+        retryBtn.hidden = true;
+        acceptBtn.hidden = true;
+        return;
+      }
+      if (type === "stale") {
+        showScaleStaleHint(payload.stale);
+        return;
+      }
+      if (type === "draft_resumed") {
+        const count = payload.count != null ? payload.count : 0;
+        if (count > 0) {
+          mouseCount.textContent = `已记录 ${count} 只`;
+          toast(`已恢复 ${count} 只未完成记录`);
+        }
+        return;
+      }
+      // 'recorded' 等其它事件此处不需要额外 UI（accepted 已覆盖）
     }
 
-    function sendScaleReadingToWs(reading) {
-      if (!rtSession || rtSession.weight_source !== "ble_k797") return;
-      if (!scaleDedup) return;
-      // dedup 发送器：值变化即发（曲线保真），值不变按 2s 心跳；
-      // WS 断开期间仍记录 pendingMsg，重连后 flush() 补发最新一条。
-      scaleDedup.send(reading);
-    }
+    /* --- 按钮事件：直接转发给本地控制器（控制器内部守卫状态）--- */
+    retryBtn.addEventListener("click", () => {
+      if (rtState !== "announced") return;
+      if (!ctrl) return;
+      retryBtn.disabled = true;
+      retryBtn.textContent = "正在重测…";
+      const r = ctrl.retry();
+      // retry 后控制器会经 engine 事件回到 weighing；这里恢复按钮可用
+      setTimeout(() => {
+        retryBtn.disabled = false;
+        retryBtn.textContent = "重测";
+      }, 300);
+      if (!r || !r.applied) {
+        toast("当前无法重测，请稍后再试");
+      } else {
+        announcedWeight = null;
+      }
+    });
+    acceptBtn.addEventListener("click", () => {
+      if (rtState !== "announced") return;
+      if (!ctrl) return;
+      const acc = ctrl.accept();
+      if (!acc) {
+        toast("确认失败，请重试");
+      }
+    });
 
+    /* ================================================================== *
+     * 蓝牙天平通道（纯 app 化：仅本地读取，不再转发 WS）。
+     * announce/post_match 模式才创建；manual 模式不连天平。
+     * 控制器内部通过 scaleChannel.onReading 订阅读数 → engine.ingestReading，
+     * 因此这里只负责：直读显示（announced 态除外）、元信息刷新、stale 提示、
+     * 设备选择自愈、原生状态同步。读数喂给控制器由 createController 时注入的
+     * scaleChannel 自动完成（控制器 start() 内部订阅）。
+     * ================================================================== */
     function startScaleChannel() {
       if (scaleChannel || weightSource !== "native_ble") return;
       // 录制期间由本视图独占 BLE 扫描；暂停首页的全局连接通道，避免双扫描冲突。
       if (scaleConn.channel) disconnectScale();
-      // 设备选择：从 localStorage 读 mv.scaleDevice，有则传 deviceId 锁定该设备；
-      // 没有 device API（legacy app）→ createScaleChannel 内部自动跳过 select。
       const saved = loadSavedScaleDevice();
       const channelOpts = saved ? { deviceId: saved.deviceId } : {};
-      // 兜底：支持选择 API 但用户没选过任何设备 → 提示回首页连接，不盲目自动选最强。
       if (!saved && ScaleBridge.detectDeviceSupport()) {
         setQualityHints(["未选择天平，请回首页连接并选定设备"]);
       }
-      // 传输层：WS 开着直发，断开时由 dedup 暂存最新一条待重连 flush。
-      scaleDedup = ScaleBridge.createDedupSender(
-        function (m) {
-          if (ws && ws.readyState === WebSocket.OPEN) rtSend(m);
-        },
-        function (reading) { return ScaleBridge.buildScaleReadingMessage(reading, bleClientTsMs()); }
-      );
-      scaleDedup.start();
       scaleChannel = ScaleBridge.createScaleChannel(channelOpts);
-      // 新读数 → 直显（一位小数）+ 转发 WS；announced 态不改写（由引擎驱动）
+      // 新读数 → 直显（announced/accepted 态除外，由引擎确认值驱动）+ 元信息。
+      // 注意：控制器在 createController 时已拿到同一个 scaleChannel 引用，并在
+      // start() 内部订阅 onReading 做 engine.ingestReading + 发 'weight' 事件。
+      // 这里再订阅一次仅用于"非 announced 态的直读大数字显示 + RSSI 元信息"，
+      // 不会造成双引擎（引擎由控制器独占创建）。
       scaleChannel.onReading(function (reading) {
         if (rtState !== "announced" && rtState !== "accepted") {
           const fmt = ScaleBridge.formatScaleDisplay(scaleChannel.getState());
           if (!fmt.stale) setBleWeightDisplay(reading.grams);
         }
         updateScaleMeta(reading);
-        sendScaleReadingToWs(reading);
       });
-      // stale 切换 → 保留上一个有效读数（数字不闪），仅提示"广播中断"；
-      // 读数间隙（卓易通容器扫描稀疏）若清数字会在 26.3 与 -- 间反复闪烁。
       scaleChannel.onStaleChange(function (isStale) {
         if (isStale && rtState !== "announced" && rtState !== "accepted") {
           showScaleStaleHint(true);
         }
       });
-      // 状态 → 反映未授权/蓝牙关闭/异常到状态文本
       scaleChannel.onStatus(function (detail) {
         const bad = detail.state === "unauthorized" || detail.state === "bluetooth_off" ||
           detail.state === "error";
@@ -2436,8 +1975,6 @@
           stateText.textContent = detail.message;
         }
       });
-      // 地址漂移自愈：带进录制的 deviceId 若已失效且仅一台候选 → 自动改选，
-      // 避免录制页永远等不到读数（与首页 sheet 共用同一判定）。
       scaleChannel.onDevices(function (norm) {
         reconcileScaleSelection(scaleChannel, norm);
       });
@@ -2463,110 +2000,84 @@
         try { scaleChannel.stop(); } catch (_) {}
         scaleChannel = null;
       }
-      if (scaleDedup) {
-        try { scaleDedup.stop(); } catch (_) {}
-        scaleDedup = null;
-      }
     }
 
-    // --- Finish: stop recording → upload video → finalize session with job_id ---
-    // Order matters: the uploaded video gets a job_id from /api/jobs, and
-    // we pass that id to /api/realtime/session/<id>/finish so the finalized
-    // run dir can link back to the source video for clip extraction.
-    async function finishSession() {
+    /* --- 构造本地称重控制器（判定/记录/草稿/outbox 全本地）--- */
+    function createLocalController() {
+      // manual 模式无天平通道；announce/post_match 用 startScaleChannel 创建的通道。
+      const channelForCtrl = recordMode === "manual" ? null : scaleChannel;
+      return LocalWeigh.createController({
+        mode: recordMode,
+        weighEngine: WeighEngine,
+        scaleChannel: channelForCtrl,
+        outbox: reportOutbox,
+        box: { cageId: box.cageId, strain: box.strain },
+        deviceId: scaleConn.selectedDeviceId || "scale01",
+        projectId: state.projectId,
+        weightSource: weightSource === "native_ble" ? "ble_k797" : weightSource,
+        storage: localStorage,
+        buildRecord: ReportClient.buildRecord,
+        // 当前录像相对毫秒（用于 accept 时记 clip_start_ms，供服务端抽帧）
+        videoTimeMs: function () { return startedAt > 0 ? Math.max(0, Date.now() - startedAt) : 0; },
+        speak: recordMode === "announce" ? speakWeight : null,
+        onEvent: handleLocalWeighEvent,
+      });
+    }
+
+    /* --- 完成本箱：停止录像 → ctrl.finishBox(videoBlob) → outbox 入队 → 上报 UI ---
+     * 视频作为证据随 report 批次走（不再 POST /api/jobs 做 OCR，避免重复计数）。
+     * 上报状态：已上报 N 只 / 待补传 M 批（离线）。 */
+    function finishBoxFlow(blob, filename, durationSec, uploadOpts) {
+      stopDraw();
+      stopStream(stream);
+      stream = null;
+      setTitle("上报中");
+
+      // 1) 控制器停止订阅读数（避免 finishBox 后再有 accepted 事件）
+      if (ctrl) { try { ctrl.stop(); } catch (_) {} }
+      // 2) 累积批次入队 outbox（含视频证据 Blob）→ 返回 {count, batchId}
+      let result = null;
+      let enqueueErr = null;
+      try {
+        result = ctrl ? ctrl.finishBox(blob) : { count: 0, batchId: null };
+      } catch (e) {
+        enqueueErr = e;
+      }
+      // 3) 触发立即补传（在线即发；离线由 outbox 退避重试 / online 事件补传）
+      const flushP = reportOutbox.flush().catch(function () {});
+
+      renderReportUploading(box, result, reportOutbox.pending(), durationSec, uploadOpts || {});
+
+      flushP.then(function (fr) {
+        const sent = (fr && typeof fr.sent === "number") ? fr.sent : 0;
+        const remaining = reportOutbox.pending();
+        updateReportUploadingDone(box, result, sent, remaining, durationSec, enqueueErr);
+      });
+    }
+
+    finishBtn.addEventListener("click", function () {
       if (finished) return;
       finished = true;
       finishBtn.disabled = true;
-      teardownFrameProtocol();
+      // 停止控制器订阅；停止 BLE 通道（录像停止由 recorder.stop 触发 finishBoxFlow）
+      if (ctrl) { try { ctrl.stop(); } catch (_) {} }
       stopScaleChannel();
-      wsClosedByUs = true;
-      if (ws) {
-        try { ws.close(); } catch (_) {}
-        ws = null;
-      }
-      if (reconnectHandle) {
-        clearTimeout(reconnectHandle);
-        reconnectHandle = null;
-      }
-      showReconnect(false);
-
-      // 1. Stop the background recorder → its stop handler builds the blob
-      //    and calls doUpload → renderUploading → POST /api/jobs.
-      //    We intercept doUpload to capture the returned job_id before it
-      //    navigates away, so we can pass it to /finish.
-      let uploadedJobId = null;
-      const origDoUpload = doUpload;
-      function doUploadForFinish(blob, filename, durationSec, uploadOpts) {
-        // Override: upload, capture job_id, then finalize, then render done.
-        stopDraw();
-        stopStream(stream);
-        stream = null;
-        setTitle("上传中");
-        uploadVideo(blob, filename, box, null, durationSec, uploadOpts || {})
-          .then(async (job) => {
-            uploadedJobId = job.job_id;
-            // 2. Finalize the realtime session with the video job id.
-            if (rtSession && rtSession.session_id) {
-              try {
-                await api.json(
-                  `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
-                  {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      video_upload_job_id: uploadedJobId,
-                      capture_meta: (uploadOpts && uploadOpts.captureMeta) || null,
-                    }),
-                  }
-                );
-              } catch (_) {}
-            }
-            state.activeJobId = uploadedJobId;
-            go("/done");
-          })
-          .catch((err) => {
-            toast(err.message);
-            // Even if upload fails, try to finalize so accepted attempts
-            // are still persisted (without a linked source video).
-            if (rtSession && rtSession.session_id) {
-              api.json(
-                `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
-                { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
-              ).catch(() => {});
-            }
-            go("/");
-          });
-      }
-      doUpload = doUploadForFinish; // type: ignore - local override
-
+      showReconnectOverlay(false);
       if (recorder && recording) {
         recording = false;
-        try { recorder.stop(); } catch (_) {} // triggers doUploadForFinish
+        try { recorder.stop(); } catch (_) {} // → finishBoxFlow
       } else {
-        // No recording (shouldn't happen post-P1 fix, but handle gracefully):
-        // finalize without a source video.
-        if (rtSession && rtSession.session_id) {
-          try {
-            await api.json(
-              `/api/realtime/session/${encodeURIComponent(rtSession.session_id)}/finish`,
-              { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
-            );
-          } catch (_) {}
-        }
-        go("/");
+        // 无录像（不应发生，但兜底）：直接 finishBox（无视频证据）
+        finishBoxFlow(null, `mv-${Date.now()}.mp4`, 0, {});
       }
-    }
-    finishBtn.addEventListener("click", finishSession);
+    });
 
     function disableRealtime(reason) {
       useCanvas = false;
       paintedReady = false;
       stopDraw();
-      teardownFrameProtocol();
       stopScaleChannel();
-      wsClosedByUs = true;
-      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
-      if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }
+      if (ctrl) { try { ctrl.stop(); } catch (_) {} ctrl = null; }
       stopStream(stream);
       stream = null;
       if (canvasStream) {
@@ -2580,7 +2091,12 @@
       setQualityHints([reason || "当前浏览器无法进行实时称重，请更换浏览器后重试"]);
     }
 
-    // --- Boot: camera → draw loop → background recorder → realtime session ---
+    // --- 上报遮罩控制（复用 reconnectOverlay 节点，纯本地无重连语义）---
+    function showReconnectOverlay(show) {
+      reconnectOverlay.hidden = !show;
+    }
+
+    // --- Boot: 相机 → 预览绘制循环 → 后台录像 → 本地控制器 ---
     (async () => {
       if (!useCanvas) {
         disableRealtime("浏览器不支持网页录像，请更换浏览器后重试");
@@ -2593,34 +2109,36 @@
         if (window.screen && window.screen.orientation && window.screen.orientation.lock) {
           window.screen.orientation.lock("portrait").catch(() => {});
         }
-        // P1: the background recorder is the only source of the uploaded
-        // video. If it cannot start, we MUST NOT begin a realtime session,
-        // because accepted attempts would otherwise have no audit video and
-        // the operator would believe a session was recorded when it wasn't.
+        // 后台录像是证据来源；无法启动则不进控制器（操作员会误以为在记录）。
         const recOk = startBackgroundRecorder();
         if (!recOk) {
-          disableRealtime("无法启动后台录像，实时称重不可用。请更换浏览器或重试。");
+          disableRealtime("无法启动后台录像，称重不可用。请更换浏览器或重试。");
           return;
         }
-        startRealtime();
+        // native_ble：先建通道再建控制器（控制器构造时需要 scaleChannel 引用）
+        if (weightSource === "native_ble") startScaleChannel();
+        ctrl = createLocalController();
+        ctrl.start();
+        // 初始状态：manual → manual；ble → calibrating（控制器 start 内会发 'state'）
+        if (recordMode === "manual") {
+          setState("manual", {});
+        } else {
+          setState("calibrating", {});
+        }
       } catch (err) {
         disableRealtime("无法打开实时相机，请确认 HTTPS 与摄像头权限");
       }
     })();
 
     return () => {
-      // Distinguish navigation-away from an explicit finish: only the former
-      // should suppress the recorder's upload handler.
+      // 区分"离开页面"与"完成本箱"：仅前者丢弃录像（abandoned 抑制 recorder.stop 上报）
       if (!finished) abandoned = true;
       finished = true;
       document.documentElement.classList.remove("camera-mode", "record-light");
       clearInterval(clockTimer);
       stopDraw();
-      teardownFrameProtocol();
+      if (ctrl) { try { ctrl.stop(); } catch (_) {} }
       stopScaleChannel();
-      wsClosedByUs = true;
-      if (ws) { try { ws.close(); } catch (_) {} ws = null; }
-      if (reconnectHandle) { clearTimeout(reconnectHandle); reconnectHandle = null; }
       if (viewportObserver) {
         try { viewportObserver.disconnect(); } catch (_) {}
         viewportObserver = null;
@@ -2652,7 +2170,80 @@
   }
 
   /* ================================================================== *
-   * 视图：上传 + 完成 / 排队 (屏 4)
+   * 视图：本箱上报（纯 app 化：本地记录 + outbox 离线补传，无 OCR 视频分析）
+   * finishBoxFlow 在 ctrl.finishBox(videoBlob) 后调用：
+   *   - renderReportUploading：展示"上报中"（含已记录只数 + 待补传批数）
+   *   - updateReportUploadingDone：flush 完成后展示"已上报 N 只 / 待补传 M 批"
+   * ================================================================== */
+  function reportDoneCard(box, recordedCount, sent, remaining, enqueueErr) {
+    const hasPending = remaining > 0;
+    const titleText = enqueueErr
+      ? "本地记录已保存（入队失败）"
+      : (hasPending ? "已记录，等待联网补传" : "本箱已上报");
+    const icon = hasPending || enqueueErr ? "↑" : "✓";
+    const iconBg = hasPending || enqueueErr ? "var(--orange)" : "var(--green)";
+    const subParts = [`${box.cageId} · 共 ${recordedCount} 只`];
+    if (sent > 0) subParts.push(`已上报 ${sent} 批`);
+    if (remaining > 0) subParts.push(`待补传 ${remaining} 批（离线）`);
+    const card = h("div", { class: "card" }, [
+      h("div", { class: "center-status" }, [
+        h("div", { class: "check-circle", style: `background:${iconBg}` }, icon),
+        h("strong", {}, titleText),
+        h("p", { class: "li-sub" }, subParts.join(" · ")),
+      ]),
+    ]);
+    if (enqueueErr) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
+        `入队异常：${enqueueErr.message || enqueueErr}`));
+    }
+    if (hasPending) {
+      card.appendChild(h("p", { class: "li-sub" },
+        "联网后自动补传，可在本箱记录中查看结果。"));
+    }
+    return card;
+  }
+
+  function renderReportUploading(box, finishResult, pendingCount, durationSec, uploadOpts) {
+    uploadOpts = uploadOpts || {};
+    const recordedCount = (finishResult && typeof finishResult.count === "number")
+      ? finishResult.count : 0;
+    const screen = h("div", { class: "screen" });
+    screen.appendChild(appbar("上报中", {}));
+    const content = h("div", { class: "content" }, [
+      h("div", { class: "card" }, [
+        h("div", { class: "center-status" }, [
+          h("div", { class: "spinner" }),
+          h("strong", {}, "正在上报"),
+          h("p", { class: "li-sub" }, `${box.cageId} · 共 ${recordedCount} 只`),
+        ]),
+      ]),
+    ]);
+    screen.appendChild(content);
+    app.innerHTML = "";
+    mount(screen);
+  }
+
+  function updateReportUploadingDone(box, finishResult, sent, remaining, durationSec, enqueueErr) {
+    const recordedCount = (finishResult && typeof finishResult.count === "number")
+      ? finishResult.count : 0;
+    const screen = h("div", { class: "screen" });
+    screen.appendChild(appbar("本箱完成", {}));
+    const card = reportDoneCard(box, recordedCount, sent, remaining, enqueueErr);
+    const content = h("div", { class: "content" }, [
+      card,
+      h("button", {
+        class: "btn ghost",
+        onClick: () => go(`/box/${encodeURIComponent(box.cageId)}`),
+      }, "查看本箱记录"),
+      h("button", { class: "btn btn-p", onClick: () => go("/mode") }, "继续录制下一只"),
+    ]);
+    screen.appendChild(content);
+    app.innerHTML = "";
+    mount(screen);
+  }
+
+  /* ================================================================== *
+   * 视图：上传 + 完成 / 排队 (屏 4) — 旧 OCR 视频分析流程（保留，viewRecord 不再调用）
    * ================================================================== */
   function renderUploading(box, blob, filename, durationSec, uploadOpts) {
     uploadOpts = uploadOpts || {};
