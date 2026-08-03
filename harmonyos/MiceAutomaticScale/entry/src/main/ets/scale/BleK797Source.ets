@@ -11,9 +11,15 @@
  *   - ble.createBleScanner(): BleScanner；
  *   - scanner.startScan(filters: Array<ScanFilter>, options?): Promise<void>，
  *     filters 必传，按 name + manufactureId 过滤 K797（拼写 manufacture 为官方字段名）；
- *   - ble.on('BLEDeviceFind', cb: Callback<Array<ScanResult>>)，回调为数组；
+ *   - 结果投递：用 scanner 实例的 on('BLEDeviceFind', Callback<ScanReport>)（@since 15），
+ *     而非全局 ble.on(...)——真机实测全局 ble.on 在 BleScanner.startScan 路径下不触发，
+ *     必须注册到 scanner 实例；ScanReport.scanResult 为 Array<ScanResult>；
  *   - ScanResult 字段：deviceName / rssi / deviceId / manufacturerDataMap(Map<number,Uint8Array>)；
  *   - 蓝牙开关用 access.getState() + access.on('stateChange')，枚举 access.BluetoothState。
+ *
+ * 已端到端验证（ESP32-C6 模拟器 ↔ MatePad）：C6 广播 K797 + 250.0g(raw2500)，
+ * MatePad scanner.on 收到、manufacturerDataMap[0x0000] 为 18B（不含公司 ID）、
+ * 前缀 CA E8 03 28 08 95 CA 02 10 匹配、payload[9..10]=C4 09 解析为 250.0g，ok=true。
  */
 
 import { ble, access } from '@kit.ConnectivityKit';
@@ -23,6 +29,8 @@ import type { ScaleDiagnostics } from '../diagnostics/ScaleDiagnostics';
 
 /** 扫描结果回调类型。 */
 type ScanHandler = (results: Array<ble.ScanResult>) => void;
+/** scanner 实例级 ScanReport 回调类型（API>=15）。 */
+type ReportHandler = (report: ble.ScanReport) => void;
 /** 蓝牙状态变化回调类型。 */
 type StateHandler = (state: access.BluetoothState) => void;
 
@@ -32,7 +40,7 @@ type StateHandler = (state: access.BluetoothState) => void;
 export class BleK797Source extends ScaleSourceBase {
   private scanner: ble.BleScanner | null = null;
   private diagnostics: ScaleDiagnostics | null = null;
-  private scanHandler: ScanHandler | null = null;
+  private reportHandler: ReportHandler | null = null;
   private stateHandler: StateHandler | null = null;
 
   constructor(clock: MonotonicClock, diagnostics: ScaleDiagnostics | null = null) {
@@ -75,13 +83,16 @@ export class BleK797Source extends ScaleSourceBase {
       return;
     }
 
-    this.scanHandler = (results: Array<ble.ScanResult>): void => {
-      for (let i = 0; i < results.length; i++) {
-        this.processScanResult(results[i]);
+    // API>=15：BleScanner.startScan 的结果只投递到 scanner 实例的
+    // on('BLEDeviceFind', Callback<ScanReport>)；全局 ble.on 在此路径不触发。
+    this.reportHandler = (report: ble.ScanReport): void => {
+      const arr: Array<ble.ScanResult> = report.scanResult;
+      for (let i = 0; i < arr.length; i++) {
+        this.processScanResult(arr[i]);
       }
     };
     try {
-      ble.on('BLEDeviceFind', this.scanHandler);
+      this.scanner.on('BLEDeviceFind', this.reportHandler);
     } catch (e) {
       this.reportError(`注册扫描监听失败：${e}`);
       return;
@@ -111,13 +122,13 @@ export class BleK797Source extends ScaleSourceBase {
   }
 
   protected onStop(): void {
-    if (this.scanHandler !== null) {
+    if (this.reportHandler !== null && this.scanner !== null) {
       try {
-        ble.off('BLEDeviceFind', this.scanHandler);
+        this.scanner.off('BLEDeviceFind', this.reportHandler);
       } catch (e) {
         // 忽略解除监听失败。
       }
-      this.scanHandler = null;
+      this.reportHandler = null;
     }
     if (this.stateHandler !== null) {
       try {

@@ -205,19 +205,21 @@ static size_t currentManufDataLen() {
 }
 
 // ---------------------------------------------------------------------------
-// 应用载荷到 NimBLE 并刷新广播（运行时刷新，无 stop/start 重建）
+// 应用载荷到 NimBLE 并刷新广播（整体替换，支持运行时变重量）
 // ---------------------------------------------------------------------------
 static void applyPayloadAndRefresh() {
     if (g_adv == nullptr) return;
-    // setManufacturerData 内部把数据复制进 NimBLEAdvertisementData，
-    // 这里传入“公司ID + 载荷”，上线即 16 FF 00 00 <载荷>。
-    bool ok = g_adv->setManufacturerData(g_manufData, currentManufDataLen());
-    if (!ok) {
-        // 极少发生；通常缓冲区超限。打印但不阻断。
-        Serial.println(F("ERR setManufacturerData failed"));
+    // NimBLE 2.x 的 setManufacturerData 是“追加”且校验总长<=31，重复调用会超限
+    // 失败；正确做法是每次构建全新 NimBLEAdvertisementData 并 setAdvertisementData
+    // 整体替换（内部 ble_gap_adv_set_data），广播运行中亦可更新。
+    NimBLEAdvertisementData advData;
+    advData.setName(K797_NAME);
+    bool ok = advData.setManufacturerData(g_manufData, currentManufDataLen());
+    if (ok) {
+        ok = g_adv->setAdvertisementData(advData);
     }
-    if (g_advRunning) {
-        g_adv->refreshAdvertisingData();  // 原地刷新，无需 stop/start
+    if (!ok) {
+        Serial.println(F("ERR setAdvertisementData failed"));
     }
     ++g_updateCount;
 #ifdef K797_LED_PIN
