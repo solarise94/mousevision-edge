@@ -32,6 +32,8 @@ export interface ScaleSource {
   readonly sourceName: ScaleSourceKind;
   /** 当前状态（只读视图）。 */
   readonly state: ScaleState;
+  /** 当前已选定的设备 ID；未选定时为 null（发现模式）。 */
+  readonly currentSelectedDeviceId: string | null;
   /** 注册读数回调。 */
   onReading(cb: ReadingCallback): void;
   /** 注册状态回调。 */
@@ -83,10 +85,13 @@ export abstract class ScaleSourceBase implements ScaleSource {
   private statusCb: StatusCallback | null = null;
 
   private sequenceCounter: number = 0;
-  private lastReadingAtMonotonicMs: number | null = null;
   private lastReadingAtEpochMs: number | null = null;
+  private lastReadingAtMonotonicMs: number | null = null;
   private lastRaw: number | null = null;
   private consecutiveSameRaw: number = 0;
+  /** 当前已选定的设备 ID（设备发现与选择功能）；未选定时为 null。
+   *  子类通过 setSelectedDeviceId 维护，transition 会把它编入 ScaleStatus。 */
+  private selectedDeviceId: string | null = null;
 
   protected readonly clock: MonotonicClock;
   private staleTimerId: number = -1;
@@ -99,6 +104,17 @@ export abstract class ScaleSourceBase implements ScaleSource {
 
   get state(): ScaleState {
     return this._state;
+  }
+
+  /** 当前已选定的设备 ID；未选定时为 null（发现模式）。 */
+  get currentSelectedDeviceId(): string | null {
+    return this.selectedDeviceId;
+  }
+
+  /** 子类维护当前选定的设备 ID（设备发现与选择）。
+   *  仅更新字段，不触发状态回调；调用方应在适当时机调用 transition 刷新状态。 */
+  protected setSelectedDeviceId(deviceId: string | null): void {
+    this.selectedDeviceId = deviceId;
   }
 
   onReading(cb: ReadingCallback): void {
@@ -130,7 +146,8 @@ export abstract class ScaleSourceBase implements ScaleSource {
     this.started = false;
     this.cancelStaleCheck();
     this.onStop();
-    this.transition('off', '扫描已停止');
+    this.selectedDeviceId = null;
+    this.transition('off', '扫描已停止', true);
   }
 
   /** 子类实现：真正启动扫描/回放/脚本。 */
@@ -275,6 +292,7 @@ export abstract class ScaleSourceBase implements ScaleSource {
       message,
       lastReadingAtEpochMs: this.lastReadingAtEpochMs,
       source: this.sourceName,
+      selectedDeviceId: this.selectedDeviceId,
     });
     if (this.statusCb !== null) {
       this.statusCb(status);

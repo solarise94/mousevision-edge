@@ -50,6 +50,9 @@ class IndexBridgeHost implements BridgeHost {
   private readonly startScaleScanCb: () => void;
   private readonly stopScaleScanCb: () => void;
   private readonly getScaleStatusJsonCb: () => string;
+  private readonly getScaleDevicesJsonCb: () => string;
+  private readonly selectScaleDeviceCb: (deviceId: string) => void;
+  private readonly clearScaleDeviceCb: () => void;
   private readonly selectScaleSourceCb: (name: SourceSelector) => void;
   private readonly loadScaleScenarioCb: (name: string) => void;
 
@@ -57,12 +60,18 @@ class IndexBridgeHost implements BridgeHost {
     startScaleScanCb: () => void,
     stopScaleScanCb: () => void,
     getScaleStatusJsonCb: () => string,
+    getScaleDevicesJsonCb: () => string,
+    selectScaleDeviceCb: (deviceId: string) => void,
+    clearScaleDeviceCb: () => void,
     selectScaleSourceCb: (name: SourceSelector) => void,
     loadScaleScenarioCb: (name: string) => void,
   ) {
     this.startScaleScanCb = startScaleScanCb;
     this.stopScaleScanCb = stopScaleScanCb;
     this.getScaleStatusJsonCb = getScaleStatusJsonCb;
+    this.getScaleDevicesJsonCb = getScaleDevicesJsonCb;
+    this.selectScaleDeviceCb = selectScaleDeviceCb;
+    this.clearScaleDeviceCb = clearScaleDeviceCb;
     this.selectScaleSourceCb = selectScaleSourceCb;
     this.loadScaleScenarioCb = loadScaleScenarioCb;
   }
@@ -70,6 +79,9 @@ class IndexBridgeHost implements BridgeHost {
   startScaleScan(): void { this.startScaleScanCb(); }
   stopScaleScan(): void { this.stopScaleScanCb(); }
   getScaleStatusJson(): string { return this.getScaleStatusJsonCb(); }
+  getScaleDevicesJson(): string { return this.getScaleDevicesJsonCb(); }
+  selectScaleDevice(deviceId: string): void { this.selectScaleDeviceCb(deviceId); }
+  clearScaleDevice(): void { this.clearScaleDeviceCb(); }
   selectScaleSource(name: SourceSelector): void { this.selectScaleSourceCb(name); }
   loadScaleScenario(name: string): void { this.loadScaleScenarioCb(name); }
 }
@@ -187,12 +199,16 @@ struct Index {
       () => this.startScan(),
       () => this.stopScan(),
       () => this.currentStatusJson(),
+      () => this.currentDevicesJson(),
+      (deviceId: string) => this.selectScaleDevice(deviceId),
+      () => this.clearScaleDevice(),
       (name: SourceSelector) => this.selectSource(name),
       (name: string) => this.loadScenario(name),
     );
     this.bridge = new ScaleWebBridge(this.webController, host, this.diagnostics);
     this.diagnostics.setSource(this.scaleSource.sourceName);
     this.attachCallbacks(this.scaleSource);
+    this.attachDevicesCallback(this.scaleSource);
     // 默认源：EntryAbility 已请求蓝牙权限并把结果存 AppStorage('bluetoothGranted')。
     // 已授权则默认 BLE 实时源（不自动 start，等用户/网页触发，避免无谓扫描耗电）；
     // 未授权则用 script 源并预加载场景，便于无 BLE 环境演练全部异常场景。
@@ -224,11 +240,24 @@ struct Index {
     });
   }
 
+  /** 仅 BleK797Source 支持设备发现表订阅；其他源忽略（空 payload 兜底）。 */
+  private attachDevicesCallback(src: ScaleSource): void {
+    if (src instanceof BleK797Source) {
+      const b = src as BleK797Source;
+      b.onDevicesChanged(() => {
+        if (this.bridge !== null) {
+          this.bridge.pushDevices(b.getDevicesJson());
+        }
+      });
+    }
+  }
+
   /** 切换读数源：停旧源、换新源、重绑回调、刷新诊断来源。 */
   private switchSource(src: ScaleSource, displayName: string): void {
     this.scaleSource.stop();
     this.scaleSource = src;
     this.attachCallbacks(src);
+    this.attachDevicesCallback(src);
     this.currentSourceName = displayName;
     this.diagnostics.setSource(src.sourceName);
     this.statusText = `已切换来源：${displayName}`;
@@ -249,13 +278,42 @@ struct Index {
   private currentStatusJson(): string {
     const s = this.scaleSource.state;
     const last = this.lastReadingAtEpochMs === null ? 'null' : String(this.lastReadingAtEpochMs);
+    const sel = this.scaleSource.currentSelectedDeviceId;
+    const selStr = sel === null ? 'null' : `"${escapeJsonInline(sel)}"`;
     return '{'
       + `"device":"K797"`
       + `,"state":"${s}"`
-      + `,"message":"${this.statusText}"`
+      + `,"message":"${escapeJsonInline(this.statusText)}"`
       + `,"lastReadingAtEpochMs":${last}`
       + `,"source":"${this.currentSourceName}"`
+      + `,"selectedDeviceId":${selStr}`
       + '}';
+  }
+
+  /** 返回发现表 JSON；非 BLE 源返回空发现表的契约形状态。 */
+  private currentDevicesJson(): string {
+    if (this.scaleSource instanceof BleK797Source) {
+      return (this.scaleSource as BleK797Source).getDevicesJson();
+    }
+    // script/replay 源不支持设备发现：返回空表、scanning 取当前状态、selectedDeviceId=null。
+    const st = this.scaleSource.state;
+    const scanning = st === 'scanning' || st === 'active' || st === 'stale';
+    return `{"devices":[],"scanning":${scanning},"selectedDeviceId":null}`;
+  }
+
+  /** 选定设备：仅对 BLE 源有效。 */
+  private selectScaleDevice(deviceId: string): void {
+    if (this.scaleSource instanceof BleK797Source) {
+      (this.scaleSource as BleK797Source).selectScaleDevice(deviceId);
+    }
+    // 非 BLE 源忽略。
+  }
+
+  /** 取消选择：仅对 BLE 源有效。 */
+  private clearScaleDevice(): void {
+    if (this.scaleSource instanceof BleK797Source) {
+      (this.scaleSource as BleK797Source).clearScaleDevice();
+    }
   }
 
   private selectSource(name: SourceSelector): void {
@@ -401,4 +459,21 @@ struct Index {
     .width('100%')
     .height('100%')
   }
+}
+
+/** 极简 JSON 字符串转义（与 ScaleStatus.toJson 风格一致，手写拼串场景使用）。 */
+function escapeJsonInline(value: string): string {
+  let out = '';
+  for (let i = 0; i < value.length; i++) {
+    const ch = value.charAt(i);
+    switch (ch) {
+      case '"': out += '\\"'; break;
+      case '\\': out += '\\\\'; break;
+      case '\n': out += '\\n'; break;
+      case '\r': out += '\\r'; break;
+      case '\t': out += '\\t'; break;
+      default: out += ch;
+    }
+  }
+  return out;
 }

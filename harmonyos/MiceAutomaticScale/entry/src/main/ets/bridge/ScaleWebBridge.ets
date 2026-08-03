@@ -6,15 +6,20 @@
  * - 向页面注入 javaScriptProxy，对象名固定为 `MiceAutomaticScale`
  *   （即 window.MiceAutomaticScale）；
  * - 原生→页面用 CustomEvent 推送（miceautomatic:scale-reading /
- *   miceautomatic:scale-status），UI 推送限 ~10 Hz；
+ *   miceautomatic:scale-status / miceautomatic:scale-devices），
+ *   读数/状态 UI 推送限 ~10 Hz，设备发现表推送限 ~2 Hz（≥500ms）；
+ * - 页面→原生方法（javaScriptProxy，release 白名单）：
+ *   startScaleScan / stopScaleScan / getScaleStatus /
+ *   getScaleDevices / selectScaleDevice / clearScaleDevice；
  * - 导航白名单：仅允许 weight.pingoodmice.top:16206；
  * - debug 构建额外暴露 selectScaleSource / loadScaleScenario，
  *   release 必须不注册。
  *
  * 安全约束：
  * - 所有原生方法只接受 string/void，不接受可执行代码；
+ * - selectScaleDevice 对 deviceId 做 [0-9A-Za-z:\-_.]{1,64} 校验，非法直接忽略；
  * - 非白名单主机一律拦截；
- * - 重载页面时重新握手。
+ * - 重载页面时重新握手（重推状态与发现表）。
  */
 
 import { webview } from '@kit.ArkWeb';
@@ -30,9 +35,12 @@ export const TRUSTED_PORT: number = 16206;
 /** 原生→页面事件名（与 docs §7 / 网页 addEventListener 一致）。 */
 export const EVENT_READING: string = 'miceautomatic:scale-reading';
 export const EVENT_STATUS: string = 'miceautomatic:scale-status';
+export const EVENT_DEVICES: string = 'miceautomatic:scale-devices';
 
 /** UI 推送最小间隔（毫秒），约 10 Hz。 */
 const UI_PUSH_MIN_INTERVAL_MS: number = 100;
+/** 设备发现表推送最小间隔（毫秒），约 2 Hz。 */
+const DEVICES_PUSH_MIN_INTERVAL_MS: number = 500;
 
 /**
  * DEBUG 开关。
@@ -56,6 +64,12 @@ export interface BridgeHost {
   stopScaleScan(): void;
   /** 网页查询当前状态（返回 ScaleStatus JSON）。 */
   getScaleStatusJson(): string;
+  /** 网页查询发现表（返回 miceautomatic:scale-devices 事件 detail 形状 JSON）。 */
+  getScaleDevicesJson(): string;
+  /** 网页选定设备（deviceId 已校验合法性后转发给源）。 */
+  selectScaleDevice(deviceId: string): void;
+  /** 网页取消选择。 */
+  clearScaleDevice(): void;
   /** debug：切换来源。 */
   selectScaleSource(name: SourceSelector): void;
   /** debug：加载场景。 */
@@ -88,6 +102,25 @@ export class ScaleProxyObject {
     return this.host.getScaleStatusJson();
   }
 
+  /** 网页调用：查询发现表，返回 miceautomatic:scale-devices 事件 detail 形状 JSON。 */
+  getScaleDevices(): string {
+    return this.host.getScaleDevicesJson();
+  }
+
+  /** 网页调用：选定设备（校验 deviceId 合法性后转发给源）。 */
+  selectScaleDevice(deviceId: string): void {
+    if (!isValidDeviceId(deviceId)) {
+      // 非法直接忽略（不抛异常、不改状态）。
+      return;
+    }
+    this.host.selectScaleDevice(deviceId);
+  }
+
+  /** 网页调用：取消选择。 */
+  clearScaleDevice(): void {
+    this.host.clearScaleDevice();
+  }
+
   /** debug：切换来源（仅 DEBUG_ENABLED 时由 Bridge 注册）。 */
   selectScaleSource(name: string): void {
     if (!DEBUG_ENABLED) {
@@ -118,6 +151,14 @@ export class ScaleWebBridge {
   private lastReadingPushMs: number = 0;
   private lastStatusPushMs: number = 0;
   private lastStatusJson: string | null = null;
+  private lastDevicesJson: string | null = null;
+  private lastDevicesPushMs: number = 0;
+  /** 标记有待推送的设备表变化（节流窗口内合并）。 */
+  private devicesDirty: boolean = false;
+  /** 节流窗口内缓存的最新设备表 JSON（到点推送这一份）。 */
+  private pendingDevicesJson: string | null = null;
+  /** 是否已安排一次节流刷新定时器。 */
+  private devicesFlushScheduled: boolean = false;
 
   constructor(controller: webview.WebviewController, host: BridgeHost, diagnostics: ScaleDiagnostics | null = null) {
     this.controller = controller;
@@ -139,7 +180,7 @@ export class ScaleWebBridge {
 
   /** 需要注入的方法名列表（release 子集）。 */
   getReleaseMethodNames(): string[] {
-    return ['startScaleScan', 'stopScaleScan', 'getScaleStatus'];
+    return ['startScaleScan', 'stopScaleScan', 'getScaleStatus', 'getScaleDevices', 'selectScaleDevice', 'clearScaleDevice'];
   }
 
   /** debug 额外方法名列表。 */
@@ -171,12 +212,71 @@ export class ScaleWebBridge {
     this.dispatchEvent(EVENT_STATUS, json);
   }
 
-  /** 页面加载完成后调用：重新握手，重推当前状态。 */
+  /**
+   * 原生→页面：推送设备发现表。
+   * - 内容变化才推（与上次 JSON 不同）；
+   * - 相邻推送 ≥500ms：窗口内的后续变化合并，到点只推最新一份；
+   * - 内容未变化直接忽略。
+   */
+  pushDevices(json: string): void {
+    if (json === this.lastDevicesJson) {
+      return; // 内容未变化
+    }
+    const now = Date.now();
+    const elapsed = now - this.lastDevicesPushMs;
+    if (elapsed < DEVICES_PUSH_MIN_INTERVAL_MS) {
+      // 节流窗口内：标记 dirty，到点由定时器刷新最新 JSON。
+      this.devicesDirty = true;
+      // 缓存最新 JSON 供定时器到点推送（这里只存引用，下次 push 会覆盖）。
+      this.pendingDevicesJson = json;
+      if (!this.devicesFlushScheduled) {
+        this.devicesFlushScheduled = true;
+        if (typeof setTimeout !== 'undefined') {
+          const remain = DEVICES_PUSH_MIN_INTERVAL_MS - elapsed;
+          setTimeout(() => this.flushDevices(), remain > 0 ? remain : DEVICES_PUSH_MIN_INTERVAL_MS);
+        }
+      }
+      return;
+    }
+    this.lastDevicesJson = json;
+    this.lastDevicesPushMs = now;
+    this.devicesDirty = false;
+    this.pendingDevicesJson = null;
+    this.dispatchEvent(EVENT_DEVICES, json);
+  }
+
+  /** 节流到点后刷新待推送的设备表（取最新 JSON）。 */
+  private flushDevices(): void {
+    this.devicesFlushScheduled = false;
+    if (!this.devicesDirty) {
+      return;
+    }
+    const json = this.pendingDevicesJson;
+    this.devicesDirty = false;
+    this.pendingDevicesJson = null;
+    if (json === null) {
+      return;
+    }
+    if (json === this.lastDevicesJson) {
+      return;
+    }
+    this.lastDevicesJson = json;
+    this.lastDevicesPushMs = Date.now();
+    this.dispatchEvent(EVENT_DEVICES, json);
+  }
+
+  /** 页面加载完成后调用：重新握手，重推当前状态与发现表。 */
   onPageFinish(): void {
     this.lastStatusJson = null;
+    this.lastDevicesJson = null;
     // 重推当前状态，让页面刷新后立刻拿到。
     const statusJson = this.host.getScaleStatusJson();
     this.dispatchEvent(EVENT_STATUS, statusJson);
+    // 重推当前发现表。
+    const devicesJson = this.host.getScaleDevicesJson();
+    this.lastDevicesJson = devicesJson;
+    this.lastDevicesPushMs = Date.now();
+    this.dispatchEvent(EVENT_DEVICES, devicesJson);
   }
 
   /**
@@ -229,4 +329,10 @@ export class ScaleWebBridge {
 function jsonStringify(s: string): string {
   // 用 JSON.stringify 处理转义，再保证外层是双引号字符串。
   return JSON.stringify(s);
+}
+
+/** 合法 deviceId 校验：字符串、长度 ≤64、仅 [0-9A-Za-z:\-_.]。 */
+const DEVICE_ID_RE: RegExp = /^[0-9A-Za-z:\-_.]{1,64}$/;
+function isValidDeviceId(deviceId: string): boolean {
+  return typeof deviceId === 'string' && DEVICE_ID_RE.test(deviceId);
 }

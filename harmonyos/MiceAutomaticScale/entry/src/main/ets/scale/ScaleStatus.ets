@@ -35,6 +35,8 @@ export interface ScaleStatusParams {
   message: string;
   lastReadingAtEpochMs: number | null;
   source: ScaleSourceKind | null;
+  /** 当前已选定的设备 ID；未选定时为 null（发现模式）。 */
+  selectedDeviceId: string | null;
 }
 
 /** 不可变状态快照。 */
@@ -46,6 +48,8 @@ export class ScaleStatus {
   readonly lastReadingAtEpochMs: number | null;
   /** 当前读数来源。 */
   readonly source: ScaleSourceKind | null;
+  /** 当前已选定的设备 ID；未选定时为 null（发现模式）。 */
+  readonly selectedDeviceId: string | null;
 
   constructor(params: ScaleStatusParams) {
     this.device = params.device;
@@ -53,17 +57,20 @@ export class ScaleStatus {
     this.message = params.message;
     this.lastReadingAtEpochMs = params.lastReadingAtEpochMs;
     this.source = params.source;
+    this.selectedDeviceId = params.selectedDeviceId;
   }
 
   toJson(): string {
     const last = this.lastReadingAtEpochMs === null ? 'null' : String(this.lastReadingAtEpochMs);
     const src = this.source === null ? 'null' : `"${this.source}"`;
+    const sel = this.selectedDeviceId === null ? 'null' : `"${escapeJson(this.selectedDeviceId)}"`;
     return '{'
       + `"device":"${this.device}"`
       + `,"state":"${this.state}"`
       + `,"message":"${escapeJson(this.message)}"`
       + `,"lastReadingAtEpochMs":${last}`
       + `,"source":${src}`
+      + `,"selectedDeviceId":${sel}`
       + '}';
   }
 }
