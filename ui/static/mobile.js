@@ -164,6 +164,11 @@
     // 读数到达后 state=connected，sheet 0.8s 自动关闭（用户仍可改选其他设备）。
     if (scaleConn.selectedDeviceId) {
       ch.selectDevice(scaleConn.selectedDeviceId);
+    } else {
+      // 发现模式：显式 clear 一次。关键作用是让原生侧确认"页面在用新 API"，
+      // 取消 4s 旧版兜底抢选（getScaleDevices 纯查询不会标记，只有
+      // select/clear 才标记；无选择时 clear 是幂等 no-op，无副作用）。
+      ch.clearDevice();
     }
 
     // 构造 sheet DOM
@@ -226,11 +231,13 @@
     // 实时设备刷新
     const onDevicesCb = function (norm) {
       scaleConn.devices = norm.devices;
-      // 若原生已选定（selectedDeviceId 同步），刷新本地选定名
+      // 若原生已选定（selectedDeviceId 同步），刷新本地选定名并持久化，
+      // 让录制页能拿到 deviceId 锁定（覆盖原生兜底自动选的路径）。
       if (norm.selectedDeviceId && norm.selectedDeviceId !== scaleConn.selectedDeviceId) {
         scaleConn.selectedDeviceId = norm.selectedDeviceId;
         const m = norm.devices.filter((x) => x.deviceId === norm.selectedDeviceId)[0];
         if (m) scaleConn.selectedDeviceName = m.name;
+        saveScaleDevice(norm.selectedDeviceId, m ? m.name : "");
       }
       renderList();
       // 选定设备的读数到达（state 变 connected）→ 0.8s 后自动关 sheet
