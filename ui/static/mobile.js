@@ -1034,7 +1034,7 @@
     const scaleAvailable = ScaleBridge.detectNativeBridge();
     const weightSource = scaleAvailable ? "native_ble" : "ocr";
     let scaleChannel = null;          // ScaleBridge.createScaleChannel() 实例
-    let scaleSender = null;           // createLatestOnlySender：断线仅缓存最新一条
+    let scaleDedup = null;            // createDedupSender：值变化去重 + 2s 心跳 + 重连 flush
     let scaleReadingInvalidCount = 0; // 后端拒绝计数（scale_reading_invalid）
 
     // Adaptive JPEG encode profiles (realtime path only; archive video untouched).
@@ -1312,8 +1312,8 @@
         showReconnect(false);
         if (rtState === "connecting") setState("calibrating", {});
         // 蓝牙天平：重连后 flush 最新缓存的读数（仅一条），不补发过期队列
-        if (weightSource === "native_ble" && scaleSender) {
-          scaleSender.flush();
+        if (weightSource === "native_ble" && scaleDedup) {
+          scaleDedup.flush();
         }
       });
       ws.addEventListener("message", (ev) => {
@@ -1874,18 +1874,22 @@
 
     function sendScaleReadingToWs(reading) {
       if (!rtSession || rtSession.weight_source !== "ble_k797") return;
-      const msg = ScaleBridge.buildScaleReadingMessage(reading, bleClientTsMs());
-      // WS 打开则直发；断开期间由 sender 仅缓存最新一条，重连 flush。
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        rtSend(msg);
-      } else {
-        scaleSender.offer(msg);
-      }
+      if (!scaleDedup) return;
+      // dedup 发送器：值变化即发（曲线保真），值不变按 2s 心跳；
+      // WS 断开期间仍记录 pendingMsg，重连后 flush() 补发最新一条。
+      scaleDedup.send(reading);
     }
 
     function startScaleChannel() {
       if (scaleChannel || weightSource !== "native_ble") return;
-      scaleSender = ScaleBridge.createLatestOnlySender(function (m) { rtSend(m); });
+      // 传输层：WS 开着直发，断开时由 dedup 暂存最新一条待重连 flush。
+      scaleDedup = ScaleBridge.createDedupSender(
+        function (m) {
+          if (ws && ws.readyState === WebSocket.OPEN) rtSend(m);
+        },
+        function (reading) { return ScaleBridge.buildScaleReadingMessage(reading, bleClientTsMs()); }
+      );
+      scaleDedup.start();
       scaleChannel = ScaleBridge.createScaleChannel();
       // 新读数 → 直显（一位小数）+ 转发 WS；announced 态不改写（由引擎驱动）
       scaleChannel.onReading(function (reading) {
@@ -1933,7 +1937,10 @@
         try { scaleChannel.stop(); } catch (_) {}
         scaleChannel = null;
       }
-      scaleSender = null;
+      if (scaleDedup) {
+        try { scaleDedup.stop(); } catch (_) {}
+        scaleDedup = null;
+      }
     }
 
     // --- Finish: stop recording → upload video → finalize session with job_id ---

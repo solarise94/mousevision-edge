@@ -232,6 +232,81 @@ test("latest-only sender：发送函数抛错时 flush 返回 false 不崩溃", 
   assert.equal(sender.flush(), false);
 });
 
+/* ---------- createDedupSender：值变化去重 + 心跳 + flush ---------- */
+function makeDedupHarness(over) {
+  const sent = [];
+  let clockMs = 1000;
+  const timers = [];
+  const opts = Object.assign({
+    now: () => clockMs,
+    heartbeatMs: 2000,
+    setInterval: (fn, ms) => { const id = { fn, ms }; timers.push(id); return id; },
+    clearInterval: (id) => { const i = timers.indexOf(id); if (i >= 0) timers.splice(i, 1); },
+  }, over || {});
+  const build = (r) => ({ grams: r.grams, seq: r.sequence });
+  const dedup = SB.createDedupSender((m) => sent.push(m), build, opts);
+  const fireHeartbeat = () => { timers.forEach((t) => t.fn()); };
+  const advance = (ms) => { clockMs += ms; };
+  return { sent, dedup, fireHeartbeat, advance, timers };
+}
+
+test("dedup sender：首条必发；同值连续不重复发", () => {
+  const h = makeDedupHarness();
+  h.dedup.start();
+  h.dedup.send(goodReading({ grams: 25.0, sequence: 1 }));
+  h.dedup.send(goodReading({ grams: 25.0, sequence: 2 }));
+  h.dedup.send(goodReading({ grams: 25.0, sequence: 3 }));
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].grams, 25.0);
+});
+
+test("dedup sender：值变化立即发（曲线保真）", () => {
+  const h = makeDedupHarness();
+  h.dedup.start();
+  h.dedup.send(goodReading({ grams: 10.0, sequence: 1 }));
+  h.dedup.send(goodReading({ grams: 10.5, sequence: 2 }));
+  h.dedup.send(goodReading({ grams: 11.0, sequence: 3 }));
+  assert.equal(h.sent.length, 3);
+  assert.deepEqual(h.sent.map((m) => m.grams), [10.0, 10.5, 11.0]);
+});
+
+test("dedup sender：值不变超心跳周期补发一条（保活，防后端误判 stale）", () => {
+  const h = makeDedupHarness({ heartbeatMs: 2000 });
+  h.dedup.start();
+  h.dedup.send(goodReading({ grams: 30.0, sequence: 1 })); // 首条发
+  assert.equal(h.sent.length, 1);
+  // 不足心跳 → 不补发
+  h.advance(1500);
+  h.fireHeartbeat();
+  assert.equal(h.sent.length, 1);
+  // 超过心跳 → 补发一条（仍是当前值）
+  h.advance(600);
+  h.fireHeartbeat();
+  assert.equal(h.sent.length, 2);
+  assert.equal(h.sent[1].grams, 30.0);
+});
+
+test("dedup sender：flush 重连后补发最新一条", () => {
+  const h = makeDedupHarness();
+  h.dedup.start();
+  h.dedup.send(goodReading({ grams: 5.0, sequence: 1 }));
+  h.dedup.send(goodReading({ grams: 5.0, sequence: 2 })); // 同值不重复发，但 pendingMsg 更新
+  assert.equal(h.sent.length, 1);
+  // 模拟重连
+  const ok = h.dedup.flush();
+  assert.equal(ok, true);
+  assert.equal(h.sent.length, 2);
+  assert.equal(h.sent[1].seq, 2);
+});
+
+test("dedup sender：stop 清除心跳定时器", () => {
+  const h = makeDedupHarness();
+  h.dedup.start();
+  assert.equal(h.timers.length, 1);
+  h.dedup.stop();
+  assert.equal(h.timers.length, 0);
+});
+
 test("formatScaleDisplay：无读数 → '--'", () => {
   const r = SB.formatScaleDisplay({ lastReading: null, stale: true });
   assert.deepEqual(r, { text: "--", stale: true });

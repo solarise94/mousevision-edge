@@ -239,6 +239,93 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * 称重流去重发送器：值变化即发（曲线保真），值不变时按心跳周期补发一条
+   * （让后端知道天平仍在线，不误判 stale）。实测 HarmonyOS 对同值广播本身
+   * 已合并上报，但转发给后端 WS 时稳态仍会每 ~200ms 轰炸；本层在前端拦截。
+   *
+   * buildMsg(reading) 由调用方提供，返回待发的消息对象；sendFn(msg) 实际发送。
+   * now() 与 timer 工厂可注入便于测试。
+   * ------------------------------------------------------------------ */
+  var DEFAULT_HEARTBEAT_MS = 2000;
+
+  function createDedupSender(sendFn, buildMsg, opts) {
+    opts = opts || {};
+    var now = typeof opts.now === "function" ? opts.now : function () { return Date.now(); };
+    var heartbeatMs = typeof opts.heartbeatMs === "number" ? opts.heartbeatMs : DEFAULT_HEARTBEAT_MS;
+    var setIntervalFn = opts.setInterval || (typeof setInterval !== "undefined" ? setInterval : null);
+    var clearIntervalFn = opts.clearInterval || (typeof clearInterval !== "undefined" ? clearInterval : null);
+
+    var lastSentGrams = null;   // 上次发送的 grams（null=从未发过，首条必发）
+    var lastSentAtMs = 0;
+    var heartbeatTimer = null;
+    var pendingMsg = null;      // 心跳周期到来时重发的“当前最新消息”
+
+    function doSend(msg) {
+      try { sendFn(msg); } catch (_) {}
+    }
+
+    // 心跳：若距上次发送已超 heartbeatMs 且有可用最新消息，补发一条。
+    function heartbeatTick() {
+      if (pendingMsg == null) return;
+      if (now() - lastSentAtMs < heartbeatMs) return;
+      doSend(pendingMsg);
+      lastSentAtMs = now();
+    }
+
+    return {
+      // 收到一条读数：值变化或首条 → 立即发；否则只更新 pendingMsg 等心跳。
+      send: function (reading) {
+        var msg = buildMsg(reading);
+        pendingMsg = msg;
+        var grams = reading.grams;
+        var first = lastSentGrams === null;
+        if (first || grams !== lastSentGrams) {
+          doSend(msg);
+          lastSentGrams = grams;
+          lastSentAtMs = now();
+        }
+      },
+      start: function () {
+        if (heartbeatTimer == null && setIntervalFn) {
+          heartbeatTimer = setIntervalFn(heartbeatTick, heartbeatMs);
+        }
+      },
+      stop: function () {
+        if (heartbeatTimer != null && clearIntervalFn) {
+          try { clearIntervalFn(heartbeatTimer); } catch (_) {}
+        }
+        heartbeatTimer = null;
+      },
+      // 重连后补发最新一条（由调用方在 ws.onopen 调用）。
+      flush: function () {
+        if (pendingMsg == null) return false;
+        doSend(pendingMsg);
+        lastSentAtMs = now();
+        return true;
+      },
+      _state: function () {
+        return { lastSentGrams: lastSentGrams, lastSentAtMs: lastSentAtMs, hasPending: pendingMsg != null };
+      }
+    };
+  }
+  function createLatestOnlySender(sendFn) {
+    var pending = null;       // 待发送的最新消息（仅一条）
+    return {
+      offer: function (msg) {
+        // 始终只保留最新一条：覆盖旧值
+        pending = msg;
+      },
+      flush: function () {
+        if (pending == null) return false;
+        var m = pending;
+        pending = null;
+        try { sendFn(m); return true; } catch (_) { return false; }
+      },
+      hasPending: function () { return pending != null; }
+    };
+  }
+
+  /* ------------------------------------------------------------------ *
    * 显示格式化：无读数/stale → "--"；raw=0 → "0.0"；否则一位小数。
    * ------------------------------------------------------------------ */
   function formatScaleDisplay(state) {
@@ -256,10 +343,12 @@
     createScaleChannel: createScaleChannel,
     buildScaleReadingMessage: buildScaleReadingMessage,
     createLatestOnlySender: createLatestOnlySender,
+    createDedupSender: createDedupSender,
     formatScaleDisplay: formatScaleDisplay,
     isValidReading: isValidReading,
     READING_EVENT: READING_EVENT,
     STATUS_EVENT: STATUS_EVENT,
-    DEFAULT_STALE_MS: DEFAULT_STALE_MS
+    DEFAULT_STALE_MS: DEFAULT_STALE_MS,
+    DEFAULT_HEARTBEAT_MS: DEFAULT_HEARTBEAT_MS
   };
 });
