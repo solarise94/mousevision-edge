@@ -667,12 +667,23 @@
   }
 
   function pickMime() {
-    // P1-d: force MP4/H.264 only — no webm fallback.
+    // 首选 MP4/H.264（iOS Safari 唯一支持、分析管线首选容器）；
+    // 卓易通等 Android WebView 的 MediaRecorder 不支持 MP4 → 回退 WebM
+    // （后端 _upload_suffix 接受 .webm，OpenCV/ffmpeg 可正常解码）。
     if (!window.MediaRecorder) return "";
     const list = [
       "video/mp4;codecs=avc1.42E01E",
+      "video/mp4",
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm",
     ];
     return list.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+  }
+
+  /* 按实际录制的 mime 决定上传扩展名（与后端 _upload_suffix 对齐）。 */
+  function extForMime(mime) {
+    return mime && mime.indexOf("webm") >= 0 ? "webm" : "mp4";
   }
 
   /* ------------------------------------------------------------------ *
@@ -1698,14 +1709,14 @@
       }
       const mime = pickMime();
       if (!mime) {
-        toast("当前浏览器不支持 MP4/H.264 录像，请更换浏览器后重试");
+        toast("当前浏览器不支持录像（MP4/WebM 均不可用），请更换浏览器后重试");
         return false;
       }
       const opts = { videoBitsPerSecond: 1500000, mimeType: mime };
       try {
         recorder = new MediaRecorder(canvasStream, opts);
       } catch (err2) {
-        toast("无法启动 MP4 录像，请更换浏览器后重试");
+        toast("无法启动录像，请更换浏览器后重试");
         return false;
       }
       recorder.addEventListener("dataavailable", (e) => {
@@ -1727,7 +1738,7 @@
           canvasStream.getTracks().forEach((t) => t.stop());
           canvasStream = null;
         }
-        doUpload(blob, `mv-${Date.now()}.mp4`, durationSec, {
+        doUpload(blob, `mv-${Date.now()}.${extForMime(type)}`, durationSec, {
           captureMode: "realtime",
           captureMeta: meta,
         });
