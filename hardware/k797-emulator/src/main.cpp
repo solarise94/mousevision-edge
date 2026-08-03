@@ -289,6 +289,14 @@ static void stopAdv() {
 static void initAdvertising() {
     NimBLEDevice::init(K797_NAME);
     NimBLEDevice::setDeviceName(K797_NAME);
+    // 固定 BLE 地址（随机静态格式：最高字节两位置 1）。默认随机静态地址重启后
+    // 会漂移，导致 host 侧按地址锁定的选择失效（真机验收踩到）；固定后 host
+    // 重连/录制页 deviceId 过滤在板子重启/重插后依然命中。
+    {
+        static const uint8_t K797_ADDR[6] = {0xC7, 0x97, 0x00, 0x00, 0x00, 0x01}; // 小端序
+        NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+        NimBLEDevice::setOwnAddr(K797_ADDR);
+    }
     // 不创建任何 GATT Server：真实 K797 不可连接，本固件也绝不 connectable。
     g_adv = NimBLEDevice::getAdvertising();
     g_adv->setConnectableMode(BLE_GAP_CONN_MODE_NON);

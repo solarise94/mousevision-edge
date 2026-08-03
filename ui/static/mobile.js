@@ -111,6 +111,25 @@
     return ch;
   }
 
+  /* 选择漂移自愈：选定的 deviceId 连续多次不在发现表、且表中恰好只有一台设备时，
+   * 自动改选这台（应对秤/模拟器重启后 BLE 地址漂移——真机验收实测会发生）。
+   * 连续 3 次（devices 事件 ≥500ms 间隔，约 1.5s）确认，避免广播抖动误切。
+   * 返回 true 表示发生了切换。 */
+  function reconcileScaleSelection(ch, norm) {
+    if (!scaleConn.selectedDeviceId) { scaleConn._mismatch = 0; return false; }
+    const present = norm.devices.some((x) => x.deviceId === scaleConn.selectedDeviceId);
+    if (present || norm.devices.length !== 1) { scaleConn._mismatch = 0; return false; }
+    scaleConn._mismatch = (scaleConn._mismatch || 0) + 1;
+    if (scaleConn._mismatch < 3) return false;
+    const only = norm.devices[0];
+    scaleConn.selectedDeviceId = only.deviceId;
+    scaleConn.selectedDeviceName = only.name;
+    saveScaleDevice(only.deviceId, only.name);
+    ch.selectDevice(only.deviceId);
+    scaleConn._mismatch = 0;
+    return true;
+  }
+
   /* connectScale 入口：
    * - 支持 device API → 开始扫描 + 打开"选择天平"sheet（用户挑选设备）
    * - 不支持（legacy app）→ 直接启动通道并自动连（旧行为） */
@@ -231,9 +250,11 @@
     // 实时设备刷新
     const onDevicesCb = function (norm) {
       scaleConn.devices = norm.devices;
-      // 若原生已选定（selectedDeviceId 同步），刷新本地选定名并持久化，
-      // 让录制页能拿到 deviceId 锁定（覆盖原生兜底自动选的路径）。
-      if (norm.selectedDeviceId && norm.selectedDeviceId !== scaleConn.selectedDeviceId) {
+      // 地址漂移自愈：选定设备不在表中且仅一台候选 → 自动改选（见函数注释）
+      reconcileScaleSelection(ch, norm);
+      // 若本地无选择而原生侧已有（如兜底自动选）→ 同步并持久化；
+      // 本地已有选择时不覆盖（刚自愈改选的新 id 可能被原生旧事件回写）。
+      if (norm.selectedDeviceId && !scaleConn.selectedDeviceId) {
         scaleConn.selectedDeviceId = norm.selectedDeviceId;
         const m = norm.devices.filter((x) => x.deviceId === norm.selectedDeviceId)[0];
         if (m) scaleConn.selectedDeviceName = m.name;
@@ -2389,6 +2410,11 @@
         if (bad && detail.message) {
           stateText.textContent = detail.message;
         }
+      });
+      // 地址漂移自愈：带进录制的 deviceId 若已失效且仅一台候选 → 自动改选，
+      // 避免录制页永远等不到读数（与首页 sheet 共用同一判定）。
+      scaleChannel.onDevices(function (norm) {
+        reconcileScaleSelection(scaleChannel, norm);
       });
       scaleSourceLabel.hidden = false;
       scaleChannel.start();
