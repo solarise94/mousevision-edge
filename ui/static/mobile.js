@@ -88,10 +88,10 @@
     ch.onReading(function (reading) {
       scaleConn.lastReading = reading;
       scaleConn.lastGrams = reading.grams;
-      if (scaleConn.state !== "connected") {
-        scaleConn.state = "connected";
-        notifyScaleConn();
-      }
+      scaleConn.state = "connected";
+      // 每条读数都通知：卡片要实时刷新克数；仅在状态跃迁时通知会导致
+      // staleCbs 先触发的渲染把克数定格在 null（"已连接 · —"）。
+      notifyScaleConn();
     });
     ch.onStaleChange(function (isStale) {
       scaleConn.state = isStale ? "stale" : "connected";
