@@ -239,6 +239,9 @@
       }
     };
     ch.onDevices(onDevicesCb);
+    // 立即主动拉一次发现表：既填充初始列表，又让原生侧知道页面在用新 API，
+    // 取消 4s 旧版兜底自动选择（否则用户还在看列表就被原生抢选最强设备）。
+    ch.refreshDevices();
     // 已选定设备：状态变 connected 也触发自动关闭（设备读数来源）
     const connSub = function () {
       if (scaleConn.state === "connected" && scaleConn.selectedDeviceId && !autoCloseTimer && !closed) {

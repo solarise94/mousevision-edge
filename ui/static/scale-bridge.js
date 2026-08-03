@@ -251,6 +251,27 @@
       onStatus: function (cb) { if (typeof cb === "function") statusCbs.push(cb); },
       onStaleChange: function (cb) { if (typeof cb === "function") staleCbs.push(cb); },
       onDevices: function (cb) { if (typeof cb === "function") devicesCbs.push(cb); },
+      // 主动拉一次发现表（调 getScaleDevices），归一化后走与事件相同的分发。
+      // 另一关键作用：让原生侧知道"页面已用 devices API"，取消 4s 旧版兜底自动
+      // 选择——打开选择 sheet 后必须立即调用，否则用户还在看列表就被原生抢选。
+      // 返回 true 表示成功拉取并分发；无 API / 非法 JSON → false。
+      refreshDevices: function () {
+        if (!deviceSupport || !nativeBridge || typeof nativeBridge.getScaleDevices !== "function") return false;
+        try {
+          var json = nativeBridge.getScaleDevices();
+          if (typeof json !== "string" || !json) return false;
+          var norm = normalizeDevicesDetail(JSON.parse(json));
+          if (!norm) return false;
+          devices = norm.devices;
+          selectedDeviceId = norm.selectedDeviceId;
+          for (var i = 0; i < devicesCbs.length; i++) {
+            try { devicesCbs[i](norm); } catch (_) {}
+          }
+          return true;
+        } catch (_) {
+          return false;
+        }
+      },
       // 便捷方法：选定 / 清除设备。设备 API 不存在时 no-op（不抛错）。
       selectDevice: function (id) {
         if (!deviceSupport || !nativeBridge || typeof nativeBridge.selectScaleDevice !== "function") return;

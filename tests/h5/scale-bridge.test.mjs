@@ -586,3 +586,67 @@ test("stop 卸载 DEVICES_EVENT 监听（同 READING/STATUS）", () => {
   ch.stop();
   assert.equal((env.listeners[SB.DEVICES_EVENT] || []).length, 0);
 });
+
+test("refreshDevices：合法 JSON → 分发 onDevices + 更新 getState，返回 true", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  env.native._devices = [
+    { deviceId: "AA:BB:CC:DD:EE:FF", name: "K797", rssi: -52, grams: 250.0, lastSeenAtEpochMs: 1785393390194 },
+  ];
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  const seen = [];
+  ch.onDevices((d) => seen.push(d));
+  const ok = ch.refreshDevices();
+  assert.equal(ok, true);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].devices.length, 1);
+  assert.equal(seen[0].devices[0].deviceId, "AA:BB:CC:DD:EE:FF");
+  assert.equal(ch.getState().devices.length, 1);
+  ch.stop();
+});
+
+test("refreshDevices：非法 payload（grams 超界）→ 返回 false 且不分发", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  env.native.getScaleDevices = function () {
+    return JSON.stringify({ devices: [{ deviceId: "X", name: "K797", rssi: -52, grams: 99999 }], scanning: true });
+  };
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  const seen = [];
+  ch.onDevices((d) => seen.push(d));
+  assert.equal(ch.refreshDevices(), false);
+  assert.equal(seen.length, 0);
+  assert.equal(ch.getState().devices.length, 0);
+  ch.stop();
+});
+
+test("refreshDevices：无设备 API（legacy app）→ 返回 false 不抛错", () => {
+  const env = makeFakeEnv();
+  const legacy = {
+    startScaleScan() {}, stopScaleScan() {}, getScaleStatus() { return ""; },
+  };
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(legacy),
+    nativeBridge: legacy,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  assert.equal(ch.refreshDevices(), false);
+  ch.stop();
+});
