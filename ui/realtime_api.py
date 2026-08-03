@@ -711,14 +711,14 @@ def _touch(session: ActiveSession) -> None:
 class CreateSessionRequest(BaseModel):
     cage_id: str = Field(..., min_length=1, max_length=64)
     project_id: str = Field("default", max_length=64)
-    # 重量来源：OCR（手机拍 LCD，默认）或 ble_k797（天平蓝牙广播）。
-    weight_source: Literal["ocr", "ble_k797"] = "ocr"
+    # 重量来源：OCR（手机拍 LCD，默认）/ ble_k797（天平蓝牙广播）/ manual（操作员手输）。
+    weight_source: Literal["ocr", "ble_k797", "manual"] = "ocr"
 
 
 class CreateSessionResponse(BaseModel):
     session_id: str
     state: str
-    weight_source: Literal["ocr", "ble_k797"] = "ocr"
+    weight_source: Literal["ocr", "ble_k797", "manual"] = "ocr"
     # Tuning knobs the phone client should apply (P2). The client clamps
     # these to safe ranges before use; absent fields fall back to client
     # defaults so older clients keep working.
@@ -1273,6 +1273,64 @@ async def _handle_scale_reading(session: ActiveSession, cmd: dict[str, Any]) -> 
         )
 
 
+async def _handle_manual_weight(
+    websocket: WebSocket, session: ActiveSession, cmd: dict[str, Any]
+) -> None:
+    """手动模式：操作员手输一只鼠的克数（plan §手动模式）。
+
+    仅 ``weight_source="manual"`` 会话接受；校验 weight_g 为有限数且在
+    [0, 6553.5]，调用引擎 ingest_manual_weight 合成已 accepted 的 attempt，
+    回 ACK（含 accepted attempt）。非 manual 会话忽略并记录。
+    """
+    if session.weight_source != "manual":
+        log.debug(
+            "realtime: ignoring manual_weight on non-manual session %s (source=%s)",
+            session.session_id, session.weight_source,
+        )
+        return
+
+    weight_g = _coerce_float(cmd.get("weight_g"), name="weight_g")
+    if weight_g is None or not math.isfinite(weight_g):
+        log.debug(
+            "realtime: manual_weight rejected: missing/non-numeric weight_g=%r (session=%s)",
+            cmd.get("weight_g"), session.session_id,
+        )
+        return
+
+    if weight_g < 0 or weight_g > 6553.5:
+        log.debug(
+            "realtime: manual_weight rejected: weight_g out of range [0, 6553.5]: %s (session=%s)",
+            weight_g, session.session_id,
+        )
+        return
+
+    def _ingest_locked() -> Any:
+        with session.frame_lock:
+            return session.engine.ingest_manual_weight(weight_g=weight_g)
+
+    try:
+        accepted = await run_in_threadpool(_ingest_locked)
+    except Exception:  # noqa: BLE001
+        log.exception("realtime: manual_weight ingest failed (session=%s)", session.session_id)
+        return
+
+    try:
+        session.journal.record_decision(accepted.attempt_id, "accepted", accepted.weight_g)
+    except Exception:  # noqa: BLE001
+        log.exception("realtime: journal record_decision(manual) failed")
+
+    await _send_state(
+        websocket,
+        {
+            "type": "ack",
+            "cmd": "manual_weight",
+            "session_id": session.session_id,
+            "state": session.engine.state.value,
+            "accepted": _attempt_to_dict(accepted),
+        },
+    )
+
+
 async def _handle_ws_command(
     session: ActiveSession,
     websocket: WebSocket,
@@ -1354,6 +1412,9 @@ async def _handle_ws_command(
         # BLE 天平读数（K797）。仅在会话声明 weight_source="ble_k797" 时接受；
         # OCR 会话收到则忽略并记录（计划 §12：非 BLE 会话不得静默接受天平读数）。
         await _handle_scale_reading(session, cmd)
+    elif ctype == "manual_weight":
+        # 手动模式：操作员手输一只鼠的克数。仅 manual 会话接受。
+        await _handle_manual_weight(websocket, session, cmd)
     else:
         log.debug("realtime: ignoring unknown ws command %r", ctype)
 

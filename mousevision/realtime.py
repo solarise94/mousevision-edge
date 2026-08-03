@@ -381,6 +381,43 @@ class RealtimeSession:
         with self._lock:
             return list(self._attempts)
 
+    def ingest_manual_weight(self, *, weight_g: float) -> Attempt:
+        """手动模式：操作员直接输入一只鼠的克数，跳过 OCR/BLE 自动判定与播报确认。
+
+        合成一个已 accepted 的 Attempt（手动输入即定稿，无需 announced→accept 两步），
+        直接追加到 accepted 列表并转到 WAIT_CLEAR。仅在 ``weight_source="manual"`` 时
+        由上层调用；本方法不自行校验来源（守卫在 realtime_api 的 WS 命令层）。
+
+        Args:
+            weight_g: 操作员输入的克数，已由上层校验为有限数且在 [0, 6553.5]。
+
+        Returns:
+            合成并已接受的 :class:`Attempt`（weight_raw=None，confidence=1.0）。
+        """
+        with self._lock:
+            now = time.time()
+            attempt = Attempt(
+                attempt_id=uuid.uuid4().hex[:12],
+                weight_g=round(float(weight_g), 2),
+                confidence=1.0,
+                frame_seq=self._last_frame_seq,
+                client_ts_ms=float(self._last_client_ts_ms),
+                state="accepted",
+                created_at=now,
+                weight_raw=None,
+            )
+            self._attempts.append(attempt)
+            self._accepted.append(attempt)
+            # 若当前有未确认的播报 attempt，手动输入视为取代它。
+            if self._current_attempt is not None:
+                self._current_attempt.mark_rejected()
+                self._current_attempt = None
+            self._reset_weighing()
+            self._clear_count = 0
+            self._wait_clear_at = now
+            self._state = RealtimeState.WAIT_CLEAR
+            return attempt
+
     # ----------------------------------------------------------------- #
     # BLE (K797) ingest
     # ----------------------------------------------------------------- #
@@ -616,8 +653,10 @@ class RealtimeSession:
         仍会执行，因为鼠检测需要 lcd_box 作为 ROI。
         """
         lcd_box = self.reader.lcd_box(image)
-        if self.weight_source == "ble_k797":
-            grams = self._fresh_ble_grams()
+        if self.weight_source in ("ble_k797", "manual"):
+            # BLE：重量来自缓存；manual：无自动重量来源（由 ingest_manual_weight 驱动）。
+            # 两者都不走 OCR 自动读重，避免与手动输入/天平读数冲突。
+            grams = self._fresh_ble_grams() if self.weight_source == "ble_k797" else None
             if grams is None:
                 return None, 0.0, lcd_box
             return float(grams), 1.0, lcd_box
@@ -659,8 +698,9 @@ class RealtimeSession:
         RETRY_REQUESTED 经此方法）都经过 BLE 缓存，BLE 会话绝不调用 OCR
         reader 读取重量。
         """
-        if self.weight_source == "ble_k797":
-            return self._fresh_ble_grams()
+        if self.weight_source in ("ble_k797", "manual"):
+            # BLE：新鲜缓存 grams；manual：无自动来源，恒 None（靠 clear_timeout_s 超时回 ARMED）。
+            return self._fresh_ble_grams() if self.weight_source == "ble_k797" else None
         weight, _conf = self.reader.read_weight(image)
         return weight
 

@@ -28,9 +28,10 @@ class JournalMeta:
     project_id: str
     created_at: float
     device_id: str = ""
-    # Weight provenance: "ocr" (camera LCD OCR) or "ble_k797" (Bluetooth scale).
-    # Persisted so a restart/recovery keeps the source and a finalized record
-    # can stamp it without trusting in-memory state (plan §8.2 / §14).
+    # Weight provenance: "ocr" (camera LCD OCR) / "ble_k797" (Bluetooth scale) /
+    # "manual" (operator hand-entered). Persisted so a restart/recovery keeps the
+    # source and a finalized record can stamp it without trusting in-memory state
+    # (plan §8.2 / §14).
     weight_source: str = "ocr"
 
 
