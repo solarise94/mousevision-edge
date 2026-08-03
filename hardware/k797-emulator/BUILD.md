@@ -98,3 +98,25 @@ send HELP for commands
 `GRAMS <g>` / `RAW <u16>` / `ZERO` / `SILENCE <ms>` / `NOISE <center> <amp>` /
 `PLAY <scenario> [LOOP]` / `MALFORMED short|prefix` / `INTERVAL <100..1000>` /
 `STOP` / `STATUS` / `HELP`。场景文件见 `scenarios/`。
+
+## 端到端联调结论（ESP32-C6 ↔ MatePad API24）
+
+K797 为不可连接广播设备（`ADV_NONCONN_IND`，无 GATT/notify），MatePad 必须持续
+被动扫描。已用本模拟器 + 鸿蒙 BleK797Source 实测验证：
+
+**扫描与解析**：C6 广播 K797 + 重量，MatePad `SCAN_MODE_LOW_LATENCY` 持续扫描，
+`scanner.on('BLEDeviceFind', ScanReport)` 收到，`manufacturerDataMap[0x0000]` 为
+18B（不含公司 ID），前缀 `CA E8 03 28 08 95 CA 02 10` 匹配，`payload[9..10]` 小端
+解析为克数，`ok=true`。
+
+**上报保真度（重量曲线可行性）**：
+- 恒定值：HarmonyOS 对“同地址+相同数据”做合并上报，约 5s/条（仅同值去重）。
+- **值变化：每个不同值都会上报**，间隔 ≈ 广播周期（中位数 207ms）。
+- `mouse_normal_26_3g` 场景（400ms 级变值）：5 个不同值全部收到，无丢失。
+- 泊松到达（λ=0.5/s）+ 100ms 步进阻尼振荡上秤过程：发出 122 个不同值、收到 54 个。
+  振荡过渡主干（如 13.7→12.4→8.2→11.2→10.9→10.0）被忠实捕获；丢失集中在比真实
+  天平快得多的 100ms 极速过渡段。真实天平上秤后稳定停留数百 ms~数秒，稳定值 100% 到。
+
+**结论**：合并上报对重量曲线计算无影响——稳定期密集同值足以支撑后端稳定窗判定，
+过渡段主干完整。真实 K797（机械稳定 1–2s）下保真度会更好。
+
