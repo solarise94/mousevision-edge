@@ -52,12 +52,20 @@ function makeFakeEnv() {
       startScaleScan() { this.startScaleScanCalls += 1; },
       stopScaleScan() { this.stopScaleScanCalls += 1; },
       getScaleStatus() { return this.status ? JSON.stringify(this.status) : ""; },
+      // device-selection API (optional; tests toggle via withDeviceApi)
+      selectCalls: [], clearCalls: 0, deviceApi: false,
+      getScaleDevices() { return JSON.stringify({ devices: this._devices || [], scanning: true }); },
+      selectScaleDevice(id) { if (this.deviceApi) this.selectCalls.push(id); },
+      clearScaleDevice() { if (this.deviceApi) this.clearCalls += 1; },
     },
     dispatchReading: (detail) => {
       (listeners[SB.READING_EVENT] || []).forEach((fn) => fn({ detail }));
     },
     dispatchStatus: (detail) => {
       (listeners[SB.STATUS_EVENT] || []).forEach((fn) => fn({ detail }));
+    },
+    dispatchDevices: (detail) => {
+      (listeners[SB.DEVICES_EVENT] || []).forEach((fn) => fn({ detail }));
     },
   };
 }
@@ -384,4 +392,197 @@ test("onStatus 回调被触发，onReading 回调被触发", () => {
   assert.deepEqual(statuses, ["scanning"]);
   assert.deepEqual(readings, [7]);
   ch.stop();
+});
+
+/* ---------- 设备选择 API（C1 契约扩展）---------- */
+
+/* 开启设备 API 的 native（在 makeFakeEnv 基础上） */
+function nativeWithDevices(env) {
+  env.native.deviceApi = true;
+  return env.native;
+}
+
+test("detectDeviceSupport: 三方法齐全返回 true；缺一返回 false", () => {
+  const env = makeFakeEnv();
+  // 默认 fake native 没开启 deviceApi（selectScaleDevice 不计入）——这里直接构造
+  const full = {
+    startScaleScan() {}, stopScaleScan() {}, getScaleStatus() {},
+    getScaleDevices() {}, selectScaleDevice() {}, clearScaleDevice() {},
+  };
+  assert.equal(SB.detectDeviceSupport({ MiceAutomaticScale: full }), true);
+  // 缺 selectScaleDevice
+  assert.equal(SB.detectDeviceSupport({ MiceAutomaticScale: {
+    getScaleDevices() {}, clearScaleDevice() {},
+  } }), false);
+  // 无桥
+  assert.equal(SB.detectDeviceSupport({}), false);
+  assert.equal(SB.detectDeviceSupport(null), false);
+});
+
+test("channel start：带 deviceId 且支持选择 API → startScaleScan 后调 selectScaleDevice", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    deviceId: "AA:BB:CC:DD:EE:FF",
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  assert.equal(env.native.startScaleScanCalls, 1);
+  assert.deepEqual(env.native.selectCalls, ["AA:BB:CC:DD:EE:FF"]);
+  ch.stop();
+});
+
+test("channel start：不支持选择 API（legacy app）→ 不调 selectScaleDevice", () => {
+  const env = makeFakeEnv();
+  // deviceApi 默认 false：selectScaleDevice 不会推入 selectCalls
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    deviceId: "AA:BB:CC:DD:EE:FF",
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  assert.equal(env.native.startScaleScanCalls, 1);
+  assert.deepEqual(env.native.selectCalls, []);
+  ch.stop();
+});
+
+test("channel start：无 deviceId（设备发现模式）→ 不调 selectScaleDevice", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  assert.deepEqual(env.native.selectCalls, []);
+  ch.stop();
+});
+
+test("DEVICES_EVENT 合法 payload → onDevices 触发，getState 含 devices/selectedDeviceId", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  const seen = [];
+  ch.onDevices((d) => seen.push(d));
+  env.dispatchDevices({
+    devices: [
+      { deviceId: "AA:BB:CC:DD:EE:FF", name: "K797", rssi: -52, grams: 250.0, lastSeenAtEpochMs: 1785393390194 },
+      { deviceId: "11:22:33:44:55:66", name: "K797-2", rssi: -70, grams: null },
+    ],
+    scanning: true,
+    selectedDeviceId: "AA:BB:CC:DD:EE:FF",
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].devices.length, 2);
+  assert.equal(seen[0].devices[0].name, "K797");
+  assert.equal(seen[0].devices[1].grams, null);
+  assert.equal(seen[0].selectedDeviceId, "AA:BB:CC:DD:EE:FF");
+  const st = ch.getState();
+  assert.equal(st.devices.length, 2);
+  assert.equal(st.selectedDeviceId, "AA:BB:CC:DD:EE:FF");
+  assert.equal(st.deviceSupport, true);
+  ch.stop();
+  // stop 后不再触发
+  env.dispatchDevices({ devices: [], scanning: true });
+  assert.equal(seen.length, 1);
+});
+
+test("DEVICES_EVENT 非法 payload 被丢弃（不触发 onDevices，不污染 state）", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  const seen = [];
+  ch.onDevices((d) => seen.push(d));
+  // 非 object
+  env.dispatchDevices(null);
+  env.dispatchDevices("oops");
+  // devices 非数组
+  env.dispatchDevices({ devices: "x" });
+  // 单项缺 deviceId
+  env.dispatchDevices({ devices: [{ name: "x", rssi: -50 }] });
+  // rssi 非有限数
+  env.dispatchDevices({ devices: [{ deviceId: "a", name: "x", rssi: "bad" }] });
+  // grams 非法（负数）
+  env.dispatchDevices({ devices: [{ deviceId: "a", name: "x", rssi: -50, grams: -1 }] });
+  // grams 非数非 null
+  env.dispatchDevices({ devices: [{ deviceId: "a", name: "x", rssi: -50, grams: "x" }] });
+  assert.equal(seen.length, 0, "所有非法 payload 应被丢弃");
+  assert.equal(ch.getState().devices.length, 0);
+  ch.stop();
+});
+
+test("selectDevice / clearDevice 转发到 nativeBridge；legacy app no-op", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  ch.selectDevice("AA:BB:CC:DD:EE:FF");
+  ch.clearDevice();
+  assert.deepEqual(env.native.selectCalls, ["AA:BB:CC:DD:EE:FF"]);
+  assert.equal(env.native.clearCalls, 1);
+  ch.stop();
+});
+
+test("selectDevice / clearDevice：无设备 API 时不抛错且不调用", () => {
+  const env = makeFakeEnv();
+  // deviceApi false
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  // 不应抛错
+  ch.selectDevice("AA:BB:CC:DD:EE:FF");
+  ch.clearDevice();
+  assert.deepEqual(env.native.selectCalls, []);
+  ch.stop();
+});
+
+test("stop 卸载 DEVICES_EVENT 监听（同 READING/STATUS）", () => {
+  const env = makeFakeEnv();
+  nativeWithDevices(env);
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  assert.ok(env.listeners[SB.DEVICES_EVENT] && env.listeners[SB.DEVICES_EVENT].length > 0);
+  ch.stop();
+  assert.equal((env.listeners[SB.DEVICES_EVENT] || []).length, 0);
 });

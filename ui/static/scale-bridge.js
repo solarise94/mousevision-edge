@@ -26,6 +26,7 @@
 
   var READING_EVENT = "miceautomatic:scale-reading";
   var STATUS_EVENT = "miceautomatic:scale-status";
+  var DEVICES_EVENT = "miceautomatic:scale-devices";
   // 读数校验上下界（K797 量程相关，与后端一致）
   var MAX_GRAMS = 6553.5;
   var MAX_RAW = 65535;
@@ -46,6 +47,50 @@
     return typeof b.startScaleScan === "function" &&
       typeof b.stopScaleScan === "function" &&
       typeof b.getScaleStatus === "function";
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 设备选择 API 探测：原生桥是否提供 getScaleDevices / selectScaleDevice
+   * / clearScaleDevice 三方法。齐全才进入设备发现+选择流程，否则走旧直连。
+   * ------------------------------------------------------------------ */
+  function detectDeviceSupport(scope) {
+    var w = scope || (typeof window !== "undefined" ? window : null);
+    if (!w || !w.MiceAutomaticScale) return false;
+    var b = w.MiceAutomaticScale;
+    return typeof b.getScaleDevices === "function" &&
+      typeof b.selectScaleDevice === "function" &&
+      typeof b.clearScaleDevice === "function";
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 设备列表形状校验。devices 必须是数组；每项 deviceId/name 为字符串、
+   * rssi 有限数、grams 有限数或 null。非法整体丢弃（保守，避免半合法列表）。
+   * selectedDeviceId 可缺省，存在时须为字符串。scanning 须为布尔。
+   * 返回归一化后的 {devices, scanning, selectedDeviceId} 或 null。
+   * ------------------------------------------------------------------ */
+  function normalizeDevicesDetail(detail) {
+    if (!detail || typeof detail !== "object") return null;
+    var arr = detail.devices;
+    if (!Array.isArray(arr)) return null;
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+      var d = arr[i];
+      if (!d || typeof d !== "object") return null;
+      if (typeof d.deviceId !== "string" || typeof d.name !== "string") return null;
+      if (typeof d.rssi !== "number" || !isFinite(d.rssi)) return null;
+      if (d.grams !== null && (typeof d.grams !== "number" || !isFinite(d.grams) || d.grams < 0 || d.grams > MAX_GRAMS)) return null;
+      out.push({
+        deviceId: d.deviceId,
+        name: d.name,
+        rssi: d.rssi,
+        grams: d.grams,
+        lastSeenAtEpochMs: typeof d.lastSeenAtEpochMs === "number" ? d.lastSeenAtEpochMs : 0,
+      });
+    }
+    var scanning = detail.scanning === true;
+    var sel = detail.selectedDeviceId;
+    if (sel != null && typeof sel !== "string") return null;
+    return { devices: out, scanning: scanning, selectedDeviceId: sel || null };
   }
 
   /* ------------------------------------------------------------------ *
@@ -82,6 +127,8 @@
     var staleMs = typeof opts.staleMs === "number" ? opts.staleMs : DEFAULT_STALE_MS;
 
     var available = detectNativeBridge(opts.windowScope);
+    var deviceSupport = detectDeviceSupport(opts.windowScope);
+    var deviceId = typeof opts.deviceId === "string" && opts.deviceId ? opts.deviceId : null;
     var started = false;
 
     var status = null;             // 最近一条状态（detail）
@@ -93,9 +140,14 @@
     var stale = true;
     var staleTimer = null;
 
+    // 设备发现：最近一条归一化后的 devices detail
+    var devices = [];
+    var selectedDeviceId = null;
+
     var readingCbs = [];
     var statusCbs = [];
     var staleCbs = [];
+    var devicesCbs = [];
 
     function pushStaleChange() {
       var s = computeStale();
@@ -142,6 +194,17 @@
       }
     }
 
+    function onDevicesEvent(ev) {
+      var detail = ev && ev.detail;
+      var norm = normalizeDevicesDetail(detail);
+      if (!norm) return; // 非法 payload 整体丢弃
+      devices = norm.devices;
+      selectedDeviceId = norm.selectedDeviceId;
+      for (var i = 0; i < devicesCbs.length; i++) {
+        try { devicesCbs[i](norm); } catch (_) {}
+      }
+    }
+
     function tickStaleWatchdog() {
       pushStaleChange();
     }
@@ -153,12 +216,19 @@
         if (addEventListener) {
           addEventListener(READING_EVENT, onReadingEvent);
           addEventListener(STATUS_EVENT, onStatusEvent);
+          addEventListener(DEVICES_EVENT, onDevicesEvent);
         }
         if (setIntervalFn) {
           staleTimer = setIntervalFn(tickStaleWatchdog, STALE_CHECK_MS);
         }
         if (available && nativeBridge && typeof nativeBridge.startScaleScan === "function") {
           try { nativeBridge.startScaleScan(); } catch (_) {}
+        }
+        // 设备选择：支持选择 API 且指定 deviceId → 扫描后立即选定，避免原生侧
+        // 4s 无 devices API 调用的兜底（自动选最强设备）误触发。旧 app 无此 API
+        // 则完全跳过，行为与改造前一致。
+        if (deviceSupport && deviceId && nativeBridge && typeof nativeBridge.selectScaleDevice === "function") {
+          try { nativeBridge.selectScaleDevice(deviceId); } catch (_) {}
         }
       },
       stop: function () {
@@ -167,6 +237,7 @@
         if (removeEventListener) {
           try { removeEventListener(READING_EVENT, onReadingEvent); } catch (_) {}
           try { removeEventListener(STATUS_EVENT, onStatusEvent); } catch (_) {}
+          try { removeEventListener(DEVICES_EVENT, onDevicesEvent); } catch (_) {}
         }
         if (staleTimer && clearIntervalFn) {
           try { clearIntervalFn(staleTimer); } catch (_) {}
@@ -179,6 +250,17 @@
       onReading: function (cb) { if (typeof cb === "function") readingCbs.push(cb); },
       onStatus: function (cb) { if (typeof cb === "function") statusCbs.push(cb); },
       onStaleChange: function (cb) { if (typeof cb === "function") staleCbs.push(cb); },
+      onDevices: function (cb) { if (typeof cb === "function") devicesCbs.push(cb); },
+      // 便捷方法：选定 / 清除设备。设备 API 不存在时 no-op（不抛错）。
+      selectDevice: function (id) {
+        if (!deviceSupport || !nativeBridge || typeof nativeBridge.selectScaleDevice !== "function") return;
+        if (typeof id !== "string" || !id) return;
+        try { nativeBridge.selectScaleDevice(id); } catch (_) {}
+      },
+      clearDevice: function () {
+        if (!deviceSupport || !nativeBridge || typeof nativeBridge.clearScaleDevice !== "function") return;
+        try { nativeBridge.clearScaleDevice(); } catch (_) {}
+      },
       getState: function () {
         return {
           available: available,
@@ -186,7 +268,10 @@
           lastReading: lastReading,
           lastReadingAtMs: lastReadingAtMs,
           stale: computeStale(),
-          droppedOutOfOrder: droppedOutOfOrder
+          droppedOutOfOrder: droppedOutOfOrder,
+          devices: devices,
+          selectedDeviceId: selectedDeviceId,
+          deviceSupport: deviceSupport
         };
       },
       // 重置内部状态，主要供测试用
@@ -197,6 +282,8 @@
         lastSequence = -1;
         droppedOutOfOrder = 0;
         stale = true;
+        devices = [];
+        selectedDeviceId = null;
       }
     };
   }
@@ -340,6 +427,8 @@
 
   return {
     detectNativeBridge: detectNativeBridge,
+    detectDeviceSupport: detectDeviceSupport,
+    normalizeDevicesDetail: normalizeDevicesDetail,
     createScaleChannel: createScaleChannel,
     buildScaleReadingMessage: buildScaleReadingMessage,
     createLatestOnlySender: createLatestOnlySender,
@@ -348,6 +437,7 @@
     isValidReading: isValidReading,
     READING_EVENT: READING_EVENT,
     STATUS_EVENT: STATUS_EVENT,
+    DEVICES_EVENT: DEVICES_EVENT,
     DEFAULT_STALE_MS: DEFAULT_STALE_MS,
     DEFAULT_HEARTBEAT_MS: DEFAULT_HEARTBEAT_MS
   };

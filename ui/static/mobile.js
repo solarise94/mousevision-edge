@@ -41,23 +41,50 @@
     lastGrams: null,          // 最近读数克数（显示用）
     lastReading: null,        // 最近读数 detail
     errorMsg: "",
+    devices: [],              // 扫描发现的天平设备（{deviceId,name,rssi,grams}）
+    selectedDeviceId: null,   // 当前选定设备 deviceId
+    selectedDeviceName: null, // 当前选定设备名（显示用）
     _subs: [],                // 状态变更订阅者（首页卡片等）
   };
   function notifyScaleConn() {
     scaleConn._subs.forEach((fn) => { try { fn(); } catch (_) {} });
   }
-  function connectScale() {
-    if (!ScaleBridge.detectNativeBridge()) {
-      scaleConn.state = "error";
-      scaleConn.errorMsg = "未检测到天平桥（请在原生外壳中打开）";
-      notifyScaleConn();
-      return;
+
+  /* 选定设备持久化：localStorage mv.scaleDevice = JSON {deviceId,name}。
+   * 断开连接时清除内存引用，但保留 localStorage（下次进入可自动重选）。
+   * 仅在选择确认时写入。 */
+  function loadSavedScaleDevice() {
+    try {
+      const raw = localStorage.getItem("mv.scaleDevice");
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj.deviceId === "string" && obj.deviceId) {
+        return { deviceId: obj.deviceId, name: typeof obj.name === "string" ? obj.name : "" };
+      }
+    } catch (_) {}
+    return null;
+  }
+  function saveScaleDevice(deviceId, name) {
+    try {
+      localStorage.setItem("mv.scaleDevice", JSON.stringify({ deviceId: deviceId, name: name || "" }));
+    } catch (_) {}
+  }
+  function clearSavedScaleDevice() {
+    try { localStorage.removeItem("mv.scaleDevice"); } catch (_) {}
+  }
+  // 启动时把持久化的选定设备载入内存（供 viewRecord 直连用）
+  (function restoreScaleDevice() {
+    const saved = loadSavedScaleDevice();
+    if (saved) {
+      scaleConn.selectedDeviceId = saved.deviceId;
+      scaleConn.selectedDeviceName = saved.name;
     }
-    if (scaleConn.channel) return; // 已在连接
-    scaleConn.state = "connecting";
-    scaleConn.errorMsg = "";
-    notifyScaleConn();
-    const ch = ScaleBridge.createScaleChannel();
+  })();
+
+  /* 构造并启动一个天平通道，挂载标准读数/状态/stale 回调。
+   * deviceId 可选：支持设备选择 API 时传入以锁定设备；否则走旧直连。 */
+  function startScaleConnChannel(deviceId) {
+    const ch = ScaleBridge.createScaleChannel(deviceId ? { deviceId: deviceId } : {});
     ch.onReading(function (reading) {
       scaleConn.lastReading = reading;
       scaleConn.lastGrams = reading.grams;
@@ -81,7 +108,29 @@
       }
     });
     ch.start();
-    scaleConn.channel = ch;
+    return ch;
+  }
+
+  /* connectScale 入口：
+   * - 支持 device API → 开始扫描 + 打开"选择天平"sheet（用户挑选设备）
+   * - 不支持（legacy app）→ 直接启动通道并自动连（旧行为） */
+  function connectScale() {
+    if (!ScaleBridge.detectNativeBridge()) {
+      scaleConn.state = "error";
+      scaleConn.errorMsg = "未检测到天平桥（请在原生外壳中打开）";
+      notifyScaleConn();
+      return;
+    }
+    if (scaleConn.channel) return; // 已在连接
+    if (ScaleBridge.detectDeviceSupport()) {
+      openDevicePickSheet();
+      return;
+    }
+    // legacy 直连
+    scaleConn.state = "connecting";
+    scaleConn.errorMsg = "";
+    notifyScaleConn();
+    scaleConn.channel = startScaleConnChannel(null);
   }
   function disconnectScale() {
     if (scaleConn.channel) {
@@ -92,7 +141,153 @@
     scaleConn.lastGrams = null;
     scaleConn.lastReading = null;
     scaleConn.errorMsg = "";
+    scaleConn.devices = [];
     notifyScaleConn();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * "选择天平"底部弹出层（仅 device API 可用时由 connectScale 调用）。
+   * - 开始扫描 → 订阅 onDevices 实时刷新列表
+   * - 点行 → channel.selectDevice → 选定设备的读数到达（state=connected）后
+   *   0.8s 自动关 sheet；也可点"完成"关 sheet
+   * - 关 sheet 时未选任何设备 → 停止扫描回 disconnected
+   * ------------------------------------------------------------------ */
+  function openDevicePickSheet() {
+    // 进入发现模式即启动扫描通道（不发读数，仅发现设备）
+    scaleConn.state = "connecting";
+    scaleConn.errorMsg = "";
+    scaleConn.devices = [];
+    notifyScaleConn();
+    const ch = startScaleConnChannel(null);
+    scaleConn.channel = ch;
+    // 已有历史选定设备（localStorage 恢复）→ 立即通知原生锁定该设备自动重连；
+    // 读数到达后 state=connected，sheet 0.8s 自动关闭（用户仍可改选其他设备）。
+    if (scaleConn.selectedDeviceId) {
+      ch.selectDevice(scaleConn.selectedDeviceId);
+    }
+
+    // 构造 sheet DOM
+    const overlay = h("div", { class: "sheet-overlay device-pick-overlay" });
+    const sheet = h("div", { class: "sheet device-pick-sheet" }, [
+      h("div", { class: "sheet-grabber" }),
+      h("div", { class: "sheet-header" }, [
+        h("div", { class: "sheet-title" }, "选择天平"),
+        h("button", { class: "sheet-done-btn", type: "button" }, "完成"),
+      ]),
+    ]);
+    const listWrap = h("div", { class: "device-list" });
+    const searchingHint = h("div", { class: "device-searching" }, [
+      h("div", { class: "device-spinner" }),
+      h("div", {}, "正在搜索附近的天平…"),
+    ]);
+    sheet.appendChild(listWrap);
+    overlay.appendChild(sheet);
+    document.body.appendChild(overlay);
+    // 触发上滑动画
+    requestAnimationFrame(() => overlay.classList.add("visible"));
+
+    let closed = false;
+    let autoCloseTimer = null;
+
+    function renderList() {
+      listWrap.innerHTML = "";
+      const devs = scaleConn.devices;
+      if (!devs.length) {
+        listWrap.appendChild(searchingHint);
+        return;
+      }
+      devs.forEach((d) => {
+        const isSelected = d.deviceId === scaleConn.selectedDeviceId;
+        const gramsText = (typeof d.grams === "number" && isFinite(d.grams))
+          ? Number(d.grams).toFixed(1) + " g"
+          : "—";
+        const row = h("div", {
+          class: "device-row" + (isSelected ? " selected" : ""),
+          onClick: () => {
+            if (closed) return;
+            scaleConn.selectedDeviceId = d.deviceId;
+            scaleConn.selectedDeviceName = d.name;
+            saveScaleDevice(d.deviceId, d.name);
+            ch.selectDevice(d.deviceId);
+            renderList();
+          },
+        }, [
+          h("div", { class: "device-row-main" }, [
+            h("div", { class: "device-row-name" }, d.name),
+            h("div", { class: "device-row-sub" }, gramsText),
+          ]),
+          rssiIndicator(d.rssi),
+          isSelected ? h("div", { class: "device-row-check" }, "✓") : null,
+        ]);
+        listWrap.appendChild(row);
+      });
+    }
+
+    // 实时设备刷新
+    const onDevicesCb = function (norm) {
+      scaleConn.devices = norm.devices;
+      // 若原生已选定（selectedDeviceId 同步），刷新本地选定名
+      if (norm.selectedDeviceId && norm.selectedDeviceId !== scaleConn.selectedDeviceId) {
+        scaleConn.selectedDeviceId = norm.selectedDeviceId;
+        const m = norm.devices.filter((x) => x.deviceId === norm.selectedDeviceId)[0];
+        if (m) scaleConn.selectedDeviceName = m.name;
+      }
+      renderList();
+      // 选定设备的读数到达（state 变 connected）→ 0.8s 后自动关 sheet
+      if (scaleConn.state === "connected" && scaleConn.selectedDeviceId && !autoCloseTimer && !closed) {
+        autoCloseTimer = setTimeout(closeSheet, 800);
+      }
+    };
+    ch.onDevices(onDevicesCb);
+    // 已选定设备：状态变 connected 也触发自动关闭（设备读数来源）
+    const connSub = function () {
+      if (scaleConn.state === "connected" && scaleConn.selectedDeviceId && !autoCloseTimer && !closed) {
+        autoCloseTimer = setTimeout(closeSheet, 800);
+      }
+    };
+    scaleConn._subs.push(connSub);
+
+    renderList();
+
+    function closeSheet() {
+      if (closed) return;
+      closed = true;
+      if (autoCloseTimer) { clearTimeout(autoCloseTimer); autoCloseTimer = null; }
+      const i = scaleConn._subs.indexOf(connSub);
+      if (i >= 0) scaleConn._subs.splice(i, 1);
+      // 未选任何设备 → 停止扫描回 disconnected
+      if (!scaleConn.selectedDeviceId) {
+        if (scaleConn.channel) {
+          try { scaleConn.channel.stop(); } catch (_) {}
+          scaleConn.channel = null;
+        }
+        scaleConn.state = "disconnected";
+        scaleConn.devices = [];
+        notifyScaleConn();
+      }
+      overlay.classList.remove("visible");
+      setTimeout(() => { if (overlay.parentNode) overlay.remove(); }, 280);
+    }
+
+    // 点遮罩空白 = 取消（不选定）
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) closeSheet(); });
+    sheet.querySelector(".sheet-done-btn").addEventListener("click", closeSheet);
+  }
+
+  /* RSSI 信号强度指示：4 根递增高度竖条，按 rssi 分 4 档（CSS 画，不用 emoji）。
+   * -50 以上 4 格；-60 以上 3 格；-70 以上 2 格；其余 1 格。 */
+  function rssiIndicator(rssi) {
+    if (typeof rssi !== "number" || !isFinite(rssi)) rssi = -100;
+    let level;
+    if (rssi >= -50) level = 4;
+    else if (rssi >= -60) level = 3;
+    else if (rssi >= -70) level = 2;
+    else level = 1;
+    const bars = [];
+    for (let i = 1; i <= 4; i++) {
+      bars.push(h("span", { class: "rssi-bar" + (i <= level ? " on" : "") }));
+    }
+    return h("div", { class: "rssi-indicator", "aria-label": `信号 ${level}/4` }, bars);
   }
 
   /* ------------------------------------------------------------------ *
@@ -507,41 +702,45 @@
   async function viewHome() {
     const screen = h("div", { class: "screen" });
     screen.appendChild(
-      appbar("小鼠称重记录", {
-        right: h("button", { class: "iconbtn", onClick: () => go("/settings") }, "⚙"),
+      appbar("", {
+        right: h("button", { class: "appbar-btn", onClick: () => go("/settings") }, "设置"),
       })
     );
     const content = h("div", { class: "content" });
 
-    // 天平连接卡片（全局连接入口）
+    // 大标题 + 日期副标题
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
+    content.appendChild(h("div", { class: "page-title" }, "小鼠称重"));
+    content.appendChild(h("div", { class: "page-subtitle" }, dateStr));
+
+    // 天平连接卡片（全局连接入口，iOS 风格）
     const connectCard = renderScaleConnectCard();
     content.appendChild(connectCard);
 
-    content.appendChild(h("div", { class: "hero-illus", html: HERO_SVG }));
-    const startBtn = h("button", { class: "btn primary", onClick: startRecording }, "📷  开始录制");
-    content.appendChild(startBtn);
-    content.appendChild(
-      h("button", { class: "btn outline", onClick: () => go("/manage") }, "🗂  开始管理")
-    );
-    content.appendChild(
-      h("button", { class: "btn ghost", onClick: () => go("/scale-sync") }, "⏱  天平校时（测试）")
-    );
+    // 操作分组列表（开始录制 ›、箱子管理 ›、天平校时 ›）
+    content.appendChild(h("div", { class: "group-title" }, "操作"));
+    const opGroup = h("div", { class: "group" }, [
+      // 开始录制：未连接时 label3 置灰但可点（进手动模式）
+      groupNavRow("开始录制", null, () => startRecording(), "home-start-rec"),
+      groupNavRow("箱子管理", null, () => go("/manage")),
+      groupNavRow("天平校时（测试）", null, () => go("/scale-sync")),
+    ]);
+    content.appendChild(opGroup);
 
-    const recentCard = h("div", { class: "card", style: "margin-top:18px" });
-    recentCard.appendChild(
-      h("div", { class: "section-head" }, [
-        h("h2", {}, "最近记录"),
-        h("button", { class: "link", onClick: () => go("/manage") }, "查看全部 ›"),
-      ])
+    // 最近记录分组
+    content.appendChild(h("div", { class: "group-title" }, "最近记录"));
+    const listWrap = h("div", { class: "group recent-group" }, [h("div", { class: "empty group-empty" }, "加载中…")]);
+    content.appendChild(listWrap);
+    content.appendChild(
+      h("button", { class: "group-footer-btn", onClick: () => go("/manage") }, "查看全部 ›")
     );
-    const listWrap = h("div", { class: "list" }, [h("div", { class: "empty" }, "加载中…")]);
-    recentCard.appendChild(listWrap);
-    content.appendChild(recentCard);
     screen.appendChild(content);
     mount(screen);
 
-    // 连接卡片订阅全局连接状态实时刷新
-    const updater = renderScaleConnectCard._updater(connectCard, startBtn);
+    // 连接卡片订阅全局连接状态实时刷新；同时刷新开始录制行的置灰态
+    const startRow = opGroup.querySelector(".home-start-rec");
+    const updater = renderScaleConnectCard._updater(connectCard, startRow);
     scaleConn._subs.push(updater);
     return () => {
       const i = scaleConn._subs.indexOf(updater);
@@ -552,80 +751,106 @@
       const data = await api.recentBoxes();
       listWrap.innerHTML = "";
       if (!data.items.length) {
-        listWrap.appendChild(h("div", { class: "empty" }, "还没有记录，去录制第一只吧"));
+        listWrap.appendChild(h("div", { class: "empty group-empty" }, "还没有记录，去录制第一只吧"));
       } else {
         data.items.forEach((b) => listWrap.appendChild(recentRow(b)));
       }
     } catch (err) {
       listWrap.innerHTML = "";
-      listWrap.appendChild(h("div", { class: "empty" }, err.message));
+      listWrap.appendChild(h("div", { class: "empty group-empty" }, err.message));
     }
+  }
+
+  /* iOS 风格分组导航行：左标题 / 副标题 + 右侧 "›"。extraClass 用于钩子。 */
+  function groupNavRow(title, subtitle, onClick, extraClass) {
+    const main = h("div", { class: "group-row-main" }, [
+      h("div", { class: "group-row-title" }, title),
+      subtitle ? h("div", { class: "group-row-sub" }, subtitle) : null,
+    ]);
+    return h("div", { class: "group-row nav-row" + (extraClass ? " " + extraClass : ""), onClick: onClick }, [
+      main,
+      h("span", { class: "group-chevron" }, "›"),
+    ]);
   }
 
   // 天平连接卡片渲染 + 状态→DOM 更新器（返回一个订阅函数）
   function renderScaleConnectCard() {
     const card = h("div", { class: "card scale-connect-card" });
+    // 左侧 40px 圆角 9 蓝色方块内白色"⚖"
+    const icon = h("div", { class: "connect-icon" }, "⚖");
     const dot = h("span", { class: "connect-dot" });
     const statusText = h("div", { class: "connect-status-text" }, "天平未连接");
     const weightText = h("div", { class: "connect-weight" }, "");
-    const info = h("div", { class: "connect-info" }, [statusText, weightText]);
-    const actionBtn = h("button", { class: "btn outline connect-action" }, "连接天平");
+    const title = h("div", { class: "connect-title" }, "天平");
+    const info = h("div", { class: "connect-info" }, [dot, statusText, weightText]);
+    const infoBlock = h("div", { class: "connect-info-block" }, [title, info]);
+    const actionBtn = h("button", { class: "pill connect-action pill-connect" }, "连接");
     actionBtn.addEventListener("click", () => {
       if (scaleConn.state === "disconnected" || scaleConn.state === "error") connectScale();
       else disconnectScale();
     });
-    card.appendChild(h("div", { class: "connect-row" }, [h("div", { class: "connect-left" }, [dot, info]), actionBtn]));
+    card.appendChild(h("div", { class: "connect-row" }, [icon, infoBlock, actionBtn]));
     // 立即按当前状态渲染一次
     applyConnectState(card, dot, statusText, weightText, actionBtn);
     return card;
   }
-  renderScaleConnectCard._updater = function (card, startBtn) {
+  renderScaleConnectCard._updater = function (card, startRow) {
     return function () {
       const dot = card.querySelector(".connect-dot");
       const statusText = card.querySelector(".connect-status-text");
       const weightText = card.querySelector(".connect-weight");
       const actionBtn = card.querySelector(".connect-action");
       applyConnectState(card, dot, statusText, weightText, actionBtn);
-      // 开始录制按钮：未连接时仍允许（手动模式可用），但给出提示样式
-      if (startBtn) {
+      // 开始录制行：未连接时 label3 置灰但仍可点（进手动模式）
+      if (startRow) {
         const connected = scaleConn.state === "connected";
-        startBtn.classList.toggle("btn-primary-dim", !connected);
+        startRow.classList.toggle("dim", !connected);
       }
     };
   };
   function applyConnectState(card, dot, statusText, weightText, actionBtn) {
     const s = scaleConn.state;
-    dot.className = "connect-dot " + s;
     const labels = {
-      disconnected: "天平未连接",
-      connecting: "正在连接天平…",
-      connected: "天平已连接",
-      stale: "天平广播中断",
+      disconnected: "未连接",
+      connecting: "正在搜索天平…",
+      connected: "已连接",
+      stale: "广播中断",
       error: scaleConn.errorMsg || "天平异常",
     };
     statusText.textContent = labels[s] || s;
-    if (s === "connected" && scaleConn.lastGrams !== null) {
-      weightText.textContent = Number(scaleConn.lastGrams).toFixed(1) + " g";
+    // connected 时副标题显示 设备名 · 实时克数
+    if (s === "connected") {
+      const name = scaleConn.selectedDeviceName || "";
+      const g = scaleConn.lastGrams !== null ? Number(scaleConn.lastGrams).toFixed(1) + " g" : "—";
+      weightText.textContent = name ? `${name} · ${g}` : g;
       weightText.hidden = false;
     } else {
       weightText.textContent = "";
       weightText.hidden = true;
     }
-    actionBtn.textContent = (s === "disconnected" || s === "error") ? "连接天平" : "断开";
+    // 状态色点（pill 内的小圆点用 connect-dot class）
+    if (dot) dot.className = "connect-dot " + s;
+    actionBtn.textContent = (s === "disconnected" || s === "error") ? "连接" : "断开";
     actionBtn.disabled = (s === "connecting");
+    // pill 状态色：connected 绿、connecting/stale 橙、error/disconnected 灰
+    actionBtn.classList.remove("pill-green", "pill-orange", "pill-red", "pill-gray");
+    if (s === "connected") actionBtn.classList.add("pill-green");
+    else if (s === "connecting" || s === "stale") actionBtn.classList.add("pill-orange");
+    else actionBtn.classList.add("pill-gray");
   }
 
   function recentRow(b) {
     const count = (b.record_count || 0) + (b.pending_count || 0);
     return h(
       "div",
-      { class: "list-item", onClick: () => go(`/box/${encodeURIComponent(b.cage_id)}`) },
+      { class: "group-row nav-row recent-row", onClick: () => go(`/box/${encodeURIComponent(b.cage_id)}`) },
       [
-        h("div", { class: "li-main" }, [
-          h("div", { class: "li-title" }, b.cage_id),
-          h("div", { class: "li-sub" }, `${b.strain} · ${fmtTime(b.last_activity_at || b.created_at)}`),
+        h("div", { class: "group-row-main" }, [
+          h("div", { class: "group-row-title" }, b.cage_id),
+          h("div", { class: "group-row-sub" }, `${b.strain} · ${fmtTime(b.last_activity_at || b.created_at)}`),
         ]),
-        h("span", { class: "count-pill" }, `${count} 只`),
+        h("span", { class: "count-badge" }, `${count} 只`),
+        h("span", { class: "group-chevron" }, "›"),
       ]
     );
   }
@@ -642,39 +867,58 @@
   function viewMode() {
     const screen = h("div", { class: "screen" });
     const box = state.currentBox || { cageId: "-" };
-    screen.appendChild(appbar("选择录制模式", { back: "/scan" }));
-    const content = h("div", { class: "content" });
-    content.appendChild(h("div", { class: "card mode-info-card" },
-      h("div", { class: "li-sub" }, `本次录制：箱 ${box.cageId}`)
-    ));
+    screen.appendChild(appbar("记录方式", { back: "/scan" }));
+    const content = h("div", { class: "content mode-content" });
+
+    content.appendChild(h("div", { class: "page-title" }, "记录方式"));
+    content.appendChild(h("div", { class: "page-subtitle" }, `本次录制：箱 ${box.cageId}`));
 
     const connected = scaleConn.state === "connected";
     const modes = [
-      { id: "post_match", label: "后匹配", desc: "连续录像，自动记录每只，事后审核", requireScale: true },
-      { id: "announce", label: "即时报数", desc: "每只暂停确认重量，语音报数", requireScale: true },
-      { id: "manual", label: "手动", desc: "人工输入每只克数，无需天平", requireScale: false },
+      { id: "post_match", label: "后匹配", desc: "连续录像，自动记录每只，事后审核", requireScale: true, icon: "▶" },
+      { id: "announce", label: "即时报数", desc: "每只暂停确认重量，语音报数", requireScale: true, icon: "♪" },
+      { id: "manual", label: "手动", desc: "人工输入每只克数，无需天平", requireScale: false, icon: "✎" },
     ];
-    const chips = h("div", { class: "mode-chips" });
-    modes.forEach((m) => {
-      const disabled = m.requireScale && !connected;
-      const chip = h("button", {
-        class: "mode-chip" + (disabled ? " disabled" : ""),
-        onClick: () => {
-          if (disabled) { toast("请先在首页连接天平"); return; }
-          sessionStorage.setItem("mv.recordMode", m.id);
-          go("/record");
-        },
-      }, [
-        h("div", { class: "mode-chip-label" }, m.label),
-        h("div", { class: "mode-chip-desc" }, m.desc),
-      ]);
-      chips.appendChild(chip);
-    });
-    content.appendChild(chips);
-    if (!connected) {
-      content.appendChild(h("div", { class: "mode-hint" }, "天平未连接：后匹配/即时报数需先连接天平；可选择手动模式。"));
+    let selectedMode = currentRecordMode();
+    const cardsWrap = h("div", { class: "mode-cards" });
+    function renderCards() {
+      cardsWrap.innerHTML = "";
+      modes.forEach((m) => {
+        const disabled = m.requireScale && !connected;
+        const selected = selectedMode === m.id;
+        const card = h("button", {
+          class: "mode-card" + (disabled ? " disabled" : "") + (selected ? " selected" : ""),
+          onClick: () => {
+            if (disabled) { toast("请先在首页连接天平"); return; }
+            selectedMode = m.id;
+            renderCards();
+          },
+        }, [
+          h("div", { class: "mode-card-icon" }, m.icon),
+          h("div", { class: "mode-card-main" }, [
+            h("div", { class: "mode-card-label" }, m.label),
+            h("div", { class: "mode-card-desc" }, m.desc),
+          ]),
+          selected ? h("div", { class: "mode-card-check" }, "✓") : null,
+        ]);
+        cardsWrap.appendChild(card);
+      });
     }
+    renderCards();
+    content.appendChild(cardsWrap);
+    if (!connected) {
+      content.appendChild(h("div", { class: "group-footer mode-footer-note" },
+        "天平未连接：后匹配 / 即时报数需先连接天平；可选择手动模式。"));
+    }
+    // 底部固定主按钮
+    const startBtn = h("button", { class: "btn btn-p", onClick: () => {
+      const m = modes.filter((x) => x.id === selectedMode)[0];
+      if (m && m.requireScale && !connected) { toast("请先在首页连接天平"); return; }
+      sessionStorage.setItem("mv.recordMode", selectedMode);
+      go("/record");
+    } }, "开始录制");
     screen.appendChild(content);
+    screen.appendChild(h("div", { class: "dock dock-fixed" }, [startBtn]));
     mount(screen);
   }
   function currentRecordMode() {
@@ -1083,28 +1327,17 @@
     const viewportHost = h("div", { class: "record-viewport-host" }, [viewport]);
 
     // --- Realtime dock ---
-    const stateDot = h("span", {
-      class: "rt-state-dot",
-      style:
-        "display:inline-block;width:10px;height:10px;border-radius:50%;background:#9aa0a6;margin-right:6px;vertical-align:middle",
-    });
+    const stateDot = h("span", { class: "rt-state-dot" });
     const stateText = h("span", { class: "rt-state-text" }, "正在连接…");
+    // 状态 pill：毛玻璃 + 状态色点 + 文字。CSS 提供样式，setState 切 class。
     const stateIndicator = h(
       "div",
-      { class: "rt-state-indicator", style: "text-align:center;padding:6px 0;font-size:15px" },
+      { class: "rt-state-pill" },
       [stateDot, stateText]
     );
 
-    const weightValue = h(
-      "span",
-      { class: "rt-weight-value", style: "font-size:56px;font-weight:700;line-height:1;color:#9aa0a6" },
-      "--"
-    );
-    const weightUnit = h(
-      "span",
-      { class: "rt-weight-unit", style: "font-size:20px;margin-left:6px;color:#9aa0a6" },
-      "g"
-    );
+    const weightValue = h("span", { class: "rt-weight-value" }, "--");
+    const weightUnit = h("span", { class: "rt-weight-unit" }, "g");
     // 蓝牙天平源标签 + RSSI/广播间隔（仅 native_ble 模式可见）
     const scaleSourceLabel = h("div", { class: "rt-scale-source", hidden: true }, "蓝牙天平 K797");
     const scaleMeta = h("div", { class: "rt-scale-meta", hidden: true });
@@ -1126,27 +1359,27 @@
     );
     const acceptBtn = h(
       "button",
-      { class: "btn primary rt-btn-accept", type: "button", hidden: true },
+      { class: "btn btn-p rt-btn-accept", type: "button", hidden: true },
       "确认"
     );
     const actionButtons = h(
       "div",
-      { class: "rt-actions", style: "display:flex;gap:12px;justify-content:center" },
+      { class: "rt-actions" },
       [retryBtn, acceptBtn]
     );
 
     const mouseCount = h(
       "div",
-      { class: "rt-mouse-count", style: "text-align:center;color:var(--muted,#5f6368);font-size:13px" },
+      { class: "rt-mouse-count" },
       "已记录 0 只"
     );
 
-    // 手动模式：克数输入 + 确认本只（替代 BLE 自动读数）
+    // 手动模式：克数输入 + 确认本只（替代 BLE 自动读数）。iOS 输入框风格。
     const manualInput = h("input", {
-      class: "field manual-weight-input", type: "number", inputmode: "decimal",
+      class: "ios-input manual-weight-input", type: "number", inputmode: "decimal",
       step: "0.1", min: "0", max: "6553.5", placeholder: "输入克数，如 25.4",
     });
-    const manualSubmit = h("button", { class: "btn primary manual-submit-btn", type: "button" }, "确认本只");
+    const manualSubmit = h("button", { class: "btn btn-p manual-submit-btn", type: "button" }, "确认本只");
     const manualPanel = h("div", { class: "manual-panel", hidden: recordMode !== "manual" },
       [manualInput, manualSubmit]);
     manualSubmit.addEventListener("click", () => {
@@ -1567,12 +1800,12 @@
     function setWeightValue(value, confirmed) {
       if (value == null) {
         weightValue.textContent = "--";
-        weightValue.style.color = "#9aa0a6";
-        weightUnit.style.color = "#9aa0a6";
+        weightValue.style.color = "var(--label2)";
+        weightUnit.style.color = "var(--label2)";
       } else {
         weightValue.textContent = Number(value).toFixed(2);
-        // Confirmed (announced) = green; live/unconfirmed = gray.
-        const c = confirmed ? "#1e8e3e" : "#5f6368";
+        // Confirmed (announced) = green; live/unconfirmed = label (dark).
+        const c = confirmed ? "var(--green)" : "var(--label)";
         weightValue.style.color = c;
         weightUnit.style.color = c;
       }
@@ -1597,14 +1830,14 @@
       retry_requested: "正在重测…",
     };
     const STATE_COLORS = {
-      connecting: "#9aa0a6",
-      calibrating: "#f59e0b",
-      armed: "#1a73e8",
-      weighing: "#1a73e8",
-      announced: "#1e8e3e",
-      wait_clear: "#f59e0b",
-      accepted: "#1e8e3e",
-      retry_requested: "#f59e0b",
+      connecting: "var(--gray)",
+      calibrating: "var(--orange)",
+      armed: "var(--blue)",
+      weighing: "var(--blue)",
+      announced: "var(--green)",
+      wait_clear: "var(--orange)",
+      accepted: "var(--green)",
+      retry_requested: "var(--orange)",
     };
 
     function setState(newState, msg) {
@@ -2085,13 +2318,13 @@
     function setBleWeightDisplay(grams) {
       if (grams == null || typeof grams !== "number" || !isFinite(grams)) {
         weightValue.textContent = "--";
-        weightValue.style.color = "#9aa0a6";
-        weightUnit.style.color = "#9aa0a6";
+        weightValue.style.color = "var(--label2)";
+        weightUnit.style.color = "var(--label2)";
         return;
       }
       weightValue.textContent = grams.toFixed(1);
-      weightValue.style.color = "#5f6368";
-      weightUnit.style.color = "#5f6368";
+      weightValue.style.color = "var(--label)";
+      weightUnit.style.color = "var(--label)";
     }
 
     function sendScaleReadingToWs(reading) {
@@ -2106,6 +2339,14 @@
       if (scaleChannel || weightSource !== "native_ble") return;
       // 录制期间由本视图独占 BLE 扫描；暂停首页的全局连接通道，避免双扫描冲突。
       if (scaleConn.channel) disconnectScale();
+      // 设备选择：从 localStorage 读 mv.scaleDevice，有则传 deviceId 锁定该设备；
+      // 没有 device API（legacy app）→ createScaleChannel 内部自动跳过 select。
+      const saved = loadSavedScaleDevice();
+      const channelOpts = saved ? { deviceId: saved.deviceId } : {};
+      // 兜底：支持选择 API 但用户没选过任何设备 → 提示回首页连接，不盲目自动选最强。
+      if (!saved && ScaleBridge.detectDeviceSupport()) {
+        setQualityHints(["未选择天平，请回首页连接并选定设备"]);
+      }
       // 传输层：WS 开着直发，断开时由 dedup 暂存最新一条待重连 flush。
       scaleDedup = ScaleBridge.createDedupSender(
         function (m) {
@@ -2114,7 +2355,7 @@
         function (reading) { return ScaleBridge.buildScaleReadingMessage(reading, bleClientTsMs()); }
       );
       scaleDedup.start();
-      scaleChannel = ScaleBridge.createScaleChannel();
+      scaleChannel = ScaleBridge.createScaleChannel(channelOpts);
       // 新读数 → 直显（一位小数）+ 转发 WS；announced 态不改写（由引擎驱动）
       scaleChannel.onReading(function (reading) {
         if (rtState !== "announced" && rtState !== "accepted") {
@@ -2274,7 +2515,7 @@
       switchCamBtn.hidden = true;
       finishBtn.disabled = true;
       stateText.textContent = "不可用";
-      stateDot.style.background = "#dc3545";
+      stateDot.style.background = "var(--red)";
       setQualityHints([reason || "当前浏览器无法进行实时称重，请更换浏览器后重试"]);
     }
 
@@ -2333,9 +2574,18 @@
       if (canvasStream) canvasStream.getTracks().forEach((t) => t.stop());
       stopStream(stream);
       // 录制期间为避免双扫描暂停了首页全局天平连接；BLE 模式下录制结束自动恢复，
-      // 连续录多箱时回到首页无需重新点"连接天平"。
+      // 连续录多箱时回到首页无需重新点"连接天平"。自动恢复时若已有持久化选定设备，
+      // 直接重连该设备（带 deviceId），不弹"选择天平"sheet。
       if (weightSource === "native_ble" && ScaleBridge.detectNativeBridge()) {
-        connectScale();
+        const saved = loadSavedScaleDevice();
+        if (saved) {
+          scaleConn.state = "connecting";
+          scaleConn.errorMsg = "";
+          notifyScaleConn();
+          scaleConn.channel = startScaleConnChannel(saved.deviceId);
+        } else {
+          connectScale();
+        }
       }
     };
   }
@@ -3316,18 +3566,6 @@
   route("/manage/new", viewBoxNew);
   route("/settings", viewSettings);
   route("/scale-sync", viewScaleSync);
-
-  const HERO_SVG = `
-<svg viewBox="0 0 320 180" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect x="70" y="120" width="180" height="16" rx="6" fill="#e9ecef"/>
-  <rect x="96" y="96" width="128" height="30" rx="6" fill="#ffffff" stroke="#dee2e6"/>
-  <rect x="150" y="104" width="60" height="16" rx="3" fill="#1b1f22"/>
-  <text x="180" y="117" font-size="12" fill="#28a745" text-anchor="middle" font-family="monospace">22.43g</text>
-  <ellipse cx="130" cy="92" rx="34" ry="18" fill="#adb5bd"/>
-  <circle cx="104" cy="86" r="6" fill="#adb5bd"/>
-  <circle cx="102" cy="84" r="2" fill="#495057"/>
-  <path d="M150 78 q22 -14 30 6" stroke="#adb5bd" stroke-width="4" fill="none" stroke-linecap="round"/>
-</svg>`;
 
   render();
 })();
