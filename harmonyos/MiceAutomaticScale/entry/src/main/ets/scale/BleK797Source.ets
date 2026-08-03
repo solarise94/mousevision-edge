@@ -100,8 +100,12 @@ export class BleK797Source extends ScaleSourceBase {
 
     // 带过滤扫描：name=K797 + manufactureId=0x0000。onScanResults 内仍二次校验名称。
     const filter: ble.ScanFilter = { name: K797_DEVICE_NAME, manufactureId: K797_MANUFACTURER_ID };
+    // 扫描占空比：K797 是不可连接广播设备，无 GATT/notify 通道，必须持续被动监听。
+    // LOW_LATENCY 用最高占空比，对应毫秒级广播时延迟最低；现场插电连续称量，
+    // 实时性优先于功耗。stale 阈值见 STALE_THRESHOLD_MS（15s，宽容系统批处理抖动）。
+    const options: ble.ScanOptions = { dutyMode: ble.ScanDuty.SCAN_MODE_LOW_LATENCY };
     try {
-      this.scanner.startScan([filter]).catch((e: Object) => {
+      this.scanner.startScan([filter], options).catch((e: Object) => {
         const msg = `${e}`;
         if (msg.indexOf('201') >= 0 || msg.indexOf('ermission') >= 0) {
           this.reportUnauthorized(`蓝牙权限被拒：${msg}`);

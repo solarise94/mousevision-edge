@@ -42,8 +42,12 @@ export interface ScaleSource {
   stop(): void;
 }
 
-/** stale 阈值：超过此时间无合法包则进入 stale（毫秒，单调时钟）。 */
-export const STALE_THRESHOLD_MS: number = 10_000;
+/** stale 阈值：超过此时间无合法包则进入 stale（毫秒，单调时钟）。
+ *  K797 广播间隔默认 200ms（计划 §10）。MatePad 扫描为系统批处理投递
+ *  （占空比相关，见 BleK797Source 的 ScanOptions），即便均衡档也可能每 ~1.28s
+ *  才上报一批。15s ≈ 75 个广播周期 / 十余个扫描周期，既对真实断流足够灵敏，
+ *  又能容忍系统批处理的偶发抖动，避免误判 stale 误显“断线”。 */
+export const STALE_THRESHOLD_MS: number = 15_000;
 /** 派生稳定所需连续相同 raw 的最小条数。 */
 export const STABLE_MIN_REPEAT: number = 3;
 /** device 固定为 K797（来源无关）。 */

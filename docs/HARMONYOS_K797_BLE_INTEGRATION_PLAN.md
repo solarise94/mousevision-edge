@@ -197,7 +197,7 @@ Android 端以 Android SDK 的 `BluetoothLeScanner`、`ScanRecord.getManufacture
 | `off` | 用户未启动或已停止扫描 |
 | `scanning` | 扫描已启动，但尚未收到合法 K797 包 |
 | `active` | 最近收到合法包 |
-| `stale` | 超过 10 秒未收到合法包 |
+| `stale` | 超过 15 秒未收到合法包 |
 | `unauthorized` | 权限未授权或被撤销 |
 | `bluetooth_off` | 系统蓝牙关闭 |
 | `error` | 扫描器异常 |
