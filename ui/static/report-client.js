@@ -326,19 +326,23 @@
             }
           } catch (_) { bodyP = Promise.resolve(null); }
           return bodyP.then(function (body) {
-            var withBody = res;
-            if (body && !res._body) {
-              // 不修改原 res；造一个带 _body 的浅拷贝供 classify 使用
-              withBody = Object.create(res);
-              withBody.status = res.status;
-              withBody._body = body;
-            } else if (body) {
-              withBody = res;
-            }
-            return { kind: classifyResult(withBody), res: res, body: body };
+            // 判定用普通对象携带 status + 解析后的 body。
+            // 不能用 Object.create(res) 再赋值 status：Response.prototype.status 是
+            // 只读 getter，严格模式下 withBody.status=... 会抛 TypeError（被外层
+            // catch 误判为 retry）——导致设备其实上报成功(201)却显示"等待联网"并
+            // 无限重传。该 bug 只在真实 fetch 下出现（测试假 fetch 自带 _body，
+            // 不走此分支），真机实测暴露。
+            var statusCode = (res && typeof res.status === "number") ? res.status : 0;
+            var bodyFinal = body || (res && res._body) || null;
+            return {
+              kind: classifyResult({ status: statusCode, _body: bodyFinal }),
+              res: res,
+              body: bodyFinal,
+            };
           }, function () {
             // body 解析失败：仅凭 status 判定（classify 在 status 2xx 但无 body.ok 时 retry）
-            return { kind: classifyResult(res), res: res, body: null };
+            var statusCode2 = (res && typeof res.status === "number") ? res.status : 0;
+            return { kind: classifyResult({ status: statusCode2, _body: res && res._body }), res: res, body: null };
           });
         })
         .catch(function () {

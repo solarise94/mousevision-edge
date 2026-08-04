@@ -673,3 +673,23 @@ test("video: 函数形式 ()=>Blob 也支持（延迟求值，flush 时取）", 
   assert.equal(made, true, "flush 时求值");
   assert.notEqual(fetchFn.calls[0].init.body.get("video"), null);
 });
+
+/* 真机 bug 回归：真实 fetch Response（status 是只读 getter）下成功上报必须判 ok。
+ * 修复前用 Object.create(res)+withBody.status=... 在严格模式抛 TypeError，被外层
+ * catch 误判 retry → 设备其实 201 成功却显示"等待联网"并无限重传。 */
+test("flush 用真实 Response 对象（只读 status）成功上报判 ok 并出队", async () => {
+  const storage = makeStorage();
+  // 返回 node 真实 Response（status 只读 getter），body 为合法 ok JSON
+  const realFetch = () => Promise.resolve(
+    new Response(JSON.stringify({ ok: true, run_id: "r1", count: 1, record_ids: ["a"] }), {
+      status: 201,
+      headers: { "Content-Type": "application/json" },
+    })
+  );
+  const ob = RC.createOutbox({ storage, fetchFn: realFetch, now: () => 1000 });
+  ob.enqueue({ cage_id: "C1", records: [{ record_id: "a", ordinal: 1, weight_g: 26.3 }] });
+  const r = await ob.flush();
+  assert.equal(r.sent, 1, "201 成功必须计入 sent（不能误判 retry）");
+  assert.equal(r.remaining, 0);
+  assert.equal(ob.pending(), 0);
+});
