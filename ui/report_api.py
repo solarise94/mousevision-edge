@@ -256,6 +256,44 @@ def _write_frame_photo(path: Path, frame: np.ndarray) -> bool:
     return True
 
 
+# Upper bound for a single dev readings.json payload (10MB). Beyond this the
+# payload is skipped (not fatal): device-side dev collection should stay well
+# under this for a single box session.
+_READINGS_MAX_BYTES = 10 * 1024 * 1024
+
+
+async def _read_dev_readings(upload: UploadFile) -> tuple[dict | None, str | None]:
+    """Read + validate the optional dev ``readings`` JSON upload.
+
+    Returns ``(payload, reason)``. On success ``payload`` is the parsed dict
+    (guaranteed to be a dict containing a ``readings`` list) and ``reason`` is
+    None. On any failure (too large, bad JSON, wrong shape) ``payload`` is None
+    and ``reason`` is a short human-readable string; the caller skips the
+    readings without failing the whole report.
+    """
+    if upload is None:
+        return None, None
+    try:
+        raw = await upload.read(_READINGS_MAX_BYTES + 1)
+    except Exception as exc:  # noqa: BLE001 — drain/decode robustness
+        log.warning("report_api: readings upload read failed: %s", exc)
+        return None, "read-error"
+    if len(raw) > _READINGS_MAX_BYTES:
+        log.warning("report_api: readings payload too large (%d bytes), skipping", len(raw))
+        return None, "too-large"
+    if not raw:
+        return None, "empty"
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        log.warning("report_api: readings payload not valid JSON: %s", exc)
+        return None, "bad-json"
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("readings"), list):
+        log.warning("report_api: readings payload must be a dict with a 'readings' list")
+        return None, "bad-shape"
+    return parsed, None
+
+
 @router.post("/api/records/report", dependencies=[Depends(require_api_token)])
 async def report_records(
     cage_id: str = Form(...),
@@ -265,6 +303,7 @@ async def report_records(
     strain: str | None = Form(None),
     records: str = Form(...),
     video: UploadFile | None = File(None),
+    readings: UploadFile | None = File(None),
 ) -> JSONResponse:
     """Receive a batch of device-judged weighing records.
 
@@ -327,6 +366,14 @@ async def report_records(
         # drain and discard so the multipart body is fully consumed.
         await video.read()
 
+    # dev readings: when nothing will be written (all duplicates) the readings
+    # upload, if present, is drained + discarded — no run exists to attach to.
+    if not to_write and readings is not None:
+        try:
+            await readings.read()
+        except Exception:  # noqa: BLE001 — drain robustness
+            pass
+
     if not to_write:
         # All duplicates: do not create an empty run.
         return JSONResponse(
@@ -338,6 +385,7 @@ async def report_records(
                 "record_ids": [],
                 "photos_extracted": 0,
                 "skipped": skipped,
+                "readings_saved": False,
                 "message": "全部记录已存在，跳过",
             }
         )
@@ -360,6 +408,23 @@ async def report_records(
         uploaded_video_path.replace(target_video)
         uploaded_video_path = target_video
         evidence_rel = target_video.name
+
+    # dev readings: optional time series of raw scale readings for this session,
+    # collected by the H5 client in dev mode (for future model training). Read +
+    # validate (bounded size, JSON dict with a 'readings' list); on any failure
+    # we skip it without failing the whole report. Original bytes written as-is.
+    readings_saved = False
+    if readings is not None:
+        try:
+            parsed_readings, _reason = await _read_dev_readings(readings)
+            if parsed_readings is not None:
+                (run_dir / "readings.json").write_text(
+                    json.dumps(parsed_readings, ensure_ascii=False), encoding="utf-8"
+                )
+                readings_saved = True
+        except Exception:  # noqa: BLE001 — readings must never fail the report
+            log.exception("report_api: failed to persist readings for run %s", run_id)
+            readings_saved = False
 
     written_records: list[dict[str, Any]] = []
     record_ids: list[str] = []
@@ -469,6 +534,8 @@ async def report_records(
     }
     if strain:
         manifest["strain"] = strain
+    if readings_saved:
+        manifest["readings_file"] = "readings.json"
     write_manifest(run_dir, manifest)
     finish_run(run_dir, status="device_report")
 
@@ -486,6 +553,7 @@ async def report_records(
             "record_ids": record_ids,
             "photos_extracted": photos_extracted,
             "skipped": skipped,
+            "readings_saved": readings_saved,
         },
         status_code=201,
     )

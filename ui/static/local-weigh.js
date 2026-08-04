@@ -149,6 +149,10 @@
     var projectId = opts.projectId || "default";
     var weightSource = opts.weightSource || DEFAULT_WEIGHT_SOURCE[mode];
 
+    // dev 采集：开启后订阅每条天平读数进缓冲，finishBox 时随记录上报。
+    // 默认 false（非 dev 模式零开销：不采集、不附字段）。
+    var collectReadings = !!opts.collectReadings;
+
     var storage = opts.storage || null;
     var now = typeof opts.now === "function" ? opts.now : function () { return Date.now(); };
     var onEvent = typeof opts.onEvent === "function" ? opts.onEvent : function () {};
@@ -185,6 +189,12 @@
     var weightCandidate = null;
     // stale 标志
     var stale = false;
+
+    // dev 读数采集缓冲（仅 collectReadings=true 时填充）
+    // 每条 {t_ms(相对会话开始), grams, raw, sequence, rssi, stable, receivedAtEpochMs}
+    var readingsBuffer = [];
+    var readingsStartedAtEpochMs = 0;
+    var readingsCollecting = false; // start() 置 true、stop()/finishBox() 置 false
 
     /* ---------- UI 回调封装（吞错，避免回调异常中断状态机）---------- */
     function emit(type, payload) {
@@ -303,6 +313,19 @@
       if (reading && typeof reading.grams === "number" && isFinite(reading.grams)) {
         emit("weight", { grams: reading.grams });
       }
+      // dev 采集：把完整读数时间序列进缓冲（相对会话开始的毫秒时间戳）
+      if (readingsCollecting && reading) {
+        var recvMs = (typeof reading.receivedAtEpochMs === "number") ? reading.receivedAtEpochMs : now();
+        readingsBuffer.push({
+          t_ms: recvMs - readingsStartedAtEpochMs,
+          grams: (typeof reading.grams === "number") ? reading.grams : null,
+          raw: reading.raw != null ? reading.raw : null,
+          sequence: (typeof reading.sequence === "number") ? reading.sequence : null,
+          rssi: reading.rssi != null ? reading.rssi : null,
+          stable: (typeof reading.stable === "boolean") ? reading.stable : null,
+          receivedAtEpochMs: recvMs,
+        });
+      }
       if (engineSession && reading) {
         try {
           engineSession.ingestReading({
@@ -323,6 +346,13 @@
       started = true;
       stopped = false;
       startedAt = now();
+
+      // dev 采集：新会话/新箱开始时重置缓冲（避免跨箱混入上一箱读数）
+      if (collectReadings) {
+        readingsBuffer = [];
+        readingsStartedAtEpochMs = startedAt;
+        readingsCollecting = true;
+      }
 
       // 恢复未完成草稿（崩溃安全）
       var draft = readDraft(storage, cageId);
@@ -369,6 +399,8 @@
       started = false;
       // 退订：scaleChannel.onReading 无取消订阅 API，用标志位忽略后续回调。
       readingListenerActive = false;
+      // dev 采集：stop 后停止写入缓冲（finishBox 仍可读已采集数据）
+      readingsCollecting = false;
       if (tickTimer && clearIntervalFn) {
         try { clearIntervalFn(tickTimer); } catch (_) {}
         tickTimer = null;
@@ -419,9 +451,12 @@
     }
 
     /* ================================================================== *
-     * finishBox(videoBlob?)：累积批次 outbox.enqueue → 清草稿 → 返回 {count,batchId}
+     * finishBox(videoBlob?, readings?)：累积批次 outbox.enqueue → 清草稿
+     * → 返回 {count, batchId}
+     *   readings：可选 dev 采集 payload（getReadingsPayload() 返回值），
+     *             随记录一起入队上报（可 JSON 序列化、可持久化，与 videoBlob 不同）。
      * ================================================================== */
-    function finishBox(videoBlob) {
+    function finishBox(videoBlob, readings) {
       var batch = {
         cage_id: cageId,
         project_id: projectId,
@@ -433,7 +468,8 @@
 
       var batchId;
       try {
-        batchId = outbox.enqueue(batch, videoBlob || undefined);
+        // readings 为可选第三参数（null/undefined 时 outbox 不附字段）
+        batchId = outbox.enqueue(batch, videoBlob || undefined, readings || undefined);
       } catch (e) {
         // enqueue 失败（如 records 非数组）不应清草稿（数据未入队）
         throw e;
@@ -444,7 +480,34 @@
       // 重置当前批次累积（同一控制器实例可继续用于下一箱——但建议每箱 new 一个）
       records = [];
       weightCandidate = null;
+      // dev 采集缓冲也随批次清空（下一箱重新累计）
+      readingsBuffer = [];
       return { count: count, batchId: batchId };
+    }
+
+    /* ================================================================== *
+     * getReadingsPayload()：dev 采集——返回当前会话的完整读数时间序列。
+     * 无数据（未开启采集 / 会话未开始 / 无读数）返回 null。
+     * 有数据返回：
+     *   {device_id, started_at_epoch_ms, app: "h5-dev-collect",
+     *    engine_config: <当前引擎配置快照>, readings: [...]}
+     * engine_config 快照取 opts.engineConfig（mobile.js 传入的 {stable_min_span_ms:800} 等）。
+     * ================================================================== */
+    function getReadingsPayload() {
+      if (!collectReadings) return null;
+      if (!readingsBuffer || readingsBuffer.length === 0) return null;
+      var cfg = null;
+      if (opts.engineConfig && typeof opts.engineConfig === "object") {
+        // 浅拷贝快照（避免后续 mutate 影响上报）
+        try { cfg = JSON.parse(JSON.stringify(opts.engineConfig)); } catch (_) { cfg = opts.engineConfig; }
+      }
+      return {
+        device_id: deviceId,
+        started_at_epoch_ms: readingsStartedAtEpochMs || startedAt || 0,
+        app: "h5-dev-collect",
+        engine_config: cfg,
+        readings: readingsBuffer.slice(),
+      };
     }
 
     /* ================================================================== *
@@ -470,8 +533,10 @@
       submitManual: submitManual,
       finishBox: finishBox,
       getState: getState,
+      getReadingsPayload: getReadingsPayload,
       // 测试/调试用只读视图
       _records: function () { return records.slice(); },
+      _readings: function () { return readingsBuffer.slice(); },
     };
   }
 

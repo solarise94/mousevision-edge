@@ -65,20 +65,33 @@ def _records_payload(n: int = 3, *, with_id: bool = True) -> list[dict]:
     return out
 
 
-def _post(client: TestClient, records, *, video_bytes=None, video_name="v.mp4"):
+def _post(
+    client: TestClient,
+    records,
+    *,
+    video_bytes=None,
+    video_name="v.mp4",
+    readings_obj=None,
+):
     data = {
         "cage_id": "C57-023",
         "project_id": "default",
         "device_id": "phone-01",
         "records": json.dumps(records),
     }
-    files = None
+    files = {}
     if video_bytes is not None:
-        files = {"video": (video_name, video_bytes, "video/mp4")}
+        files["video"] = (video_name, video_bytes, "video/mp4")
+    if readings_obj is not None:
+        files["readings"] = (
+            "readings.json",
+            json.dumps(readings_obj).encode("utf-8"),
+            "application/json",
+        )
     return client.post(
         "/api/records/report",
         data=data,
-        files=files,
+        files=files or None,
         headers=_headers(),
     )
 
@@ -388,3 +401,127 @@ def test_optional_fields_persisted(client):
     assert rec["clip_start_ms"] == 1000.0
     assert rec["clip_end_ms"] == 3000.0
     assert rec["timestamp"] == "2026-08-03T10:00:00"
+
+
+# --------------------------------------------------------------------------- #
+# dev readings：天平读数时间序列随记录上报（dev 模式采集，供训练识别模型）
+# --------------------------------------------------------------------------- #
+
+
+def _readings_payload(n: int = 3) -> dict:
+    """Build a valid readings payload (same shape as H5 getReadingsPayload)."""
+    readings = []
+    for i in range(n):
+        readings.append(
+            {
+                "t_ms": 100 * i,
+                "grams": 20.0 + i,
+                "raw": 200 + i,
+                "sequence": i + 1,
+                "rssi": -60 - i,
+                "stable": i % 2 == 0,
+                "receivedAtEpochMs": 1000 + 100 * i,
+            }
+        )
+    return {
+        "device_id": "phone-01",
+        "started_at_epoch_ms": 1000,
+        "app": "h5-dev-collect",
+        "engine_config": {"stable_min_span_ms": 800},
+        "readings": readings,
+    }
+
+
+def test_report_with_valid_readings_persisted(client):
+    c, app_mod = client
+    payload = _readings_payload(3)
+    res = _post(c, _records_payload(2), readings_obj=payload)
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["readings_saved"] is True
+
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    readings_file = run_dir / "readings.json"
+    assert readings_file.is_file(), "readings.json 应落盘到 run_dir"
+    saved = json.loads(readings_file.read_text(encoding="utf-8"))
+    assert saved["app"] == "h5-dev-collect"
+    assert saved["device_id"] == "phone-01"
+    assert len(saved["readings"]) == 3
+    assert saved["readings"][0]["grams"] == 20.0
+
+    # manifest 标注 readings_file
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["readings_file"] == "readings.json"
+
+
+def test_report_with_invalid_readings_json_skipped_not_fatal(client):
+    c, app_mod = client
+    # 直接构造非法 JSON body（绕过 _post 的 json.dumps，模拟客户端发了坏 JSON）
+    data = {
+        "cage_id": "C57-023",
+        "project_id": "default",
+        "device_id": "phone-01",
+        "records": json.dumps(_records_payload(1)),
+    }
+    files = {"readings": ("readings.json", b"not-json{", "application/json")}
+    res = c.post("/api/records/report", data=data, files=files, headers=_headers())
+    # 上报仍应 201（readings 非法不致命）
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["readings_saved"] is False
+    assert body["count"] == 1, "记录本身仍正常落盘"
+
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    assert not (run_dir / "readings.json").exists(), "非法 readings 不应落盘"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "readings_file" not in manifest
+
+
+def test_report_invalid_readings_shape_skipped(client):
+    """readings 是合法 JSON 但非 {readings: list} 形状 → 跳过，上报仍成功。"""
+    c, app_mod = client
+    res = _post(
+        c,
+        _records_payload(1),
+        readings_obj={"not_a_readings_key": [1, 2, 3]},
+    )
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["readings_saved"] is False
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    assert not (run_dir / "readings.json").exists()
+
+
+def test_report_all_duplicates_with_readings_drains_and_no_run(client):
+    c, app_mod = client
+    payload = _records_payload(3)
+    first = _post(c, payload, readings_obj=_readings_payload(2))
+    assert first.status_code == 201
+    assert first.json()["readings_saved"] is True
+
+    runs_before = app_mod.registry.list_runs()
+    assert len(runs_before) == 1
+
+    # 全部重复上报（带 readings）→ 不建 run，readings 被丢弃
+    second = _post(c, payload, readings_obj=_readings_payload(2))
+    assert second.status_code == 200
+    body = second.json()
+    assert body["count"] == 0
+    assert body["run_id"] is None
+    assert body["readings_saved"] is False
+    assert sorted(body["skipped"]) == sorted(first.json()["record_ids"])
+
+    # 仍只有一个 run（readings 未产生新 run）
+    runs_after = app_mod.registry.list_runs()
+    assert len(runs_after) == 1
+
+
+def test_report_without_readings_has_no_readings_field(client):
+    """非 dev 模式（不带 readings）行为与现状一致：响应 readings_saved=false，无 readings.json。"""
+    c, app_mod = client
+    res = _post(c, _records_payload(1))
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["readings_saved"] is False
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    assert not (run_dir / "readings.json").exists()

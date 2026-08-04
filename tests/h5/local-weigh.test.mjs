@@ -42,9 +42,9 @@ function makeFakeChannel() {
 function makeFakeOutbox() {
   const enqueued = [];
   return {
-    enqueue(batch, videoOpt) {
+    enqueue(batch, videoOpt, readings) {
       const id = "batch-" + (enqueued.length + 1);
-      enqueued.push({ clientBatchId: id, batch, videoOpt: videoOpt || null });
+      enqueued.push({ clientBatchId: id, batch, videoOpt: videoOpt || null, readings: readings || null });
       return id;
     },
     pending() { return enqueued.length; },
@@ -772,4 +772,192 @@ test("ready_next 与 stale 事件转发到 UI", () => {
   clock = 5000; // 远超 1s
   timers._tickAll(); // tick 触发 stale 判定
   assert.ok(ec.events.some((e) => e.type === "stale" && e.payload.stale === true), "应转发 stale=true");
+});
+
+/* ------------------------------------------------------------------ */
+/* 8. dev 读数采集：collectReadings 开关行为
+/*    - 默认关闭：不采集、getReadingsPayload 返回 null、enqueue 不带 readings
+/*    - 开启后：订阅 channel 读数 → 进缓冲；getReadingsPayload 返回合法 payload
+/*    - 会话重置：start() 清空缓冲；finishBox 后缓冲清空
+/* ------------------------------------------------------------------ */
+test("dev 采集: 默认关闭（collectReadings 不传）→ 不采集、getReadingsPayload 返回 null", () => {
+  const ec = makeEventCollector();
+  const channel = makeFakeChannel();
+  const timers = makeFakeTimers();
+  let clock = 0;
+  const ctrl = LW.createController({
+    mode: "announce",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "CD1" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: ec.onEvent,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+  ctrl.start();
+  clock = 100; channel.feed({ grams: 7.3, raw: 73, sequence: 1, receivedAtEpochMs: 100 });
+  clock = 200; channel.feed({ grams: 7.4, raw: 74, sequence: 2, receivedAtEpochMs: 200 });
+
+  // 默认不采集
+  assert.equal(ctrl.getReadingsPayload(), null, "默认 collectReadings=false → getReadingsPayload 返回 null");
+  assert.deepEqual(ctrl._readings(), [], "默认 _readings 为空");
+});
+
+test("dev 采集: collectReadings=true → 订阅读数进缓冲 + getReadingsPayload 返回合法 payload", () => {
+  const ec = makeEventCollector();
+  const channel = makeFakeChannel();
+  const timers = makeFakeTimers();
+  let clock = 0;
+  const ctrl = LW.createController({
+    mode: "announce",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "CD2", strain: "S" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: ec.onEvent,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    collectReadings: true,
+    engineConfig: { stable_min_span_ms: 800, foo: "bar" },
+  });
+  ctrl.start();
+  // startedAtEpochMs 在 start() 时记录为 startedAt=now()=0
+  clock = 100; channel.feed({ grams: 7.3, raw: 73, sequence: 1, receivedAtEpochMs: 100 });
+  clock = 250; channel.feed({ grams: 7.4, raw: 74, sequence: 2, rssi: -67, stable: true, receivedAtEpochMs: 250 });
+
+  const payload = ctrl.getReadingsPayload();
+  assert.ok(payload, "collectReadings=true 且有读数 → 应返回 payload");
+  assert.equal(payload.device_id, "scale01", "device_id 默认 scale01");
+  assert.equal(payload.app, "h5-dev-collect");
+  assert.equal(payload.started_at_epoch_ms, 0, "started_at_epoch_ms = 会话开始的 now()");
+  assert.deepEqual(payload.engine_config, { stable_min_span_ms: 800, foo: "bar" }, "engine_config 快照");
+  assert.ok(Array.isArray(payload.readings), "readings 应为数组");
+  assert.equal(payload.readings.length, 2);
+  // 第一条：t_ms 相对会话开始（100-0=100）
+  assert.deepEqual(payload.readings[0], {
+    t_ms: 100, grams: 7.3, raw: 73, sequence: 1, rssi: null, stable: null, receivedAtEpochMs: 100,
+  });
+  // 第二条：带 rssi / stable
+  assert.equal(payload.readings[1].t_ms, 250);
+  assert.equal(payload.readings[1].grams, 7.4);
+  assert.equal(payload.readings[1].rssi, -67);
+  assert.equal(payload.readings[1].stable, true);
+});
+
+test("dev 采集: 无读数 → getReadingsPayload 返回 null（即使 collectReadings=true）", () => {
+  const timers = makeFakeTimers();
+  const ctrl = LW.createController({
+    mode: "announce",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: makeFakeChannel(),
+    outbox: makeFakeOutbox(),
+    box: { cageId: "CD3" },
+    storage: makeStorage(),
+    now: () => 0,
+    onEvent: () => {},
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    collectReadings: true,
+  });
+  ctrl.start();
+  assert.equal(ctrl.getReadingsPayload(), null, "无读数时应返回 null");
+});
+
+test("dev 采集: start() 重置缓冲（跨会话不混入上一箱读数）", () => {
+  // 生产中每箱 new 一个 controller（start 仅调一次）。这里在同一实例上
+  // stop→start 模拟"新箱"，验证缓冲被清空 + started_at_epoch_ms 重置。
+  // （假通道会累积 onReading 回调导致重复投递，故只验证缓冲清空这一核心契约。）
+  const channel = makeFakeChannel();
+  const timers = makeFakeTimers();
+  let clock = 0;
+  const ctrl = LW.createController({
+    mode: "announce",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "CD4" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    collectReadings: true,
+  });
+  ctrl.start();
+  clock = 100; channel.feed({ grams: 1.0, raw: 10, sequence: 1, receivedAtEpochMs: 100 });
+  const payload1 = ctrl.getReadingsPayload();
+  assert.equal(payload1.readings.length, 1, "第一会话有 1 条读数");
+  assert.equal(payload1.started_at_epoch_ms, 0, "第一会话 started_at=0");
+
+  ctrl.stop();
+  // 第二会话：start() 应清空缓冲 + 重置 started_at_epoch_ms
+  clock = 5000;
+  ctrl.start();
+  assert.equal(ctrl._readings().length, 0, "新会话 start() 后缓冲应清空");
+  assert.equal(ctrl.getReadingsPayload(), null, "清空后 getReadingsPayload 返回 null");
+});
+
+test("dev 采集: finishBox(videoBlob, readings) → readings 透传给 outbox.enqueue + 缓冲清空", () => {
+  const outbox = makeFakeOutbox();
+  const channel = makeFakeChannel();
+  const timers = makeFakeTimers();
+  let clock = 0;
+  const ctrl = LW.createController({
+    mode: "announce",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox,
+    box: { cageId: "CD5" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    collectReadings: true,
+  });
+  ctrl.start();
+  clock = 100; channel.feed({ grams: 7.3, raw: 73, sequence: 1, receivedAtEpochMs: 100 });
+  const readings = ctrl.getReadingsPayload();
+  assert.ok(readings, "finishBox 前应有采集数据");
+
+  const blob = { name: "v.mp4" };
+  ctrl.finishBox(blob, readings);
+
+  // outbox.enqueue 第三参数收到 readings
+  assert.equal(outbox._enqueued.length, 1);
+  assert.equal(outbox._enqueued[0].readings, readings, "readings 应透传给 enqueue");
+  assert.equal(outbox._enqueued[0].videoOpt, blob, "videoBlob 仍透传");
+  // finishBox 后缓冲清空 → getReadingsPayload 返回 null
+  assert.equal(ctrl._readings().length, 0, "finishBox 后缓冲应清空");
+  assert.equal(ctrl.getReadingsPayload(), null, "finishBox 后无采集数据");
+});
+
+test("dev 采集: finishBox 无 readings 参数（非 dev 路径）→ enqueue 不带 readings", () => {
+  const outbox = makeFakeOutbox();
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: null,
+    outbox,
+    box: { cageId: "CD6" },
+    storage: makeStorage(),
+    now: () => 0,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  ctrl.submitManual(10.0);
+  ctrl.finishBox();
+  assert.equal(outbox._enqueued.length, 1);
+  assert.equal(outbox._enqueued[0].readings, null, "非 dev 路径 enqueue 不带 readings");
 });

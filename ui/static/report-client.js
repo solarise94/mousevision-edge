@@ -203,8 +203,11 @@
       try {
         // 只序列化可 JSON 化的字段：剥掉 videoBlobRef（Blob/File 不可序列化，
         // 且我们有意不持久化视频，见文件头注释）。
+        // readings 是普通对象（dev 采集的天平读数时间序列），可持久化，与 videoBlobRef 不同。
         var serializable = queue.map(function (item) {
-          return { clientBatchId: item.clientBatchId, enqueuedAt: item.enqueuedAt, batch: item.batch };
+          var o = { clientBatchId: item.clientBatchId, enqueuedAt: item.enqueuedAt, batch: item.batch };
+          if (item.readings) o.readings = item.readings;
+          return o;
         });
         storage.setItem(key, JSON.stringify({ v: 1, queue: serializable }));
       } catch (_) {
@@ -223,12 +226,15 @@
         queue = parsed.queue.filter(function (item) {
           return item && typeof item === "object" && item.batch && Array.isArray(item.batch.records);
         }).map(function (item) {
-          return {
+          var o = {
             clientBatchId: (typeof item.clientBatchId === "string" && item.clientBatchId) ? item.clientBatchId : uuid(),
             enqueuedAt: typeof item.enqueuedAt === "number" ? item.enqueuedAt : 0,
             batch: item.batch
             // videoBlobRef 不恢复（reload 后视频丢失，记录仍补传）
           };
+          // readings 是普通对象，可恢复（与 videoBlobRef 不同）
+          if (item.readings && typeof item.readings === "object") o.readings = item.readings;
+          return o;
         });
       } catch (_) {
         // 损坏的存储：清空内存队列避免使用半截数据。原 storage 不动（保守）。
@@ -264,6 +270,15 @@
       if (b.weight_source != null) fd.append("weight_source", String(b.weight_source));
       // records：JSON 字符串数组
       fd.append("records", JSON.stringify(b.records || []));
+      // dev 采集的天平读数时间序列：普通对象，附为 JSON Blob 文件字段。
+      // 可持久化到 localStorage outbox（与 video Blob 不同），reload 后仍随记录补传。
+      if (item.readings && typeof item.readings === "object") {
+        try {
+          var rj = JSON.stringify(item.readings);
+          var rblob = new Blob([rj], { type: "application/json" });
+          fd.append("readings", rblob, "readings.json");
+        } catch (_) { /* readings 形状异常 → 跳过，仍发记录 */ }
+      }
       // 视频证据：仅当本批次附带未过期的 Blob 时附挂（reload 后丢失，跳过）
       if (item.videoBlobRef) {
         var v = item.videoBlobRef;
@@ -374,13 +389,15 @@
           if (r.kind === "dead") {
             // 4xx：进死信，移出队列，不阻塞后续
             var dead = queue.shift();
-            deadLetter.push({
+            var deadEntry = {
               clientBatchId: dead.clientBatchId,
               enqueuedAt: dead.enqueuedAt,
               batch: dead.batch,
               failedAt: now(),
               reason: "4xx"
-            });
+            };
+            if (dead.readings) deadEntry.readings = dead.readings;
+            deadLetter.push(deadEntry);
             persist();
             notify();
             return step(); // 继续下一批（不死信卡死）
@@ -449,7 +466,9 @@
       // 入队一批。batch.records 应为 buildRecord 构造好的数组（也接受裸对象，
       // 内部不强制重造 record_id，保留调用方原样以便幂等）。
       // videoOpt: 可选 Blob/File 或 ()=>Blob/File，附挂视频证据（不持久化）。
-      enqueue: function (batch, videoOpt) {
+      // readingsOpt: 可选普通对象（dev 采集的天平读数时间序列），可 JSON 序列化、
+      //   可持久化到 localStorage outbox（与 videoOpt 不同），随记录补传。
+      enqueue: function (batch, videoOpt, readingsOpt) {
         batch = batch || {};
         if (!Array.isArray(batch.records)) {
           throw new Error("enqueue: batch.records 必须是数组");
@@ -460,6 +479,7 @@
           batch: batch
         };
         if (videoOpt != null) item.videoBlobRef = videoOpt;
+        if (readingsOpt && typeof readingsOpt === "object") item.readings = readingsOpt;
         queue.push(item);
         persist();
         notify();

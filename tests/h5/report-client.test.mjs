@@ -693,3 +693,124 @@ test("flush 用真实 Response 对象（只读 status）成功上报判 ok 并�
   assert.equal(r.remaining, 0);
   assert.equal(ob.pending(), 0);
 });
+
+/* ================================================================== *
+ * dev 采集：readings 字段（普通对象，可序列化、可持久化，与 video Blob 不同）
+ * ================================================================== */
+
+/* 构造一个合法的 readings payload（与 local-weigh.getReadingsPayload 同构） */
+function aReadingsPayload(n) {
+  const readings = [];
+  for (let i = 0; i < n; i++) {
+    readings.push({
+      t_ms: 100 * i,
+      grams: 20 + i,
+      raw: 200 + i,
+      sequence: i + 1,
+      rssi: -60 - i,
+      stable: i % 2 === 0,
+      receivedAtEpochMs: 1000 + 100 * i,
+    });
+  }
+  return {
+    device_id: "scale01",
+    started_at_epoch_ms: 1000,
+    app: "h5-dev-collect",
+    engine_config: { stable_min_span_ms: 800 },
+    readings,
+  };
+}
+
+test("readings: enqueue 第三参数 → flush 时 append 为 Blob 文件字段 readings (readings.json)", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const payload = aReadingsPayload(3);
+  ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }, null, payload);
+  await ob.flush();
+
+  assert.equal(fetchFn.calls.length, 1);
+  const fd = fetchFn.calls[0].init.body;
+  const readingsField = fd.get("readings");
+  assert.notEqual(readingsField, null, "readings 字段应被 append");
+  // 应为 Blob/File（filename readings.json）
+  assert.equal(typeof readingsField.text, "function", "readings 应为 Blob");
+  // FormData.get 返回的 File 带 name
+  assert.equal(readingsField.name, "readings.json");
+  const parsed = JSON.parse(await readingsField.text());
+  assert.equal(parsed.app, "h5-dev-collect");
+  assert.equal(parsed.device_id, "scale01");
+  assert.equal(parsed.readings.length, 3);
+  assert.equal(parsed.readings[0].grams, 20);
+});
+
+test("readings: 不传第三参数 → flush 时无 readings 字段（零开销）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+  await ob.flush();
+  const fd = fetchFn.calls[0].init.body;
+  assert.equal(fd.get("readings"), null, "未传 readings → 不应含 readings 字段");
+});
+
+test("readings: 可持久化到 localStorage outbox，reload 后仍随记录补传", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob1 = RC.createOutbox({ storage, fetchFn: () => Promise.resolve(), now: () => 1000 });
+  const payload = aReadingsPayload(2);
+  ob1.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }, null, payload);
+  assert.equal(ob1.pending(), 1);
+
+  // storage 落盘应含 readings（与 video Blob 不同，readings 持久化）
+  const parsed = JSON.parse(storage.getItem(RC.DEFAULT_STORAGE_KEY));
+  assert.equal(parsed.queue.length, 1);
+  assert.ok(parsed.queue[0].readings, "持久化的 item 应含 readings");
+  assert.equal(parsed.queue[0].readings.app, "h5-dev-collect");
+
+  // reload：新建 outbox 读同一 storage，用可追踪的 fetchFn 补传
+  const ob2 = RC.createOutbox({ storage, fetchFn, now: () => 2000 });
+  assert.equal(ob2.pending(), 1, "reload 后队列恢复");
+  await ob2.flush();
+  assert.equal(ob2.pending(), 0, "补传成功");
+  // 恢复后的 item flush 时仍带 readings 字段
+  assert.equal(fetchFn.calls.length, 1);
+  const fd = fetchFn.calls[0].init.body;
+  assert.notEqual(fd.get("readings"), null, "reload 后补传仍带 readings");
+  const rj = JSON.parse(await fd.get("readings").text());
+  assert.equal(rj.readings.length, 2, "readings 数据完整保留");
+});
+
+test("readings: 与 video 同时存在（readings 持久化、video 不持久化）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob1 = RC.createOutbox({ storage, fetchFn: () => Promise.resolve() });
+  const blob = new Blob([new Uint8Array([1, 2, 3])], { type: "video/mp4" });
+  const payload = aReadingsPayload(1);
+  ob1.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }, blob, payload);
+
+  // reload：用可追踪的 fetchFn 补传
+  const ob2 = RC.createOutbox({ storage, fetchFn });
+  assert.equal(ob2.pending(), 1);
+  await ob2.flush();
+  assert.equal(fetchFn.calls.length, 1);
+  const fd = fetchFn.calls[0].init.body;
+  // readings 恢复（持久化）
+  assert.notEqual(fd.get("readings"), null, "reload 后 readings 仍在");
+  // video 未恢复（不持久化）
+  assert.equal(fd.get("video"), null, "reload 后 video 丢失（不持久化）");
+});
+
+test("readings: flush 成功后随批次移除（不残留到下批）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }, null, aReadingsPayload(1));
+  ob.enqueue({ cage_id: "C2", records: [aRecord(1, 2)] }); // 第二批无 readings
+  await ob.flush();
+  assert.equal(fetchFn.calls.length, 2);
+  // 第一批带 readings
+  assert.notEqual(fetchFn.calls[0].init.body.get("readings"), null);
+  // 第二批无 readings
+  assert.equal(fetchFn.calls[1].init.body.get("readings"), null);
+});

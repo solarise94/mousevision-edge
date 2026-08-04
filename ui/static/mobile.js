@@ -8,6 +8,14 @@
   const BASE = "/mobile";
   const app = document.getElementById("app");
 
+  /* dev 模式：Android dev 版会在 H5 URL 后追加 ?dev=1。
+   * SPA pushState 会丢 query，所以同时落 sessionStorage 保持会话级持久。
+   * dev 模式下每次录制会话采集完整天平读数时间序列，随记录上报（供训练识别模型）。
+   * 非 dev 模式行为与现状完全一致（零开销：不采集、不附字段）。 */
+  var DEV_MODE = /[?&]dev=1\b/.test(location.search)
+    || (function () { try { return sessionStorage.getItem("mv.devMode") === "1"; } catch (_) { return false; } })();
+  if (DEV_MODE) { try { sessionStorage.setItem("mv.devMode", "1"); } catch (_) {} }
+
   /* ------------------------------------------------------------------ *
    * 状态 (design §7.5)
    * ------------------------------------------------------------------ */
@@ -1375,7 +1383,17 @@
       h("div", { class: "capture-guide weight-guide" }, [h("span", {}, "体重读数区（显示屏）")]),
     ]);
     const viewport = h("div", { class: "capture-viewport" }, [video, canvas, guides]);
-    const viewportHost = h("div", { class: "record-viewport-host" }, [viewport]);
+    // dev 模式角标：提示操作员正在采集读数（复用 pill-orange 风格）
+    const viewportHostChildren = [viewport];
+    if (DEV_MODE) {
+      viewportHostChildren.push(
+        h("div", {
+          class: "pill pill-orange",
+          style: "position:absolute;top:8px;right:8px;z-index:20;font-size:12px;padding:3px 8px;pointer-events:none",
+        }, "DEV·采集中")
+      );
+    }
+    const viewportHost = h("div", { class: "record-viewport-host" }, viewportHostChildren);
 
     // --- Realtime dock ---
     const stateDot = h("span", { class: "rt-state-dot" });
@@ -2024,6 +2042,8 @@
         videoTimeMs: function () { return startedAt > 0 ? Math.max(0, Date.now() - startedAt) : 0; },
         speak: recordMode === "announce" ? speakWeight : null,
         onEvent: handleLocalWeighEvent,
+        // dev 模式：采集完整天平读数时间序列，随记录上报
+        collectReadings: DEV_MODE,
       });
     }
 
@@ -2039,10 +2059,15 @@
       // 1) 控制器停止订阅读数（避免 finishBox 后再有 accepted 事件）
       if (ctrl) { try { ctrl.stop(); } catch (_) {} }
       // 2) 累积批次入队 outbox（含视频证据 Blob）→ 返回 {count, batchId}
+      //    dev 模式：若控制器采集了读数，附进上报（可序列化、可离线补传）
       let result = null;
       let enqueueErr = null;
       try {
-        result = ctrl ? ctrl.finishBox(blob) : { count: 0, batchId: null };
+        let readingsPayload = null;
+        if (DEV_MODE && ctrl && typeof ctrl.getReadingsPayload === "function") {
+          try { readingsPayload = ctrl.getReadingsPayload(); } catch (_) {}
+        }
+        result = ctrl ? ctrl.finishBox(blob, readingsPayload) : { count: 0, batchId: null };
       } catch (e) {
         enqueueErr = e;
       }
