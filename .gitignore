@@ -90,3 +90,4 @@ harmonyos/MiceAutomaticScale/signature/*.csr
 hardware/**/.build/
 hardware/**/.pio/
 *.keystore
+dist/
