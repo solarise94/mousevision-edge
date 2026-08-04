@@ -9,7 +9,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.WindowManager
+import android.net.http.SslError
 import android.webkit.PermissionRequest
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -86,6 +88,26 @@ class MainActivity : Activity(), K797BleScanner.Listener {
                 return !isTrusted(request.url)
             }
 
+            /**
+             * 放行白名单主机的 SSL 证书错误。
+             *
+             * 背景：weight.pingoodmice.top 走 FRP，证书由 FRP 服务商签发为
+             * Let's Encrypt ECDSA 链（ISRG Root X2）。卓易通等 Android 兼容容器
+             * 内的 WebView 信任库较旧，不信任 X2 ECDSA 链，导致 ERR_CERT_AUTHORITY_INVALID
+             * 无法加载页面。HarmonyOS 原生 WebView（ArkWeb）信任库较新无此问题。
+             *
+             * 信任边界已由主机白名单（isTrusted）约束，仅放行白名单内的证书错误；
+             * 其余一律按默认拒绝（不放宽任何外部站点的 TLS 校验）。
+             */
+            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                val url = error?.url
+                if (handler != null && url != null && isTrusted(Uri.parse(url))) {
+                    handler.proceed()
+                } else if (handler != null) {
+                    handler.cancel()
+                }
+            }
+
             override fun onPageFinished(view: WebView, url: String?) {
                 // 重载页面时重新握手：重推当前状态与发现表（对齐 ScaleWebBridge.onPageFinish）。
                 resetPushState()
@@ -111,7 +133,13 @@ class MainActivity : Activity(), K797BleScanner.Listener {
                 }
             }
         }
-        webView.loadUrl(BuildConfig.MICE_WEB_URL)
+        val webUrl = if (BuildConfig.MICE_DEV_MODE) {
+            // dev 版：H5 开启训练数据采集（每次记录附带读数时间序列）
+            BuildConfig.MICE_WEB_URL + (if (BuildConfig.MICE_WEB_URL.contains("?")) "&dev=1" else "?dev=1")
+        } else {
+            BuildConfig.MICE_WEB_URL
+        }
+        webView.loadUrl(webUrl)
     }
 
     override fun onResume() {

@@ -29,7 +29,8 @@
 
     <application
         android:allowBackup="false"
-        android:label="MiceAutomatic"
+        android:icon="@mipmap/ic_launcher"
+        android:label="小鼠称重"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
         <activity

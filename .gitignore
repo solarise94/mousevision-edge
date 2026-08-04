@@ -89,3 +89,4 @@ harmonyos/MiceAutomaticScale/signature/*.csr
 # 硬件固件构建产物（arduino-cli 暂存 sketch 与编译输出；PIO 缓存）
 hardware/**/.build/
 hardware/**/.pio/
+*.keystore
