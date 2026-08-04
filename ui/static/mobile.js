@@ -777,6 +777,7 @@
       groupNavRow("开始录制", null, () => startRecording(), "home-start-rec"),
       groupNavRow("箱子管理", null, () => go("/manage")),
       groupNavRow("天平校时（测试）", null, () => go("/scale-sync")),
+      groupNavRow("数据采集（测试）", null, () => go("/scale-capture")),
     ]);
     content.appendChild(opGroup);
 
@@ -2401,7 +2402,6 @@
     const screen = h("div", { class: "screen" });
     let strain = "";
     let box = null;
-    try { box = await api.box(cage); strain = box.strain; } catch (_) {}
 
     screen.appendChild(
       appbar(cage, {
@@ -2410,11 +2410,10 @@
       })
     );
     const countEl = h("span", { class: "count-pill" }, "");
+    // strain 用引用保留，await 拿到箱信息后再更新文本（先挂骨架再取数，避免白屏）。
+    const strainEl = h("div", { class: "strain-sub" }, "其他");
     const subHead = h("div", { class: "content", style: "padding-bottom:0" }, [
-      h("div", { class: "section-head" }, [
-        h("div", { class: "strain-sub" }, strain || "其他"),
-        countEl,
-      ]),
+      h("div", { class: "section-head" }, [strainEl, countEl]),
     ]);
     screen.appendChild(subHead);
     const listWrap = h("div", { class: "list" }, [h("div", { class: "empty" }, "加载中…")]);
@@ -2432,7 +2431,15 @@
         }, "继续录制"),
       ])
     );
+    // 先挂载骨架，再 await 网络——否则 render() 已清空屏幕，FRP 慢/挂起时整页白屏
+    // （真机「查看本箱记录」白屏卡死的根因）。
     mount(screen);
+
+    try {
+      box = await api.box(cage);
+      strain = box.strain || "";
+      strainEl.textContent = strain || "其他";
+    } catch (_) {}
 
     try {
       const data = await api.boxRecords(cage);
@@ -3209,6 +3216,258 @@
     return () => clockCtl.stop();
   }
 
+  /* ================================================================== *
+   * 视图：天平原始读数采集（测试）—
+   *   用户在真实 K797 秤上放/取砝码，本页把收到的每条 BLE 读数原样记录，
+   *   停止时打包上传到服务器（POST /api/scale-capture），供离线回放称重
+   *   引擎、精准调参（稳定判定时机等）。
+   *
+   * 通道策略：复用首页全局 scaleConn.channel（避免双扫描冲突）。未连接时
+   * 提示回首页连接；离开页面时只清理本视图的 onReading 订阅与定时器，
+   * 不动 scaleConn（首页连接卡片继续工作）。
+   * ================================================================== */
+  async function viewScaleCapture() {
+    const screen = h("div", { class: "screen" });
+    screen.appendChild(appbar("数据采集（测试）", { back: "/" }));
+    const content = h("div", { class: "content" });
+    screen.appendChild(content);
+    mount(screen);
+
+    // 连接状态行（简版，复用 scaleConn 状态）。未连接时引导回首页连接。
+    const connectStatusDot = h("span", { class: "connect-dot" });
+    const connectStatusText = h("span", {});
+    const connectWeightText = h("span", {});
+    const connectRow = h("div", { class: "card scale-capture-conn" }, [
+      h("div", { class: "connect-row" }, [
+        h("div", { class: "connect-icon" }, "⚖"),
+        h("div", { class: "connect-info-block" }, [
+          h("div", { class: "connect-title" }, "天平"),
+          h("div", { class: "connect-info" }, [connectStatusDot, connectStatusText, connectWeightText]),
+        ]),
+      ]),
+    ]);
+    content.appendChild(connectRow);
+
+    // 大数字实时克数 + 速率 + 已录条数
+    const weightValue = h("span", { class: "rt-weight-value" }, "--");
+    const weightUnit = h("span", { class: "rt-weight-unit" }, "g");
+    const weightDisplay = h(
+      "div",
+      { class: "rt-weight-display", style: "text-align:center;margin:6px 0" },
+      [weightValue, weightUnit]
+    );
+    const rateText = h("div", { class: "li-sub", style: "text-align:center" }, "0 Hz");
+    const countText = h("div", { class: "li-sub", style: "text-align:center" }, "已录 0 条");
+    const statCard = h("div", { class: "card" }, [weightDisplay, rateText, countText]);
+    content.appendChild(statCard);
+
+    // 提示文案
+    content.appendChild(h("div", { class: "li-sub", style: "padding:0 4px 8px" }, [
+      "流程：清空秤 → 开始记录 → 放上砝码等稳定 → 取走 → 可重复多组 → 停止并上传。",
+    ]));
+
+    // 控制按钮：开始记录 / 停止并上传
+    const actionBtn = h("button", { class: "btn btn-p", type: "button" }, "开始记录");
+    const resultArea = h("div", {});
+    content.appendChild(h("div", { class: "dock dock-static", style: "padding:8px 0" }, [actionBtn]));
+    content.appendChild(resultArea);
+
+    // 录制状态
+    let recording = false;
+    let startedAtEpochMs = 0;
+    let readings = [];
+    // 最近 2s 内读数的时间戳数组（用于计算 Hz）
+    let recentRecvMs = [];
+    let rateTimer = null;
+    // scaleConn 订阅 + onReading 回调引用（用于停止时移除）
+    let connSub = null;
+    let readingCb = null;
+
+    function refreshConnStatus() {
+      const s = scaleConn.state;
+      const labels = {
+        disconnected: "未连接（请回首页连接天平）",
+        connecting: "正在搜索天平…",
+        connected: "已连接",
+        stale: "广播中断",
+        error: scaleConn.errorMsg || "天平异常",
+      };
+      connectStatusText.textContent = labels[s] || s;
+      if (connectStatusDot) connectStatusDot.className = "connect-dot " + s;
+      if (s === "connected" || s === "stale") {
+        const name = scaleConn.selectedDeviceName || "";
+        const g = scaleConn.lastGrams !== null && scaleConn.lastGrams !== undefined
+          ? Number(scaleConn.lastGrams).toFixed(1) + " g" : "—";
+        connectWeightText.textContent = name ? `${name} · ${g}` : g;
+        connectWeightText.hidden = false;
+      } else {
+        connectWeightText.textContent = "";
+        connectWeightText.hidden = true;
+      }
+      // 按钮可用性：未连接且未录制时禁用
+      const canStart = (s === "connected") && !recording;
+      actionBtn.disabled = !canStart;
+      actionBtn.textContent = recording ? "停止并上传" : "开始记录";
+      actionBtn.classList.toggle("danger", recording);
+    }
+
+    function updateRate() {
+      // 清理 2s 外的旧时间戳
+      const cutoff = Date.now() - 2000;
+      while (recentRecvMs.length && recentRecvMs[0] < cutoff) recentRecvMs.shift();
+      const hz = (recentRecvMs.length / 2).toFixed(1);
+      rateText.textContent = `${hz} Hz`;
+    }
+
+    function handleReading(reading) {
+      if (!recording) return;
+      const now = Date.now();
+      const rel = startedAtEpochMs > 0 ? now - startedAtEpochMs : 0;
+      readings.push({
+        t_ms: Math.max(0, Math.round(rel)),
+        grams: reading.grams,
+        raw: reading.raw,
+        sequence: reading.sequence,
+        rssi: typeof reading.rssi === "number" ? reading.rssi : null,
+        stable: reading.stable === true,
+        receivedAtEpochMs: now,
+      });
+      recentRecvMs.push(now);
+      // 刷新大数字（一位小数）
+      if (typeof reading.grams === "number" && isFinite(reading.grams)) {
+        weightValue.textContent = Number(reading.grams).toFixed(1);
+        weightValue.style.color = "var(--label)";
+        weightUnit.style.color = "var(--label)";
+      }
+      countText.textContent = `已录 ${readings.length} 条`;
+      updateRate();
+    }
+
+    function startRecording() {
+      if (recording) return;
+      if (scaleConn.state !== "connected") {
+        toast("请先回首页连接天平");
+        return;
+      }
+      if (!scaleConn.channel) {
+        toast("天平通道未就绪，请回首页重连");
+        return;
+      }
+      recording = true;
+      startedAtEpochMs = Date.now();
+      readings = [];
+      recentRecvMs = [];
+      // 订阅读数（scaleConn.channel 已在首页 start，这里只加回调）
+      readingCb = handleReading;
+      scaleConn.channel.onReading(readingCb);
+      // 每秒刷新速率（读数稀疏时也能让 Hz 衰减显示）
+      rateTimer = setInterval(updateRate, 1000);
+      refreshConnStatus();
+      toast("已开始记录");
+    }
+
+    async function stopAndUpload() {
+      if (!recording) return;
+      recording = false;
+      // 移除 onReading 订阅：ScaleBridge 没有显式 off，重建通道最干净；
+      // 但重建会中断首页连接，所以这里改为：若通道没有其它消费者，
+      // 重建一个同 deviceId 的通道接续首页连接（与 viewRecord 退出处理一致）。
+      // 简单稳妥做法：保留通道，回调里 recording=false 已不再 push（回调
+      // 对象仍挂在 readingCbs 数组里但成为 no-op，无副作用）。
+      readingCb = null;
+      if (rateTimer) { clearInterval(rateTimer); rateTimer = null; }
+      refreshConnStatus();
+
+      const deviceId = scaleConn.selectedDeviceId || "scale01";
+      const payload = {
+        device_id: deviceId,
+        started_at_epoch_ms: startedAtEpochMs,
+        app: "h5-scale-capture",
+        readings: readings,
+      };
+
+      // 上传 UI：进行中
+      resultArea.innerHTML = "";
+      resultArea.appendChild(h("div", { class: "card" }, [
+        h("div", { class: "center-status" }, [
+          h("div", { class: "spinner" }),
+          h("strong", {}, "正在上传…"),
+          h("p", { class: "li-sub" }, `${readings.length} 条读数`),
+        ]),
+      ]));
+
+      try {
+        const fd = new FormData();
+        fd.append("device_id", deviceId);
+        fd.append("payload", JSON.stringify(payload));
+        const token = document
+          .querySelector('meta[name="mousevision-api-token"]')
+          ?.content?.trim();
+        const res = await fetch("/api/scale-capture", {
+          method: "POST",
+          headers: token ? { "X-MouseVision-Token": token } : {},
+          body: fd,
+        });
+        let body = null;
+        try { body = await res.json(); } catch (_) {}
+        if (res.ok && body && body.ok) {
+          resultArea.innerHTML = "";
+          resultArea.appendChild(h("div", { class: "card" }, [
+            h("div", { class: "center-status" }, [
+              h("div", { class: "check-circle", style: "background:var(--green)" }, "✓"),
+              h("strong", {}, "上传成功"),
+              h("p", { class: "li-sub" }, `记录 ${body.count} 条 · ID ${body.capture_id}`),
+              h("p", { class: "li-sub" }, body.path || ""),
+            ]),
+          ]));
+          // 重置统计显示，准备下一组
+          countText.textContent = `已录 ${readings.length} 条（已上传）`;
+          readings = [];
+          startedAtEpochMs = 0;
+          recentRecvMs = [];
+          weightValue.textContent = "--";
+          weightValue.style.color = "var(--label2)";
+          weightUnit.style.color = "var(--label2)";
+          rateText.textContent = "0 Hz";
+        } else {
+          throw new Error((body && body.detail) || `上传失败 (${res.status})`);
+        }
+      } catch (err) {
+        resultArea.innerHTML = "";
+        const retryBtn = h("button", { class: "btn primary", type: "button" }, "重试上传");
+        retryBtn.addEventListener("click", () => { void stopAndUpload(); });
+        resultArea.appendChild(h("div", { class: "card" }, [
+          h("div", { class: "center-status" }, [
+            h("div", { class: "check-circle", style: "background:#dc3545" }, "!"),
+            h("strong", {}, "上传失败"),
+            h("p", { class: "li-sub" }, err.message || "网络错误"),
+            h("p", { class: "li-sub" }, "读数仍保留在内存，可重试上传。"),
+          ]),
+          retryBtn,
+        ]));
+      }
+    }
+
+    actionBtn.addEventListener("click", () => {
+      if (recording) { void stopAndUpload(); }
+      else { startRecording(); }
+    });
+
+    // 订阅首页连接状态（卡片实时刷新 + 按钮可用性）
+    connSub = refreshConnStatus;
+    scaleConn._subs.push(connSub);
+    refreshConnStatus();
+
+    // cleanup：离开页面时停止记录订阅与定时器（不动 scaleConn 通道本身）
+    return () => {
+      recording = false;
+      readingCb = null;
+      if (rateTimer) { clearInterval(rateTimer); rateTimer = null; }
+      const i = scaleConn._subs.indexOf(connSub);
+      if (i >= 0) scaleConn._subs.splice(i, 1);
+    };
+  }
+
   /* ------------------------------------------------------------------ *
    * 路由注册
    * ------------------------------------------------------------------ */
@@ -3223,6 +3482,7 @@
   route("/manage/new", viewBoxNew);
   route("/settings", viewSettings);
   route("/scale-sync", viewScaleSync);
+  route("/scale-capture", viewScaleCapture);
 
   render();
 })();
