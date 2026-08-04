@@ -768,11 +768,25 @@
     );
     const content = h("div", { class: "content" });
 
-    // 大标题 + 日期副标题
+    // 日期副标题
     const today = new Date();
     const dateStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
-    content.appendChild(h("div", { class: "page-title" }, "小鼠称重"));
-    content.appendChild(h("div", { class: "page-subtitle" }, dateStr));
+
+    // 品牌头部：logo（薄荷绿底白鼠站秤）+ 标题。对齐 page-title 体系，简洁不喧宾夺主。
+    const brand = h("div", { class: "brand-header" }, [
+      h("img", {
+        class: "brand-logo",
+        src: "/static/app-icon-192.png",
+        alt: "",
+        width: 44,
+        height: 44,
+      }),
+      h("div", { class: "brand-text" }, [
+        h("div", { class: "brand-title" }, "小鼠称重"),
+        h("div", { class: "brand-subtitle" }, dateStr),
+      ]),
+    ]);
+    content.appendChild(brand);
 
     // 天平连接卡片（全局连接入口，iOS 风格）
     const connectCard = renderScaleConnectCard();
@@ -810,7 +824,14 @@
       const data = await api.recentBoxes();
       listWrap.innerHTML = "";
       if (!data.items.length) {
-        listWrap.appendChild(h("div", { class: "empty group-empty" }, "还没有记录，去录制第一只吧"));
+        // 友好空状态：图标 + 引导，而非裸“暂无数据”。
+        listWrap.appendChild(
+          h("div", { class: "empty-state group-empty" }, [
+            h("div", { class: "empty-state-icon" }, "📦"),
+            h("div", { class: "empty-state-title" }, "还没有箱子"),
+            h("div", { class: "empty-state-desc" }, "先去「箱子管理」创建一个箱子，再开始称重吧"),
+          ])
+        );
       } else {
         data.items.forEach((b) => listWrap.appendChild(recentRow(b)));
       }
@@ -838,11 +859,13 @@
     // 左侧 40px 圆角 9 蓝色方块内白色"⚖"
     const icon = h("div", { class: "connect-icon" }, "⚖");
     const dot = h("span", { class: "connect-dot" });
-    const statusText = h("div", { class: "connect-status-text" }, "天平未连接");
+    const statusText = h("div", { class: "connect-status-text" }, "未连接");
     const weightText = h("div", { class: "connect-weight" }, "");
     const title = h("div", { class: "connect-title" }, "天平");
     const info = h("div", { class: "connect-info" }, [dot, statusText, weightText]);
-    const infoBlock = h("div", { class: "connect-info-block" }, [title, info]);
+    // 友好副提示：状态对应的下一步引导（口语化，不出现 BLE/广播等技术词）
+    const hintText = h("div", { class: "connect-hint" }, "打开天平电源后，点击右侧“连接”");
+    const infoBlock = h("div", { class: "connect-info-block" }, [title, info, hintText]);
     const actionBtn = h("button", { class: "pill connect-action pill-connect" }, "连接");
     actionBtn.addEventListener("click", () => {
       if (scaleConn.state === "disconnected" || scaleConn.state === "error") connectScale();
@@ -850,7 +873,7 @@
     });
     card.appendChild(h("div", { class: "connect-row" }, [icon, infoBlock, actionBtn]));
     // 立即按当前状态渲染一次
-    applyConnectState(card, dot, statusText, weightText, actionBtn);
+    applyConnectState(card, dot, statusText, weightText, actionBtn, hintText);
     return card;
   }
   renderScaleConnectCard._updater = function (card, startRow) {
@@ -859,7 +882,8 @@
       const statusText = card.querySelector(".connect-status-text");
       const weightText = card.querySelector(".connect-weight");
       const actionBtn = card.querySelector(".connect-action");
-      applyConnectState(card, dot, statusText, weightText, actionBtn);
+      const hintText = card.querySelector(".connect-hint");
+      applyConnectState(card, dot, statusText, weightText, actionBtn, hintText);
       // 开始录制行：未连接时 label3 置灰但仍可点（进手动模式）
       if (startRow) {
         const connected = scaleConn.state === "connected";
@@ -867,18 +891,47 @@
       }
     };
   };
-  function applyConnectState(card, dot, statusText, weightText, actionBtn) {
+  // 根据错误信息（来自原生）推测可操作的下一步，避免技术 jargon 直出。
+  function friendlyScaleErrorHint(msg) {
+    const m = (msg || "").toLowerCase();
+    if (m.indexOf("权限") >= 0 || m.indexOf("permission") >= 0 || m.indexOf("unauthorized") >= 0) {
+      return "请在系统设置中允许蓝牙权限，再回来连接";
+    }
+    if (m.indexOf("蓝牙") >= 0 || m.indexOf("bluetooth") >= 0 || m.indexOf("off") >= 0 ||
+        m.indexOf("关闭") >= 0 || m.indexOf("未开启") >= 0) {
+      return "请先打开手机蓝牙，再点击“连接”";
+    }
+    if (m.indexOf("未检测到") >= 0 || m.indexOf("外壳") >= 0 || m.indexOf("native") >= 0) {
+      return "请在配套的小鼠称重 App 中打开本页面";
+    }
+    return "请确认天平已开机，再点击“连接”重试";
+  }
+  function applyConnectState(card, dot, statusText, weightText, actionBtn, hintText) {
     const s = scaleConn.state;
+    // 主文案：口语化，不出现“广播/stale/BLE”等词；error 始终给一个干净的主态。
     const labels = {
       disconnected: "未连接",
       connecting: "正在搜索天平…",
       connected: "已连接",
-      stale: "广播中断",
-      error: scaleConn.errorMsg || "天平异常",
+      stale: "信号中断",
+      error: "无法连接",
     };
     statusText.textContent = labels[s] || s;
+    // 各状态对应的引导副提示（可操作的下一步）。
+    const hints = {
+      disconnected: "打开天平电源后，点击右侧“连接”",
+      connecting: "请稍候，正在附近查找天平…",
+      connected: "", // 已连接时不显示提示，克数已在上一行
+      stale: "请靠近天平，或断开后重新连接",
+      error: friendlyScaleErrorHint(scaleConn.errorMsg),
+    };
+    if (hintText) {
+      const ht = hints[s] != null ? hints[s] : "";
+      hintText.textContent = ht;
+      hintText.hidden = !ht;
+    }
     // connected/stale 时副标题显示 设备名 · 实时克数（stale 保留最近一次有效读数，
-    // 仅状态点变橙表达"广播中断"，数字不闪烁）。
+    // 仅状态点变橙表达“信号中断”，数字不闪烁）。
     if (s === "connected" || s === "stale") {
       const name = scaleConn.selectedDeviceName || "";
       const g = scaleConn.lastGrams !== null ? Number(scaleConn.lastGrams).toFixed(1) + " g" : "—";
@@ -1421,6 +1474,12 @@
       style: "text-align:center;color:var(--muted,#5f6368);font-size:13px;min-height:18px",
     });
 
+    // 确认区引导文案：announced 态显示“读数已锁定…”，其余状态隐藏。
+    const confirmGuide = h(
+      "div",
+      { class: "rt-confirm-guide", hidden: true },
+      "读数已锁定，请确认记录，或重测一次"
+    );
     const retryBtn = h(
       "button",
       { class: "btn rt-btn-retry", type: "button", hidden: true },
@@ -1470,7 +1529,7 @@
       if (e.key === "Enter") { e.preventDefault(); manualSubmit.click(); }
     });
 
-    const dockChildren = [stateIndicator, weightDisplay, qualityHints, actionButtons, mouseCount];
+    const dockChildren = [stateIndicator, weightDisplay, qualityHints, confirmGuide, actionButtons, mouseCount];
     if (recordMode === "manual") dockChildren.push(manualPanel);
     const dock = h(
       "div",
@@ -1800,6 +1859,7 @@
       const showActions = newState === "announced";
       retryBtn.hidden = !showActions;
       acceptBtn.hidden = !showActions;
+      confirmGuide.hidden = !showActions;
 
       switch (newState) {
         case "calibrating":
