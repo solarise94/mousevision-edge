@@ -815,10 +815,6 @@
     const startRow = opGroup.querySelector(".home-start-rec");
     const updater = renderScaleConnectCard._updater(connectCard, startRow);
     scaleConn._subs.push(updater);
-    return () => {
-      const i = scaleConn._subs.indexOf(updater);
-      if (i >= 0) scaleConn._subs.splice(i, 1);
-    };
 
     try {
       const data = await api.recentBoxes();
@@ -839,6 +835,13 @@
       listWrap.innerHTML = "";
       listWrap.appendChild(h("div", { class: "empty group-empty" }, err.message));
     }
+
+    // cleanup 必须在数据加载之后返回（此前 return 提前导致 await 段不可达，
+    // 最近记录永远停在"加载中…"）。
+    return () => {
+      const i = scaleConn._subs.indexOf(updater);
+      if (i >= 0) scaleConn._subs.splice(i, 1);
+    };
   }
 
   /* iOS 风格分组导航行：左标题 / 副标题 + 右侧 "›"。extraClass 用于钩子。 */
