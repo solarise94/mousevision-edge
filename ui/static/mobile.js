@@ -2009,6 +2009,10 @@
       return LocalWeigh.createController({
         mode: recordMode,
         weighEngine: WeighEngine,
+        // 真秤实测：放鼠有稳定瞬态，需稳定判定持续满 ~0.8s 真实时间才播报，
+        // 否则重量还在爬升/抖动就确认（最小稳定时长门槛，仅 App 运行时设置，
+        // 引擎默认 stable_min_span_ms=0 不变、不影响单测）。
+        engineConfig: { stable_min_span_ms: 800 },
         scaleChannel: channelForCtrl,
         outbox: reportOutbox,
         box: { cageId: box.cageId, strain: box.strain },

@@ -541,14 +541,26 @@
       return true;
     }
 
-    /* 定时器驱动：用当前缓存的新鲜读数推进一次。
-     * 缓存过期/无读数时 g=null，状态机据此暂停判定（仅 wait_clear 超时等仍推进）。 */
+    /* 定时器驱动：只推进"无新读数也需处理"的时间逻辑（wait_clear 超时、
+     * announced 自动接受超时、stale 边沿），**绝不往证据窗注入读数**。
+     *
+     * 真机 bug 修复（重量未稳即播报）：此前 tick() 用当前缓存读数调 advance()，
+     * 而 armed/weighing handler 会把该读数 appendRawRead 进证据窗——150ms 定时器
+     * 反复把同一条缓存读数计入稳定窗，同一重量 ~0.5s 就凑满 stable_min_raw_reads+confirm
+     * → 重量还在爬升/抖动就播报。证据只能来自 ingestReading 的真实新读数（与 Python
+     * 帧驱动语义一致：每帧=一条真实新样本，绝不重复用旧样本充数）。
+     * wait_clear/announced 的超时推进不需要新证据，故 tick 只调这两个 handler。 */
     function tick() {
-      var g = freshGrams();
-      var conf = g === null ? 0.0 : 1.0;
-      var frameSeq = bleReading ? bleReading.sequence : 0;
-      var clientTsMs = bleReading ? bleReading.receivedAtEpochMs : 0;
-      advance(g, conf, frameSeq, clientTsMs);
+      if (state === "wait_clear") {
+        // handleWaitClear 内部先查超时（超时→armed），g=null 直接返回、不动 clearCount、
+        // 不注入证据。
+        handleWaitClear(null);
+      } else if (state === "announced") {
+        // announce_hold_s 自动接受超时（默认 0=关闭则不动作）。
+        handleAnnounced();
+      }
+      // armed/weighing/calibrating 需要真实新读数才能推进，tick 不驱动它们。
+      reportStaleEdge();
     }
 
     /* 用户接受当前播报。仅在 announced 态生效。

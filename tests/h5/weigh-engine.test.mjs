@@ -450,3 +450,46 @@ test("reset：回到 calibrating，清空所有证据", () => {
   assert.equal(st.weightCandidate, null);
   assert.equal(st.lastGrams, null);
 });
+
+/* ------------------------- tick 不注入证据（真机 bug 回归）-------------------------
+ * 修复前：tick() 用缓存读数调 advance()，armed/weighing 会把同一条缓存读数
+ * 反复 appendRawRead 进证据窗 → 同一重量 ~0.5s 凑满稳定条件 → 重量未稳即播报。
+ * 修复后：tick() 只推进超时/stale，绝不注入证据。以下锁定该行为。 */
+
+test("tick 不注入证据：weighing 中反复 tick 不累计稳定读数、不播报", () => {
+  const h = makeSession();
+  let seq = reachArmed(h, 0);
+  seq = reachWeighing(h, 20.0, seq); // weighing（2 条 20.0 已入窗）
+  // 不再喂新读数，只反复 tick（模拟 150ms 定时器在恒定重量下空转）
+  for (let i = 0; i < 30; i++) {
+    h.advance(150);
+    h.tick();
+  }
+  // 证据窗没有新增读数 → 凑不满 stable_min_raw_reads 的"新"稳定段 → 绝不播报
+  assert.equal(h.session.getState().state, "weighing");
+  const announced = h.events.filter((e) => e.type === "announce");
+  assert.equal(announced.length, 0, "tick 空转绝不应触发 announce");
+});
+
+test("tick 不注入证据：armed 中反复 tick 不会凭空进 weighing", () => {
+  const h = makeSession();
+  reachArmed(h, 0);
+  // armed 态不放鼠（无新读数），反复 tick
+  for (let i = 0; i < 20; i++) {
+    h.advance(150);
+    h.tick();
+  }
+  assert.equal(h.session.getState().state, "armed");
+});
+
+test("tick 注入证据修复后：只有真实新读数才能推进稳定判定", () => {
+  const h = makeSession();
+  let seq = reachArmed(h, 0);
+  seq = reachWeighing(h, 20.0, seq);
+  // 真实新读数（间隔 200ms）才能累积稳定段并播报
+  h.feed(20.0, seq++); // 第3条 → pending
+  assert.equal(h.session.getState().state, "weighing");
+  h.feed(20.0, seq++); // 第4条 → confirm → announced
+  assert.equal(h.session.getState().state, "announced");
+  assert.ok(Math.abs(h.session.getState().weightCandidate - 20.0) < 0.05);
+});
