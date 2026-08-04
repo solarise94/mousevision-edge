@@ -47,7 +47,11 @@
     stable_confirm_raw_reads: 1, // 候选确认期需要再确认的独立读数
     stable_min_span_ms: 0.0,     // 确认期最小时间跨度（ms）；0 = 仅按读数
     stable_max_age_s: 1.6,       // 稳定证据允许保留的最大年龄（秒）
-    stable_weight_tol: 0.10,     // 稳定后缀内最大跨度（克）
+    // 稳定后缀内最大跨度（克）。真秤实测（scale_captures 回放）：稳定读数在
+    // X.6/X.7（0.1g 分辨率）间抖动，tol=0.10 恰好卡在边界导致稳定段反复成形又
+    // 破裂、漏报真实稳定（如 33.6g 段）；调到 0.15 后容忍该抖动且对运动（>>0.5g）
+    // 依然稳健。 tol=0.15 是 K797 0.1g 抖动的安全容差。
+    stable_weight_tol: 0.15,
     min_confidence: 0.50,        // 最低置信度（BLE 恒 1.0）
     announce_hold_s: 0.0,        // 播报后自动接受的等待时间（0 = 关闭）
     clear_timeout_s: 30.0,       // 等待清秤超时（秒）
