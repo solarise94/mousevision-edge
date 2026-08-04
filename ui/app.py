@@ -786,6 +786,13 @@ report_api.configure(
 )
 app.include_router(report_api.router)
 
+# Raw BLE scale capture (for offline engine tuning): phone records every K797
+# reading verbatim and POSTs it here; server persists to output/scale_captures/.
+import ui.capture_api as capture_api  # noqa: E402
+
+capture_api.configure(str(DEFAULT_OUTPUT))
+app.include_router(capture_api.router)
+
 
 class _NoCacheStaticFiles(StaticFiles):
     """StaticFiles that always sends Cache-Control: no-cache.

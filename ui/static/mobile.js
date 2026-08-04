@@ -3367,16 +3367,18 @@
     }
 
     async function stopAndUpload() {
-      if (!recording) return;
-      recording = false;
-      // 移除 onReading 订阅：ScaleBridge 没有显式 off，重建通道最干净；
-      // 但重建会中断首页连接，所以这里改为：若通道没有其它消费者，
-      // 重建一个同 deviceId 的通道接续首页连接（与 viewRecord 退出处理一致）。
-      // 简单稳妥做法：保留通道，回调里 recording=false 已不再 push（回调
-      // 对象仍挂在 readingCbs 数组里但成为 no-op，无副作用）。
-      readingCb = null;
-      if (rateTimer) { clearInterval(rateTimer); rateTimer = null; }
-      refreshConnStatus();
+      // 停止记录（若正在记录）；retry 时 recording 已为 false，跳过停止直接重传。
+      if (recording) {
+        recording = false;
+        readingCb = null;
+        if (rateTimer) { clearInterval(rateTimer); rateTimer = null; }
+        refreshConnStatus();
+      }
+      // 没有读数（且非 retry 遗留）时不发空请求。
+      if (!readings.length) {
+        toast("没有可上传的读数");
+        return;
+      }
 
       const deviceId = scaleConn.selectedDeviceId || "scale01";
       const payload = {
