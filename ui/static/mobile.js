@@ -3304,8 +3304,9 @@
         connectWeightText.textContent = "";
         connectWeightText.hidden = true;
       }
-      // 按钮可用性：未连接且未录制时禁用
-      const canStart = (s === "connected") && !recording;
+      // 按钮可用性：已连接即可点。记录中按钮变为「停止并上传」，必须保持可点
+      // （此前写成 && !recording 会把记录中的停止按钮禁用 → 无法停止并上传）。
+      const canStart = (s === "connected");
       actionBtn.disabled = !canStart;
       actionBtn.textContent = recording ? "停止并上传" : "开始记录";
       actionBtn.classList.toggle("danger", recording);
