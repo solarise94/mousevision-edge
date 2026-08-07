@@ -84,6 +84,7 @@ class MainActivity : Activity(), K797BleScanner.Listener {
         webView.settings.mediaPlaybackRequiresUserGesture = false
         webView.addJavascriptInterface(
             ScaleJavascriptBridge(
+                context = this,
                 startScaleScan = { runOnUiThread { ensureBlePermissionAndStart() } },
                 stopScaleScan = { runOnUiThread { scanner.stop() } },
                 getScaleStatusJson = { scanner.statusJson() },

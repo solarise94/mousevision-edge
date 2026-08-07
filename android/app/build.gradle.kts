@@ -1,3 +1,8 @@
+import org.gradle.api.DefaultTask
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.TaskAction
+import org.gradle.kotlin.dsl.register
 import java.util.Properties
 
 plugins {
@@ -37,13 +42,33 @@ android {
         versionCode = 3
         versionName = "0.3.0"
 
+        // 应用名由各 flavor 覆盖（cloud=「小鼠称重」，local=「小鼠称重·本地版」）。
+        resValue("string", "app_name", "小鼠称重")
+
         buildConfigField(
             "String",
             "MICE_WEB_URL",
             "\"https://weight.pingoodmice.top:16206/mobile\"",
         )
-        // 实验室测试期：dev 版每条记录附带读数时间序列用于模型训练；正式发布改 false
+        // 实验室测试期：cloud（实验/内测）版保持 dev 模式采集训练数据；
+        // local（公众本地版）关闭（buildConfigField 在 flavor 中覆盖为 false）。
         buildConfigField("boolean", "MICE_DEV_MODE", "true")
+    }
+
+    // 单维 flavor：edition = cloud（现状）/ local（公众本地版）。
+    flavorDimensions += "edition"
+    productFlavors {
+        create("cloud") {
+            dimension = "edition"
+            // 现状：applicationId 不变，dev 模式保持 true。
+        }
+        create("local") {
+            dimension = "edition"
+            applicationIdSuffix = ".local"
+            resValue("string", "app_name", "小鼠称重·本地版")
+            // 公众版不采集训练数据。
+            buildConfigField("boolean", "MICE_DEV_MODE", "false")
+        }
     }
 
     // H5 资产由 syncH5Assets 从 ../ui/static 拷到 generated/assets/www
@@ -91,8 +116,19 @@ android {
 }
 
 // ---------------------------------------------------------------------------
-// H5 资产打包 + config.js 生成
+// H5 资产打包（共用）+ config.js 按 flavor 生成
 // 源：<repo>/ui/static（H5 本体 + mobile.html 入口）；产物：assets/www/
+//
+// config.js 必须按 flavor 区分（edition / token），所以不能放在 main sourceSet。
+// 采用「每 flavor 一个 assets srcDir + 覆盖文件」方案：
+// - main sourceSet 的 assets 由 syncH5Assets 拷入 build/generated/assets（不含 config.js）；
+// - 每个 flavor 额外挂一个 build/generated/assets-<flavor> assets srcDir（优先级高于 main），
+//   由对应 generate*Config 任务写入其专属 config.js（assets/www/config.js），覆盖 main 里
+//   同路径资源。
+//
+// 不用 androidComponents.addGeneratedSourceDirectory：它会把输出目录固定在
+// build/generated/assets/<taskName>（落在 main assets srcDir 扫描范围内），导致各 variant
+// 的 config 互相污染（见构建期 cross-variant implicit-dependency 报错）。
 // ---------------------------------------------------------------------------
 
 val staticDir = rootProject.file("../ui/static")
@@ -101,36 +137,57 @@ val generatedAssetsDir = layout.buildDirectory.dir("generated/assets/www")
 tasks.register<Copy>("syncH5Assets") {
     from(staticDir)
     into(generatedAssetsDir)
-    // config.js 为构建期生成，避免被源文件覆盖。
+    // config.js 为构建期按 flavor 生成，避免被源文件覆盖。
     exclude("config.js")
     inputs.property("apiBase", miceApiBase)
     inputs.property("token", miceSyncToken)
 }
 
-tasks.register("generateAppConfig") {
-    val outFile = generatedAssetsDir.map { it.file("config.js") }
-    inputs.property("apiBase", miceApiBase)
-    inputs.property("token", miceSyncToken)
-    outputs.file(outFile)
-    doLast {
-        val file = outFile.get().asFile
+// 每个 flavor 生成其专属 config.js（edition / token 因 flavor 而异）。
+abstract class GenerateAppConfig : DefaultTask() {
+    @get:Input
+    abstract var apiBase: String
+
+    @get:Input
+    abstract var syncToken: String
+
+    @get:Input
+    abstract var edition: String
+
+    @get:OutputDirectory
+    abstract val outputDir: org.gradle.api.file.DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val file = outputDir.get().file("www/config.js").asFile
         file.parentFile.mkdirs()
         // JS 字符串安全转义（token 可能含引号/反斜杠）。
         fun jsStr(v: String): String = v.replace("\\", "\\\\").replace("'", "\\'")
         val appOrigin = "https://app.miceautomatic.local"
         file.writeText(
             "// 构建期生成：app 独立运行配置（勿手改）\n" +
-                "window.MV_CONFIG = { apiBase: '" + jsStr(miceApiBase) +
-                "', token: '" + jsStr(miceSyncToken) +
+                "window.MV_CONFIG = { apiBase: '" + jsStr(apiBase) +
+                "', token: '" + jsStr(syncToken) +
+                "', edition: '" + edition +
                 "', appOrigin: '" + appOrigin + "' };\n",
         )
     }
 }
 
-tasks.named("generateAppConfig") {
-    dependsOn("syncH5Assets")
+// 每个 flavor 专属 assets 根目录（优先级高于 main，assets/www/config.js 覆盖 main 同路径）。
+listOf("cloud", "local").forEach { flavor ->
+    val cfgDir = layout.buildDirectory.dir("generated/assets-$flavor")
+    android.sourceSets[flavor].assets.srcDir(cfgDir)
+    val configTask = tasks.register<GenerateAppConfig>("generateAppConfig$flavor") {
+        apiBase = miceApiBase
+        // local（公众本地版）不携带同步令牌：纯本地不上传。
+        syncToken = if (flavor == "local") "" else miceSyncToken
+        edition = flavor
+        outputDir.set(cfgDir)
+    }
+    tasks.named("preBuild") { dependsOn(configTask) }
 }
 
 tasks.named("preBuild") {
-    dependsOn("generateAppConfig")
+    dependsOn("syncH5Assets")
 }
