@@ -19,6 +19,7 @@ from typing import Any
 import cv2
 import numpy as np
 from fastapi import Body, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -764,6 +765,18 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="MouseVision Edge UI", lifespan=lifespan)
+
+# CORS for the packaged Android app: H5 lives on the synthetic origin
+# app.miceautomatic.local (served from APK assets), API lives here. Tokens
+# travel in the X-MouseVision-Token header, not cookies, so credentials are
+# not shared. Only the packaged-app origin is allowed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.miceautomatic.local"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["X-MouseVision-Token", "Content-Type"],
+)
 
 # Realtime weighing WebSocket + REST API
 realtime_api.configure(DEFAULT_CONFIG, str(DEFAULT_OUTPUT))

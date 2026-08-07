@@ -14,12 +14,18 @@ import android.webkit.PermissionRequest
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.IOException
 
 /**
- * Android 外壳 Activity：WebView 加载固定页面 + 注入 JS 桥 + BLE 扫描 K797 广播秤。
+ * Android 外壳 Activity：WebView 加载打包进 APK 的本地 H5 + 注入 JS 桥 + BLE 扫描 K797 广播秤。
+ *
+ * 页面从合成域 https://app.miceautomatic.local/mobile 提供（shouldInterceptRequest
+ * 从 assets/www 拦截返回，无真实网络）；API 请求跨源打到配置的服务器并带 token。
  *
  * 对齐 HarmonyOS `Index.ets` + `ScaleWebBridge.ets`：
  * - JS 接口对象名固定 `MiceAutomaticScale`（即 window.MiceAutomaticScale）；
@@ -27,7 +33,7 @@ import org.json.JSONObject
  *     miceautomatic:scale-reading  （UI 推送节流 100ms，~10Hz）
  *     miceautomatic:scale-status   （内容变化才推）
  *     miceautomatic:scale-devices  （≥500ms 节流 + 内容变化才推，~2Hz）
- * - 导航白名单：仅允许 https + weight.pingoodmice.top:16206；
+ * - 导航白名单：合成域 app.miceautomatic.local 或 https + weight.pingoodmice.top:16206；
  * - 相机 onPermissionRequest：白名单内且已授权才放行（保留）；
  * - 称量页常亮：getWindow().addFlags(FLAG_KEEP_SCREEN_ON)（对齐鸿蒙侧行为）；
  * - onPause 停扫描（保留），避免后台占用 BLE。
@@ -38,6 +44,10 @@ class MainActivity : Activity(), K797BleScanner.Listener {
         private const val CAMERA_PERMISSION_REQUEST = 798
         private const val TRUSTED_HOST = "weight.pingoodmice.top"
         private const val TRUSTED_PORT = 16206
+
+        // 合成域：H5 打包进 APK 后以该 https 域从 assets 提供（本地拦截，无真实网络）。
+        private const val APP_HOST = "app.miceautomatic.local"
+        private const val APP_ORIGIN = "https://app.miceautomatic.local"
 
         // 原生→页面事件名（与 H5 addEventListener / ScaleWebBridge 一致）。
         private const val EVENT_READING = "miceautomatic:scale-reading"
@@ -89,19 +99,40 @@ class MainActivity : Activity(), K797BleScanner.Listener {
             }
 
             /**
-             * 放行白名单主机的 SSL 证书错误。
+             * 本地资产加载：合成域 app.miceautomatic.local 的请求全部由 assets/www
+             * 拦截提供（/mobile → mobile.html；静态资源 /static/ 前缀映射到
+             * assets/www 下对应文件），其余 host 放行（如 API 服务器）。
+             */
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
+                val url = request.url
+                if (url.host != APP_HOST) return null
+                val path = url.path ?: "/"
+                return when {
+                    path == "/" || path == "/mobile" || path.startsWith("/mobile/") ->
+                        assetResponse("www/mobile.html", "text/html", "utf-8")
+                    path.startsWith("/static/") -> {
+                        val assetPath = "www/" + path.removePrefix("/static/")
+                        val mime = mimeFor(assetPath)
+                        assetResponse(assetPath, mime, encodingFor(mime))
+                    }
+                    else -> notFoundResponse()
+                }
+            }
+
+            /**
+             * 放行真实服务器 host 的 SSL 证书错误。
              *
              * 背景：weight.pingoodmice.top 走 FRP，证书由 FRP 服务商签发为
              * Let's Encrypt ECDSA 链（ISRG Root X2）。卓易通等 Android 兼容容器
              * 内的 WebView 信任库较旧，不信任 X2 ECDSA 链，导致 ERR_CERT_AUTHORITY_INVALID
              * 无法加载页面。HarmonyOS 原生 WebView（ArkWeb）信任库较新无此问题。
              *
-             * 信任边界已由主机白名单（isTrusted）约束，仅放行白名单内的证书错误；
-             * 其余一律按默认拒绝（不放宽任何外部站点的 TLS 校验）。
+             * 仅放行真实服务器（TRUSTED_HOST:TRUSTED_PORT）；合成域走拦截器，永远
+             * 不会产生 SSL 错误，不在此处放行。信任边界已由主机白名单约束。
              */
             override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
                 val url = error?.url
-                if (handler != null && url != null && isTrusted(Uri.parse(url))) {
+                if (handler != null && url != null && isTrustedApiServer(Uri.parse(url))) {
                     handler.proceed()
                 } else if (handler != null) {
                     handler.cancel()
@@ -135,9 +166,9 @@ class MainActivity : Activity(), K797BleScanner.Listener {
         }
         val webUrl = if (BuildConfig.MICE_DEV_MODE) {
             // dev 版：H5 开启训练数据采集（每次记录附带读数时间序列）
-            BuildConfig.MICE_WEB_URL + (if (BuildConfig.MICE_WEB_URL.contains("?")) "&dev=1" else "?dev=1")
+            APP_ORIGIN + "/mobile?dev=1"
         } else {
-            BuildConfig.MICE_WEB_URL
+            APP_ORIGIN + "/mobile"
         }
         webView.loadUrl(webUrl)
     }
@@ -276,6 +307,55 @@ class MainActivity : Activity(), K797BleScanner.Listener {
         else requestPermissions(needed.toTypedArray(), BLE_PERMISSION_REQUEST)
     }
 
+    /** 白名单：合成域（无端口要求）或真实 API 服务器 host:port。 */
     private fun isTrusted(uri: Uri): Boolean =
+        (uri.scheme == "https" && uri.host == APP_HOST) ||
+            isTrustedApiServer(uri)
+
+    /** 仅真实 API 服务器（SSL 错误放行等场景，合成域不涉及真实 TLS）。 */
+    private fun isTrustedApiServer(uri: Uri): Boolean =
         uri.scheme == "https" && uri.host == TRUSTED_HOST && uri.port == TRUSTED_PORT
+
+    /** 从 assets 读取文件并包装为 WebResourceResponse；缺失返回 404。 */
+    private fun assetResponse(assetPath: String, mimeType: String, encoding: String?): WebResourceResponse {
+        val stream = try {
+            assets.open(assetPath)
+        } catch (_: IOException) {
+            return notFoundResponse()
+        }
+        return WebResourceResponse(mimeType, encoding, stream)
+    }
+
+    private fun notFoundResponse(): WebResourceResponse = WebResourceResponse(
+        "text/plain",
+        "utf-8",
+        404,
+        "Not Found",
+        emptyMap(),
+        ByteArrayInputStream("404 Not Found".toByteArray()),
+    )
+
+    private fun mimeFor(assetPath: String): String = when (assetPath.substringAfterLast('.', "").lowercase()) {
+        "js" -> "application/javascript"
+        "css" -> "text/css"
+        "html", "htm" -> "text/html"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "svg" -> "image/svg+xml"
+        "json" -> "application/json"
+        "woff2" -> "font/woff2"
+        "woff" -> "font/woff"
+        "ttf" -> "font/ttf"
+        "ico" -> "image/x-icon"
+        "webp" -> "image/webp"
+        "mp4" -> "video/mp4"
+        else -> "application/octet-stream"
+    }
+
+    private fun encodingFor(mime: String): String? = when (mime) {
+        "text/html", "text/css", "application/javascript", "application/json", "image/svg+xml",
+        "text/plain",
+        -> "utf-8"
+        else -> null
+    }
 }
