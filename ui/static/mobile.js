@@ -94,7 +94,12 @@
    * 入队，outbox 负责联网补传 POST /api/records/report。整个 app 生命周期
    * 复用同一个实例（localStorage 持久化 + online 事件自动 flush）。
    * ------------------------------------------------------------------ */
-  const reportOutbox = ReportClient.createOutbox({ storage: localStorage });
+  const reportOutbox = ReportClient.createOutbox({
+    storage: localStorage,
+    // 独立 app（打包进 APK）跨源时上报接口必须前置 MV_CONFIG.apiBase；
+    // 服务器托管 H5 无 MV_CONFIG → apiUrl() 原样返回，等价现状（同源）。
+    endpoint: apiUrl("/api/records/report"),
+  });
   reportOutbox.start();
 
   /* 构造并启动一个天平通道，挂载标准读数/状态/stale 回调。
@@ -342,6 +347,47 @@
   /* ------------------------------------------------------------------ *
    * API
    * ------------------------------------------------------------------ */
+
+  /* 离线选箱缓存：localStorage mv.boxCache.v1（map: cageId → {box, cachedAt}）。
+   * 每次 api.box()/api.boxes() 成功都把箱子对象写入缓存；断网选箱时回退
+   * 本机缓存开始录制（离线称重闭环）。缓存的是后端 /api/boxes/{id} 原样返回
+   * 的字段（cage_id/project_id/strain/mouse_no_start/mouse_no_pad/next_ordinal
+   * 等），与线上录制上报所需的箱号字段一致。 */
+  const BOX_CACHE_KEY = "mv.boxCache.v1";
+  function readBoxCache() {
+    try {
+      const raw = localStorage.getItem(BOX_CACHE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && typeof parsed === "object" && parsed.map && typeof parsed.map === "object") {
+        return parsed.map;
+      }
+    } catch (_) {}
+    return {};
+  }
+  function writeBoxCacheEntry(box) {
+    if (!box || typeof box !== "object" || !box.cage_id) return;
+    try {
+      const map = readBoxCache();
+      map[String(box.cage_id)] = { box: box, cachedAt: Date.now() };
+      localStorage.setItem(BOX_CACHE_KEY, JSON.stringify({ v: 1, map: map }));
+    } catch (_) {}
+  }
+  function readBoxCacheEntry(cageId) {
+    const entry = readBoxCache()[String(cageId)];
+    return entry && entry.box ? entry.box : null;
+  }
+  function cacheBoxResult(box) {
+    if (box && typeof box === "object") writeBoxCacheEntry(box);
+    return box;
+  }
+
+  /* 网络错误判定：fetch throw / 无 HTTP 状态码（err.status 为 undefined）→ true，
+   * 走本机缓存；HTTP 业务错误（有 status，含 404 箱子不存在）→ false，不回退缓存
+   * （避免服务器端删箱后本地还在用旧信息）。 */
+  function isNetworkError(err) {
+    return !err || typeof err.status === "undefined";
+  }
+
   const api = {
     async json(url, opts) {
       const res = await apiFetch(url, opts);
@@ -359,8 +405,11 @@
     },
     recentBoxes: () => api.json("/api/boxes/recent?limit=6"),
     boxes: (strain) =>
-      api.json("/api/boxes" + (strain ? `?strain=${encodeURIComponent(strain)}` : "")),
-    box: (cage) => api.json(`/api/boxes/${encodeURIComponent(cage)}`),
+      api.json("/api/boxes" + (strain ? `?strain=${encodeURIComponent(strain)}` : "")).then((data) => {
+        (data && Array.isArray(data.items) ? data.items : []).forEach(writeBoxCacheEntry);
+        return data;
+      }),
+    box: (cage) => api.json(`/api/boxes/${encodeURIComponent(cage)}`).then(cacheBoxResult),
     boxRecords: (cage) => api.json(`/api/boxes/${encodeURIComponent(cage)}/records`),
     createBox: (payload) =>
       api.json("/api/boxes", {
@@ -445,7 +494,7 @@
         h("div", { class: "card", style: "text-align:center;max-width:320px;width:100%" }, [
           h("div", { class: "card-title" }, cage),
           h("img", {
-            src: `/api/boxes/${encodeURIComponent(cage)}/qr.svg`,
+            src: apiUrl(`/api/boxes/${encodeURIComponent(cage)}/qr.svg`),
             alt: "二维码",
             style: "width:220px;height:220px",
           }),
@@ -707,6 +756,11 @@
   /* ------------------------------------------------------------------ *
    * 上传
    * ------------------------------------------------------------------ */
+
+  /* legacy：纯 app 流程已不使用，仅旧服务端流程保留。
+   * viewRecord 已改本地称重 + outbox 上报（POST /api/records/report），不再走
+   * XHR POST /api/jobs 做 OCR 视频分析；仅旧 renderUploading → /done 流程仍引用。
+   * 保留不删（保守），勿在纯 app 流程中调用。 */
   function uploadVideo(blob, filename, box, onProgress, durationSec, opts) {
     opts = opts || {};
     return new Promise((resolve, reject) => {
@@ -1341,15 +1395,29 @@
       if (parsed.projectId) state.projectId = parsed.projectId;
       let box = null;
       try {
-        box = await api.box(cage);
+        box = await api.box(cage); // 成功时内部已写入本机缓存（mv.boxCache.v1）
       } catch (err) {
         if (err.status === 404) {
+          // 业务错误：服务器明确表示箱子不存在 → 不回退缓存（避免删箱后本地还在用）。
+          // 在线时照旧提示新建 / 允许临时使用。
           if (confirm(`箱号 ${cage} 尚未建立，是否新建？`)) {
             go(`/manage/new?cage=${encodeURIComponent(cage)}`);
             return;
           }
           // 允许临时使用（上传时后端会自动建箱）
+        } else if (isNetworkError(err)) {
+          // 网络错误（fetch throw / 无 HTTP 状态码）→ 回退本机缓存开始录制
+          box = readBoxCacheEntry(cage);
+          if (!box) {
+            toast("离线且本机没有该箱子缓存，请联网后再试");
+            setResult("等待识别…", false);
+            scanning = true;
+            if (detector) requestAnimationFrame(loop);
+            return;
+          }
+          toast("离线模式：使用本机缓存的箱子信息");
         } else {
+          // 其它 HTTP 错误（如 5xx）：服务器可达但失败，照旧提示、不回退缓存
           toast(err.message);
           setResult("等待识别…", false);
           scanning = true;
@@ -2405,6 +2473,9 @@
       });
   }
 
+  /* legacy：纯 app 流程已不使用，仅旧服务端流程保留。
+   * /done 轮询 job 状态（api.job/jobWait）只在旧 uploadVideo → /done 流程可达；
+   * viewRecord 已不再上传视频排队分析。保留不删（保守）。 */
   async function viewDone() {
     if (!state.activeJobId) {
       go("/");
@@ -2569,7 +2640,7 @@
     const ordinal = it.actual_ordinal || it.requested_ordinal;
     const clickable = it.status === "completed" && it.record_id;
     const thumb = it.photo_url
-      ? h("img", { class: "thumb", src: it.photo_url + "?size=thumb", loading: "lazy" })
+      ? h("img", { class: "thumb", src: apiUrl(it.photo_url) + "?size=thumb", loading: "lazy" })
       : h("div", { class: "thumb placeholder" }, "🐭");
     const title =
       it.status === "completed" && it.weight != null
@@ -2617,7 +2688,7 @@
       const m = await api.record(id);
       content.innerHTML = "";
       content.appendChild(
-        h("img", { class: "detail-media", src: m.photo_url, alt: "稳定帧" })
+        h("img", { class: "detail-media", src: apiUrl(m.photo_url), alt: "稳定帧" })
       );
       const card = h("div", { class: "card" }, [
         kv("箱号", m.cage_id),
@@ -2807,7 +2878,7 @@
           ]),
           h("div", { style: "text-align:center;padding:10px 0" }, [
             h("img", {
-              src: `/api/boxes/${encodeURIComponent(cage)}/qr.svg`,
+              src: apiUrl(`/api/boxes/${encodeURIComponent(cage)}/qr.svg`),
               alt: "二维码",
               style: "width:200px;height:200px",
             }),
@@ -2834,6 +2905,15 @@
     const screen = h("div", { class: "screen" });
     screen.appendChild(appbar("设置", { back: "/" }));
     const projInput = h("input", { value: state.projectId, maxlength: "64" });
+    // 数据同步状态：outbox 待同步条数（本地累积、联网自动补传）+ 服务器地址。
+    // 打包 app 显示 MV_CONFIG.apiBase；服务器托管 H5 无 MV_CONFIG → 同源。
+    const pendingSync = (typeof reportOutbox.pending === "function") ? reportOutbox.pending() : 0;
+    let serverText = "同源";
+    try {
+      if (window.MV_CONFIG && typeof window.MV_CONFIG === "object" && window.MV_CONFIG.apiBase) {
+        serverText = window.MV_CONFIG.apiBase;
+      }
+    } catch (_) {}
     screen.appendChild(
       h("div", { class: "content" }, [
         h("div", { class: "card" }, [
@@ -2849,8 +2929,23 @@
           }, "保存"),
         ]),
         h("div", { class: "card" }, [
+          h("div", { class: "li-sub" }, "数据同步"),
+          h("div", { class: "kv" }, [
+            h("span", { class: "k" }, "待同步"),
+            h("span", { class: "v" }, `${pendingSync} 条`),
+          ]),
+          h("div", { class: "kv" }, [
+            h("span", { class: "k" }, "服务器"),
+            h("span", { class: "v" }, serverText),
+          ]),
+          DEV_MODE
+            ? h("div", { class: "li-sub", style: "margin-top:8px" },
+              "DEV 模式：本次会话采集天平读数时间序列，随记录上报")
+            : null,
+        ]),
+        h("div", { class: "card" }, [
           h("div", { class: "li-sub" }, "管理端"),
-          h("button", { class: "btn ghost", onClick: () => (location.href = "/?intent=manage") }, "打开管理端"),
+          h("button", { class: "btn ghost", onClick: () => (location.href = apiUrl("/?intent=manage")) }, "打开管理端"),
         ]),
       ])
     );
