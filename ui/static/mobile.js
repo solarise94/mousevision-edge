@@ -16,6 +16,10 @@
     || (function () { try { return sessionStorage.getItem("mv.devMode") === "1"; } catch (_) { return false; } })();
   if (DEV_MODE) { try { sessionStorage.setItem("mv.devMode", "1"); } catch (_) {} }
 
+  /* 公众版「纯本地」判定：config.js 注入 MV_CONFIG.edition === "local"。
+   * 云版（无 edition 或 "cloud"）行为与现状完全一致——本地数据层仅在本版生效。 */
+  var IS_LOCAL_EDITION = !!(window.MV_CONFIG && window.MV_CONFIG.edition === "local");
+
   /* ------------------------------------------------------------------ *
    * 状态 (design §7.5)
    * ------------------------------------------------------------------ */
@@ -388,8 +392,93 @@
     return !err || typeof err.status === "undefined";
   }
 
-  const api = {
-    async json(url, opts) {
+  /* 本地版数据后端：LocalStore 实例（仅 local edition 创建）。同步方法由
+   * Promise.resolve/reject 包装，保持 api 调用方 await 语义与错误形状一致。 */
+  const localStore = (function () {
+    if (!IS_LOCAL_EDITION) return null;
+    try {
+      return window.LocalStore.create({ idbFactory: window.indexedDB });
+    } catch (_) { return null; }
+  })();
+  // 本地版占位错误：jobs 相关 API 本地版用不到（viewRecord 已不走 legacy 流程）
+  function localUnsupported() {
+    const e = new Error("本地版无此功能");
+    e.status = 400;
+    return e;
+  }
+
+  /* 构建数据层 API。store 为 null → 纯云版（走 json 网络请求）；
+   * 非 null（本地版 LocalStore）→ 六个数据方法路由到本机存储（同步包 Promise），
+   * jobs 相关路由到 reject({status:400})。json 为网络请求实现（api.json 兼容）。
+   * 抽成纯函数便于单测注入 store / json。 */
+  function makeApiRoutes(store, json) {
+    return {
+      recentBoxes: () => {
+        if (store) {
+          try { return Promise.resolve(store.recentBoxes(6)); }
+          catch (e) { return Promise.reject(e); }
+        }
+        return json("/api/boxes/recent?limit=6");
+      },
+      boxes: (strain) => {
+        if (store) {
+          try {
+            const data = store.listBoxes();
+            const items = strain ? data.items.filter((b) => b.strain === strain) : data.items;
+            return Promise.resolve({ items: items });
+          } catch (e) { return Promise.reject(e); }
+        }
+        return json("/api/boxes" + (strain ? `?strain=${encodeURIComponent(strain)}` : "")).then((data) => {
+          (data && Array.isArray(data.items) ? data.items : []).forEach(writeBoxCacheEntry);
+          return data;
+        });
+      },
+      box: (cage) => {
+        if (store) {
+          try { return Promise.resolve(store.getBox(cage)); }
+          catch (e) { return Promise.reject(e); }
+        }
+        return json(`/api/boxes/${encodeURIComponent(cage)}`).then(cacheBoxResult);
+      },
+      boxRecords: (cage) => {
+        if (store) {
+          try { return Promise.resolve(store.boxRecords(cage)); }
+          catch (e) { return Promise.reject(e); }
+        }
+        return json(`/api/boxes/${encodeURIComponent(cage)}/records`);
+      },
+      createBox: (payload) => {
+        if (store) {
+          try { return Promise.resolve(store.createBox(payload)); }
+          catch (e) { return Promise.reject(e); }
+        }
+        return json("/api/boxes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      },
+      record: (id) => {
+        if (store) {
+          try { return Promise.resolve(store.getRecord(id)); }
+          catch (e) { return Promise.reject(e); }
+        }
+        return json(`/api/records/${encodeURIComponent(id)}`);
+      },
+      job: (id) => store
+        ? Promise.reject(localUnsupported())
+        : json(`/api/jobs/${encodeURIComponent(id)}`),
+      jobWait: (id) => store
+        ? Promise.reject(localUnsupported())
+        : json(`/api/jobs/${encodeURIComponent(id)}/wait`),
+      jobReport: (id) => store
+        ? Promise.reject(localUnsupported())
+        : json(`/api/jobs/${encodeURIComponent(id)}/report`),
+    };
+  }
+
+  const api = (function () {
+    const json = async function (url, opts) {
       const res = await apiFetch(url, opts);
       if (!res.ok) {
         let detail = `HTTP ${res.status}`;
@@ -402,26 +491,9 @@
         throw err;
       }
       return res.json();
-    },
-    recentBoxes: () => api.json("/api/boxes/recent?limit=6"),
-    boxes: (strain) =>
-      api.json("/api/boxes" + (strain ? `?strain=${encodeURIComponent(strain)}` : "")).then((data) => {
-        (data && Array.isArray(data.items) ? data.items : []).forEach(writeBoxCacheEntry);
-        return data;
-      }),
-    box: (cage) => api.json(`/api/boxes/${encodeURIComponent(cage)}`).then(cacheBoxResult),
-    boxRecords: (cage) => api.json(`/api/boxes/${encodeURIComponent(cage)}/records`),
-    createBox: (payload) =>
-      api.json("/api/boxes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }),
-    record: (id) => api.json(`/api/records/${encodeURIComponent(id)}`),
-    job: (id) => api.json(`/api/jobs/${encodeURIComponent(id)}`),
-    jobWait: (id) => api.json(`/api/jobs/${encodeURIComponent(id)}/wait`),
-    jobReport: (id) => api.json(`/api/jobs/${encodeURIComponent(id)}/report`),
-  };
+    };
+    return makeApiRoutes(localStore, json);
+  })();
 
   /* ------------------------------------------------------------------ *
    * DOM 助手
@@ -483,6 +555,21 @@
   }
 
   function showQr(cage) {
+    // 本地版无二维码图片（数据仅保存在本机），显示占位说明。
+    const body = IS_LOCAL_EDITION
+      ? [
+          h("div", { class: "card-title" }, cage),
+          h("div", { class: "li-sub", style: "padding:48px 0;text-align:center" }, "本地版无二维码（数据仅保存在本机）"),
+        ]
+      : [
+          h("div", { class: "card-title" }, cage),
+          h("img", {
+            src: apiUrl(`/api/boxes/${encodeURIComponent(cage)}/qr.svg`),
+            alt: "二维码",
+            style: "width:220px;height:220px",
+          }),
+          h("p", { class: "li-sub" }, "扫此码选箱录制 · 点击空白处关闭"),
+        ];
     const overlay = h(
       "div",
       {
@@ -491,15 +578,7 @@
         onClick: () => overlay.remove(),
       },
       [
-        h("div", { class: "card", style: "text-align:center;max-width:320px;width:100%" }, [
-          h("div", { class: "card-title" }, cage),
-          h("img", {
-            src: apiUrl(`/api/boxes/${encodeURIComponent(cage)}/qr.svg`),
-            alt: "二维码",
-            style: "width:220px;height:220px",
-          }),
-          h("p", { class: "li-sub" }, "扫此码选箱录制 · 点击空白处关闭"),
-        ]),
+        h("div", { class: "card", style: "text-align:center;max-width:320px;width:100%" }, body),
       ]
     );
     document.body.appendChild(overlay);
@@ -1675,6 +1754,10 @@
     let finished = false;             // 完成本箱已触发
     let abandoned = false;            // 离开页面（非完成）→ 不上报
 
+    // 本地版照片：accept/手动录入成功时从相机预览抓帧，record_id → dataURL。
+    // 仅 local edition 使用；云版零开销（map 为空、不抓帧）。
+    const photoByRecordId = {};
+
     // Pixel-exact 9:16 layout within the host (excludes bottom dock chrome).
     function layoutViewport() {
       const sw = viewportHost.clientWidth;
@@ -2005,6 +2088,27 @@
       scaleMeta.hidden = false;
     }
 
+    /* 本地版照片抓帧：从相机预览 <video> 抽一帧转 JPEG dataURL。
+     * 画布/帧未就绪或抓取失败 → 返回 null（不阻断记录流程）。仅 local edition 调用。 */
+    function capturePhoto() {
+      try {
+        if (!video || typeof video.videoWidth !== "number" || video.videoWidth === 0) return null;
+        if (video.readyState < 2) return null;
+        const w = video.videoWidth;
+        const h = video.videoHeight;
+        if (!w || !h) return null;
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        const cc = c.getContext("2d", { alpha: false });
+        if (!cc) return null;
+        cc.drawImage(video, 0, 0, w, h);
+        return c.toDataURL("image/jpeg", 0.75);
+      } catch (_) {
+        return null;
+      }
+    }
+
     function showScaleStaleHint(stale) {
       if (!stale) return;
       setQualityHints(["天平广播中断"]);
@@ -2069,6 +2173,18 @@
         if (count > 0) {
           mouseCount.textContent = `已记录 ${count} 只`;
           toast(`已恢复 ${count} 只未完成记录`);
+        }
+        return;
+      }
+      if (type === "recorded") {
+        // 成功录入一只（announce 人工 / post_match 自动 / manual 点按）：
+        // 本地版在此刻从相机预览抓帧存照（云版不抓，零开销）。
+        if (IS_LOCAL_EDITION) {
+          const rec = payload && payload.record;
+          if (rec && rec.record_id) {
+            const p = capturePhoto();
+            if (p) photoByRecordId[String(rec.record_id)] = p;
+          }
         }
         return;
       }
@@ -2199,17 +2315,21 @@
       });
     }
 
-    /* --- 完成本箱：停止录像 → ctrl.finishBox(videoBlob) → outbox 入队 → 上报 UI ---
-     * 视频作为证据随 report 批次走（不再 POST /api/jobs 做 OCR，避免重复计数）。
-     * 上报状态：已上报 N 只 / 待补传 M 批（离线）。 */
+    /* --- 完成本箱：停止录像 → 本地保存（local edition）或 outbox 入队（云版）--- */
     function finishBoxFlow(blob, filename, durationSec, uploadOpts) {
       stopDraw();
       stopStream(stream);
       stream = null;
-      setTitle("上报中");
+      setTitle(IS_LOCAL_EDITION ? "保存中" : "上报中");
 
       // 1) 控制器停止订阅读数（避免 finishBox 后再有 accepted 事件）
       if (ctrl) { try { ctrl.stop(); } catch (_) {} }
+
+      if (IS_LOCAL_EDITION) {
+        finishBoxFlowLocal(blob);
+        return;
+      }
+
       // 2) 累积批次入队 outbox（含视频证据 Blob）→ 返回 {count, batchId}
       //    dev 模式：若控制器采集了读数，附进上报（可序列化、可离线补传）
       let result = null;
@@ -2233,6 +2353,42 @@
         const remaining = reportOutbox.pending();
         updateReportUploadingDone(box, result, sent, remaining, durationSec, enqueueErr);
       });
+    }
+
+    /* 本地版完成本箱：把控制器累积的 records 合并抓帧照片，
+     * 经 LocalStore.saveRecords 落本机 → run_id；有视频 Blob 则 saveVideo 存 IndexedDB。
+     * 全部数据仅保存在本机，不上传服务器。 */
+    async function finishBoxFlowLocal(blob) {
+      let records = [];
+      try {
+        records = (ctrl && typeof ctrl._records === "function") ? ctrl._records() : [];
+      } catch (_) {}
+      // 合并照片（photoByRecordId 以 record_id 索引；无照片的记录保持原样）
+      const recordsWithPhoto = records.map(function (r) {
+        const photo = photoByRecordId[String(r.record_id)];
+        return photo ? Object.assign({}, r, { photo: photo }) : r;
+      });
+      // 本地模式未走 ctrl.finishBox，需手动清草稿，避免下一箱恢复旧记录
+      try { localStorage.removeItem(LocalWeigh._draftKey(box.cageId)); } catch (_) {}
+
+      let runId = null;
+      let saveErr = null;
+      const count = recordsWithPhoto.length;
+      try {
+        const meta = {
+          device_id: scaleConn.selectedDeviceId || "scale01",
+          mode: recordMode,
+        };
+        const res = localStore.saveRecords(box.cageId, recordsWithPhoto, meta);
+        runId = res && res.run_id ? res.run_id : null;
+      } catch (e) {
+        saveErr = e;
+      }
+      // 视频证据保存到 IndexedDB（不阻断：失败仅影响证据缺失）
+      if (runId && blob) {
+        try { await localStore.saveVideo(runId, box.cageId, blob); } catch (_) {}
+      }
+      renderReportLocalDone(box, count, saveErr);
     }
 
     finishBtn.addEventListener("click", function () {
@@ -2415,6 +2571,34 @@
         class: "btn ghost",
         onClick: () => go(`/box/${encodeURIComponent(box.cageId)}`),
       }, "查看本箱记录"),
+      h("button", { class: "btn btn-p", onClick: () => go("/mode") }, "继续录制下一只"),
+    ]);
+    screen.appendChild(content);
+    app.innerHTML = "";
+    mount(screen);
+  }
+
+  /* 本地版完成页：数据仅保存在本机（不上传）。saveErr 时提示保存异常。 */
+  function renderReportLocalDone(box, count, saveErr) {
+    const screen = h("div", { class: "screen" });
+    screen.appendChild(appbar("本箱完成", {}));
+    const card = h("div", { class: "card" }, [
+      h("div", { class: "center-status" }, [
+        h("div", {
+          class: "check-circle",
+          style: saveErr ? "background:var(--orange)" : "background:var(--green)",
+        }, saveErr ? "!" : "✓"),
+        h("strong", {}, saveErr ? "记录保存异常" : "已保存到本机"),
+        h("p", { class: "li-sub" }, `${box.cageId} · 共 ${count} 只`),
+      ]),
+    ]);
+    if (saveErr) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
+        `保存失败：${saveErr.message || saveErr}`));
+    }
+    const content = h("div", { class: "content" }, [
+      card,
+      h("button", { class: "btn ghost", onClick: () => go(`/box/${encodeURIComponent(box.cageId)}`) }, "查看本箱记录"),
       h("button", { class: "btn btn-p", onClick: () => go("/mode") }, "继续录制下一只"),
     ]);
     screen.appendChild(content);
@@ -2637,19 +2821,25 @@
   }
 
   function recordRow(it, pad2) {
-    const ordinal = it.actual_ordinal || it.requested_ordinal;
-    const clickable = it.status === "completed" && it.record_id;
-    const thumb = it.photo_url
+    const ordinal = it.actual_ordinal || it.requested_ordinal || it.ordinal;
+    // 本地版记录无 status（所有本地记录即已接受）；本地字段为 weight_g / recorded_at。
+    const isCompleted = it.status === "completed" || (IS_LOCAL_EDITION && it.record_id);
+    const weight = it.weight != null ? it.weight : it.weight_g;
+    const ts = it.created_at || it.recorded_at || it.timestamp;
+    const clickable = isCompleted && it.record_id;
+    const thumb = it.photo
+      ? h("img", { class: "thumb", src: it.photo, loading: "lazy" })
+      : it.photo_url
       ? h("img", { class: "thumb", src: apiUrl(it.photo_url) + "?size=thumb", loading: "lazy" })
       : h("div", { class: "thumb placeholder" }, "🐭");
     const title =
-      it.status === "completed" && it.weight != null
-        ? h("div", { class: "li-weight" }, `${Number(it.weight).toFixed(2)} g`)
+      isCompleted && weight != null
+        ? h("div", { class: "li-weight" }, `${Number(weight).toFixed(2)} g`)
         : h("div", { class: "li-title" }, `第 ${pad(ordinal, pad2)} 只`);
     const subParts = [];
-    if (it.status === "completed" && it.record_id)
-      subParts.push(`第 ${pad(ordinal, pad2)} 只 · ${fmtTime(it.created_at)}`);
-    else subParts.push(fmtTime(it.created_at));
+    if (isCompleted && it.record_id)
+      subParts.push(`第 ${pad(ordinal, pad2)} 只 · ${fmtTime(ts)}`);
+    else subParts.push(fmtTime(ts));
     const main = h("div", { class: "li-main" }, [
       title,
       h("div", { class: "li-sub" }, subParts.join("")),
@@ -2669,7 +2859,7 @@
         class: "list-item",
         onClick: clickable ? () => go(`/mouse/${encodeURIComponent(it.record_id)}`) : null,
       },
-      [thumb, main, badge(it.status)]
+      [thumb, main, isCompleted ? badge("completed") : badge(it.status)]
     );
   }
 
@@ -2687,15 +2877,20 @@
     try {
       const m = await api.record(id);
       content.innerHTML = "";
+      const mediaSrc = m.photo || (m.photo_url ? apiUrl(m.photo_url) : null);
       content.appendChild(
-        h("img", { class: "detail-media", src: apiUrl(m.photo_url), alt: "稳定帧" })
+        mediaSrc
+          ? h("img", { class: "detail-media", src: mediaSrc, alt: "稳定帧" })
+          : h("div", { class: "detail-media placeholder", style: "display:flex;align-items:center;justify-content:center" }, "无照片")
       );
+      const weight = m.weight != null ? m.weight : m.weight_g;
+      const ts = m.timestamp || m.recorded_at || m.created_at;
       const card = h("div", { class: "card" }, [
         kv("箱号", m.cage_id),
         kv("小鼠编号", `第 ${pad(m.actual_ordinal || m.ordinal, 2)} 只`),
-        kv("体重", m.weight != null ? `${Number(m.weight).toFixed(2)} g` : "-"),
-        kv("称重时间", fmtTime(m.timestamp)),
-        kv("分析状态", "已完成"),
+        kv("体重", weight != null ? `${Number(weight).toFixed(2)} g` : "-"),
+        kv("称重时间", fmtTime(ts)),
+        kv("分析状态", IS_LOCAL_EDITION ? "已保存到本机" : "已完成"),
         kv("置信度", m.confidence != null ? Number(m.confidence).toFixed(3) : "-"),
       ]);
       content.appendChild(card);
@@ -2877,11 +3072,13 @@
             h("p", { class: "li-sub" }, "扫此码即可选箱录制，可打印贴在箱上"),
           ]),
           h("div", { style: "text-align:center;padding:10px 0" }, [
-            h("img", {
-              src: apiUrl(`/api/boxes/${encodeURIComponent(cage)}/qr.svg`),
-              alt: "二维码",
-              style: "width:200px;height:200px",
-            }),
+            IS_LOCAL_EDITION
+              ? h("div", { class: "li-sub", style: "padding:40px 0" }, "本地版无二维码（数据仅保存在本机）")
+              : h("img", {
+                  src: apiUrl(`/api/boxes/${encodeURIComponent(cage)}/qr.svg`),
+                  alt: "二维码",
+                  style: "width:200px;height:200px",
+                }),
           ]),
         ]),
         h("button", {
@@ -2928,21 +3125,29 @@
             },
           }, "保存"),
         ]),
-        h("div", { class: "card" }, [
-          h("div", { class: "li-sub" }, "数据同步"),
-          h("div", { class: "kv" }, [
-            h("span", { class: "k" }, "待同步"),
-            h("span", { class: "v" }, `${pendingSync} 条`),
-          ]),
-          h("div", { class: "kv" }, [
-            h("span", { class: "k" }, "服务器"),
-            h("span", { class: "v" }, serverText),
-          ]),
-          DEV_MODE
-            ? h("div", { class: "li-sub", style: "margin-top:8px" },
-              "DEV 模式：本次会话采集天平读数时间序列，随记录上报")
-            : null,
-        ]),
+        h("div", { class: "card" }, IS_LOCAL_EDITION
+          ? [
+              h("div", { class: "li-sub" }, "数据同步"),
+              h("div", { class: "kv" }, [
+                h("span", { class: "k" }, "存储"),
+                h("span", { class: "v" }, "数据仅保存在本机"),
+              ]),
+            ]
+          : [
+              h("div", { class: "li-sub" }, "数据同步"),
+              h("div", { class: "kv" }, [
+                h("span", { class: "k" }, "待同步"),
+                h("span", { class: "v" }, `${pendingSync} 条`),
+              ]),
+              h("div", { class: "kv" }, [
+                h("span", { class: "k" }, "服务器"),
+                h("span", { class: "v" }, serverText),
+              ]),
+              DEV_MODE
+                ? h("div", { class: "li-sub", style: "margin-top:8px" },
+                  "DEV 模式：本次会话采集天平读数时间序列，随记录上报")
+                : null,
+            ]),
         h("div", { class: "card" }, [
           h("div", { class: "li-sub" }, "管理端"),
           h("button", { class: "btn ghost", onClick: () => (location.href = apiUrl("/?intent=manage")) }, "打开管理端"),
@@ -2965,6 +3170,13 @@
   route("/manage", viewManage);
   route("/manage/new", viewBoxNew);
   route("/settings", viewSettings);
+
+  // 测试钩子：暴露 edition 判定与 api 构建工厂，供 tests/h5 提取注入验证。
+  try {
+    if (typeof window !== "undefined") {
+      window.__MV_DEBUG = { IS_LOCAL_EDITION, makeApiRoutes };
+    }
+  } catch (_) {}
 
   render();
 })();
