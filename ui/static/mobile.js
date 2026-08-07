@@ -3095,6 +3095,165 @@
     mount(screen);
   }
 
+  /* ------------------------------------------------------------------ *
+   * 导出（本地版）。纯函数挂到 __MV_DEBUG 供 tests/h5 提取注入验证。
+   * CSV 列顺序：
+   *   cage_id, project_id, strain, ordinal, weight_g, recorded_at,
+   *   weight_source, record_id, run_id, created_at
+   * 前 3 列来自箱子元数据（project_id/strain），其余来自记录本身；
+   * run_id 用于关联 app 内的视频证据（视频本体不导出，见导出区小字）。
+   * ------------------------------------------------------------------ */
+  const CSV_HEADERS = ["cage_id", "project_id", "strain", "ordinal", "weight_g",
+    "recorded_at", "weight_source", "record_id", "run_id", "created_at"];
+  const EXPORT_FORMAT = "miceautomatic-export-v1";
+
+  /* RFC4180 转义：含逗号/引号/换行 → 用引号包裹，内部引号翻倍。 */
+  function csvEscape(v) {
+    const s = v == null ? "" : String(v);
+    if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+
+  /* 遍历 exportAll() 数据，返回带 UTF-8 BOM 的 CSV 字符串。
+   * data 形状 = LocalStore.exportAll() = {boxes, recordsByCage, exportedAt}。
+   * 无记录时仅返回表头（BOM+表头），由调用方做「空数据」拦截。 */
+  function buildExportCsv(data) {
+    data = data || {};
+    const boxMap = {};
+    (data.boxes || []).forEach((b) => { if (b && b.cage_id != null) boxMap[b.cage_id] = b; });
+    const lines = [CSV_HEADERS.join(",")];
+    const rbc = data.recordsByCage || {};
+    for (const cage in rbc) {
+      if (!Object.prototype.hasOwnProperty.call(rbc, cage)) continue;
+      const box = boxMap[cage] || {};
+      (rbc[cage] || []).forEach((r) => {
+        r = r || {};
+        const row = [
+          cage,
+          box.project_id != null ? box.project_id : "",
+          box.strain != null ? box.strain : "",
+          r.ordinal,
+          r.weight_g,
+          r.recorded_at,
+          r.weight_source,
+          r.record_id,
+          r.run_id,
+          r.created_at,
+        ];
+        lines.push(row.map(csvEscape).join(","));
+      });
+    }
+    return "\ufeff" + lines.join("\n") + "\n";
+  }
+
+  /* JSON 导出：exportAll() 原样 + format 版本字段。照片 dataURL 已在记录里。 */
+  function buildExportJson(data) {
+    data = data || {};
+    const out = Object.assign({}, data);
+    out.format = EXPORT_FORMAT;
+    return JSON.stringify(out);
+  }
+
+  /* 记录总数（空数据判定用）。 */
+  function countRecords(data) {
+    data = data || {};
+    const rbc = data.recordsByCage || {};
+    let n = 0;
+    for (const k in rbc) {
+      if (Object.prototype.hasOwnProperty.call(rbc, k)) n += (rbc[k] || []).length;
+    }
+    return n;
+  }
+
+  /* 字符串 → UTF-8 字节数组（TextEncoder 优先）。 */
+  function utf8Encode(str) {
+    if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(str);
+    // 兜底：encodeURIComponent 产生 UTF-8 百分号序列再还原字节
+    const esc = encodeURIComponent(str);
+    const bytes = new Uint8Array(esc.length);
+    let n = 0;
+    for (let i = 0; i < esc.length; i++) {
+      const c = esc.charCodeAt(i);
+      if (c === 37) { // '%'
+        bytes[n++] = parseInt(esc.slice(i + 1, i + 3), 16);
+        i += 2;
+      } else {
+        bytes[n++] = c;
+      }
+    }
+    return bytes.subarray(0, n);
+  }
+
+  /* 字节数组 → base64（纯实现，测试无需浏览器全局）。 */
+  function base64FromBytes(bytes) {
+    const ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+      const b0 = bytes[i];
+      const b1 = i + 1 < bytes.length ? bytes[i + 1] : NaN;
+      const b2 = i + 2 < bytes.length ? bytes[i + 2] : NaN;
+      out += ALPHA[b0 >> 2];
+      out += ALPHA[((b0 & 3) << 4) | (isNaN(b1) ? 0 : b1 >> 4)];
+      out += isNaN(b1) ? "=" : ALPHA[((b1 & 15) << 2) | (isNaN(b2) ? 0 : b2 >> 6)];
+      out += isNaN(b2) ? "=" : ALPHA[b2 & 63];
+    }
+    return out;
+  }
+
+  /* UTF-8 感知的 base64：中文等非 latin1 字符先转 UTF-8 再编码。
+   * 浏览器走 btoa，测试/无 btoa 环境走纯实现，两者结果一致。 */
+  function utf8ToBase64(str) {
+    const bytes = utf8Encode(str);
+    if (typeof btoa === "function") {
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    }
+    return base64FromBytes(bytes);
+  }
+
+  /* 导出文件名：小鼠称重_YYYYMMDD_HHmm.<ext>（ext 不带点，如 "csv"）。 */
+  function exportFilename(ext) {
+    const d = new Date();
+    const p = (n) => (n < 10 ? "0" : "") + n;
+    return "小鼠称重_" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
+      "_" + p(d.getHours()) + p(d.getMinutes()) + "." + ext;
+  }
+
+  /* 保存链路：内容 → base64 → 原生桥 saveToDownloads 写 Download/小鼠称重/；
+   * 无原生桥（浏览器调试）→ anchor download（blob URL）。失败抛错由调用方 toast。 */
+  function writeExportFile({ filename, mimeType, content }) {
+    const b64 = utf8ToBase64(content);
+    const bridge = (typeof window !== "undefined") ? window.MiceAutomaticScale : null;
+    if (bridge && typeof bridge.saveToDownloads === "function") {
+      const json = bridge.saveToDownloads(filename, b64, mimeType);
+      let res = null;
+      try { res = json ? JSON.parse(json) : null; } catch (_) {}
+      if (res && res.ok) return `已导出到 下载/小鼠称重/${res.displayName || filename}`;
+      throw new Error((res && res.error) || "导出失败（原生桥返回异常）");
+    }
+    // 浏览器回退：blob URL + a.click()，自动释放。
+    const blob = new Blob([content], { type: mimeType + ";charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return `已导出 ${filename}`;
+  }
+
+  /* 导出动作入口：data = exportAll() 结果；kind = "csv" | "json"。 */
+  function runLocalExport(data, kind) {
+    if (!countRecords(data)) throw new Error("暂无数据");
+    if (kind === "json") {
+      return writeExportFile({ filename: exportFilename("json"), mimeType: "application/json", content: buildExportJson(data) });
+    }
+    return writeExportFile({ filename: exportFilename("csv"), mimeType: "text/csv", content: buildExportCsv(data) });
+  }
+
   /* ================================================================== *
    * 视图：设置
    * ================================================================== */
@@ -3111,6 +3270,20 @@
         serverText = window.MV_CONFIG.apiBase;
       }
     } catch (_) {}
+    // 本地版：导出所需的记录总数（空数据 → 导出按钮禁用）。
+    let localRecordCount = 0;
+    try {
+      if (IS_LOCAL_EDITION && window.LocalStore) localRecordCount = countRecords(window.LocalStore.exportAll());
+    } catch (_) {}
+    // 本地版：导出动作。运行于当前页进程，生成内容并写入下载目录。
+    function handleLocalExport(kind) {
+      try {
+        const msg = runLocalExport(window.LocalStore.exportAll(), kind);
+        toast(msg);
+      } catch (err) {
+        toast((err && err.message) || "导出失败");
+      }
+    }
     screen.appendChild(
       h("div", { class: "content" }, [
         h("div", { class: "card" }, [
@@ -3127,11 +3300,27 @@
         ]),
         h("div", { class: "card" }, IS_LOCAL_EDITION
           ? [
-              h("div", { class: "li-sub" }, "数据同步"),
+              h("div", { class: "li-sub" }, "数据"),
               h("div", { class: "kv" }, [
                 h("span", { class: "k" }, "存储"),
                 h("span", { class: "v" }, "数据仅保存在本机"),
               ]),
+              h("div", { class: "kv" }, [
+                h("span", { class: "k" }, "记录数"),
+                h("span", { class: "v" }, `${localRecordCount} 条`),
+              ]),
+              h("div", { class: "li-sub", style: "margin-top:12px" }, "导出数据"),
+              h("button", {
+                class: "btn primary",
+                disabled: localRecordCount === 0,
+                onClick: () => handleLocalExport("csv"),
+              }, "导出 CSV"),
+              h("button", {
+                class: "btn outline",
+                disabled: localRecordCount === 0,
+                onClick: () => handleLocalExport("json"),
+              }, "导出 JSON（含照片）"),
+              h("p", { class: "export-note" }, "视频证据保留在 app 内，暂不支持导出"),
             ]
           : [
               h("div", { class: "li-sub" }, "数据同步"),
@@ -3174,7 +3363,17 @@
   // 测试钩子：暴露 edition 判定与 api 构建工厂，供 tests/h5 提取注入验证。
   try {
     if (typeof window !== "undefined") {
-      window.__MV_DEBUG = { IS_LOCAL_EDITION, makeApiRoutes };
+      window.__MV_DEBUG = {
+        IS_LOCAL_EDITION,
+        makeApiRoutes,
+        buildExportCsv,
+        buildExportJson,
+        exportFilename,
+        utf8ToBase64,
+        countRecords,
+        csvEscape,
+        CSV_HEADERS,
+      };
     }
   } catch (_) {}
 
