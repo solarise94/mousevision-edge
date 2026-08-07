@@ -39,6 +39,9 @@
   // 读数范围（K797 量程，与 weigh-engine.js / scale-bridge.js 一致）
   var MAX_GRAMS = 6553.5;
 
+  // manual 模式：读数超过该时长视为 stale（人眼判定后点按钮录入，期间读数应保持新鲜）
+  var MANUAL_STALE_MS = 2500;
+
   // engine tick 周期（处理 wait_clear 超时等无新读数也要推进的情况）
   var DEFAULT_TICK_MS = 150;
 
@@ -140,9 +143,12 @@
       throw new Error("createController: box.cageId 必填");
     }
 
-    var scaleChannel = (mode === "manual") ? null : opts.scaleChannel;
-    if (mode !== "manual" && (!scaleChannel || typeof scaleChannel.onReading !== "function")) {
-      throw new Error("createController: scaleChannel.onReading 缺失（announce/post_match 需注入 BLE 通道）");
+    // 所有模式现在都连天平：
+    //   - announce/post_match：建引擎、自动判定
+    //   - manual：只订阅读数，人眼判定稳定后点按钮录入（不建引擎、不做自动判定）
+    var scaleChannel = opts.scaleChannel;
+    if (!scaleChannel || typeof scaleChannel.onReading !== "function") {
+      throw new Error("createController: scaleChannel.onReading 缺失（所有模式均需注入 BLE 通道）");
     }
 
     var deviceId = opts.deviceId || "scale01";
@@ -183,6 +189,8 @@
     var records = [];
     // 当前直读克数（最近一次 BLE 读数；manual 模式为 null）
     var lastGrams = null;
+    // 最近一次完整读数对象（manual 模式 submitManual 用，{grams, receivedAtEpochMs}）
+    var lastReading = null;
     // engine 当前状态字符串（manual 模式恒 "manual"）
     var engineState = mode === "manual" ? "manual" : "calibrating";
     // 当前候选重量（announced 态的播报克数；其它态为 null）
@@ -309,6 +317,13 @@
     function handleReading(reading) {
       if (!readingListenerActive) return;
       lastGrams = (reading && typeof reading.grams === "number") ? reading.grams : lastGrams;
+      // 维护最近一次完整读数（manual 模式 submitManual 读 lastReading.grams/receivedAtEpochMs）
+      if (reading && typeof reading.grams === "number" && isFinite(reading.grams)) {
+        lastReading = {
+          grams: reading.grams,
+          receivedAtEpochMs: (typeof reading.receivedAtEpochMs === "number") ? reading.receivedAtEpochMs : now(),
+        };
+      }
       // 直读显示：每次有效读数都向 UI 发 'weight' {grams}
       if (reading && typeof reading.grams === "number" && isFinite(reading.grams)) {
         emit("weight", { grams: reading.grams });
@@ -363,6 +378,11 @@
         emit("draft_resumed", { count: records.length });
       }
 
+      // 订阅通道读数（控制器不负责 channel.start/stop，由 mobile.js 管）。
+      // 所有模式都订阅：announce/post_match 喂引擎，manual 维护 lastReading。
+      readingListenerActive = true;
+      try { scaleChannel.onReading(handleReading); } catch (_) {}
+
       if (mode === "manual") {
         engineState = "manual";
         emit("state", { state: engineState });
@@ -375,11 +395,6 @@
         now: now,
         onEvent: handleEngineEvent,
       });
-      // 订阅通道读数（控制器不负责 channel.start/stop，由 mobile.js 管）
-      readingListenerActive = true;
-      if (scaleChannel) {
-        try { scaleChannel.onReading(handleReading); } catch (_) {}
-      }
       // 启动 tick 定时器（无新读数也要推进：wait_clear 超时等）
       if (setIntervalFn) {
         tickTimer = setIntervalFn(function () {
@@ -428,26 +443,50 @@
     }
 
     /* ================================================================== *
-     * submitManual(weightG)：manual 模式录入，直接生成一条记录（不走引擎）。
-     * 校验有限且 [0, 6553.5]。
-     * 返回生成的 record；非法值返回 null。
+     * submitManual(weightG?)：manual 模式录入——读取当前天平读数（人眼判定
+     * 稳定后点按钮触发），直接生成一条记录（不走引擎）。weight_source 仍为
+     * "manual"（人眼判定、手动触发）。
+     *
+     * 可选 weightG（仅测试注入用，显式指定克数跳过读数判定）；生产调用无参。
+     *
+     * 返回结果对象：
+     *   成功 → { ok:true, record:<record>, weight_g:<g> }
+     *   无读数 / 读数超过 MANUAL_STALE_MS → { ok:false, reason:"stale", record:null }
+     *   grams <= 0 → { ok:false, reason:"zero", record:null }
+     *   非 manual 模式 / 显式注入越界 → { ok:false, reason:"invalid", record:null }
      * ================================================================== */
     function submitManual(weightG) {
-      if (mode !== "manual") return null;
-      if (typeof weightG !== "number" || !isFinite(weightG) || weightG < 0 || weightG > MAX_GRAMS) {
-        return null;
+      if (mode !== "manual") return { ok: false, reason: "invalid", record: null };
+
+      var grams;
+      if (arguments.length > 0 && typeof weightG !== "undefined") {
+        // 显式注入（测试用）：只做范围校验，不查 lastReading/新鲜度
+        if (typeof weightG !== "number" || !isFinite(weightG) || weightG < 0 || weightG > MAX_GRAMS) {
+          return { ok: false, reason: "invalid", record: null };
+        }
+        grams = weightG;
+      } else {
+        // 生产路径：读当前天平读数
+        if (!lastReading) return { ok: false, reason: "stale", record: null };
+        var ageMs = now() - (lastReading.receivedAtEpochMs || 0);
+        if (ageMs > MANUAL_STALE_MS) return { ok: false, reason: "stale", record: null };
+        grams = lastReading.grams;
+        if (!(typeof grams === "number" && isFinite(grams) && grams > 0 && grams <= MAX_GRAMS)) {
+          return { ok: false, reason: "zero", record: null };
+        }
       }
-      var rec = appendRecord(weightG, null);
+
+      var rec = appendRecord(grams, null);
       emit("accepted", {
         ordinal: records.length,
-        weight_g: weightG,
+        weight_g: grams,
         count: records.length,
       });
       emit("recorded", {
         record: rec,
         pendingCount: typeof outbox.pending === "function" ? outbox.pending() : 0,
       });
-      return rec;
+      return { ok: true, record: rec, weight_g: grams };
     }
 
     /* ================================================================== *
@@ -480,6 +519,7 @@
       // 重置当前批次累积（同一控制器实例可继续用于下一箱——但建议每箱 new 一个）
       records = [];
       weightCandidate = null;
+      lastReading = null;
       // dev 采集缓冲也随批次清空（下一箱重新累计）
       readingsBuffer = [];
       return { count: count, batchId: batchId };
@@ -546,5 +586,6 @@
     _draftKey: draftKey,
     _MAX_GRAMS: MAX_GRAMS,
     _DEFAULT_TICK_MS: DEFAULT_TICK_MS,
+    _MANUAL_STALE_MS: MANUAL_STALE_MS,
   };
 });

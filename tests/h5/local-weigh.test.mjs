@@ -258,31 +258,44 @@ test("post_match: engine 'announce' → 自动 accept + 记录生成（不调 sp
 });
 
 /* ------------------------------------------------------------------ */
-/* 3. manual 模式：submitManual → 记录生成 + 写草稿；非法值拒绝 */
+/* 3. manual 模式：天平连 BLE，人眼判定后点按钮录入当前读数。
+/*    submitManual() 无参：读控制器订阅的 lastReading（{grams, receivedAtEpochMs}）。
+/*    stale（无读数 / 超 2.5s）/ zero（grams<=0）/ ok（>0）三态返回。
+/*    保留可选显式 weight 参数用于测试注入。
 /* ------------------------------------------------------------------ */
-test("manual: submitManual(26.3) → 记录生成 + 写草稿", () => {
+test("manual: fake channel 推读数后 submitManual() 捕获当前值 + 写草稿", () => {
   const ec = makeEventCollector();
   const outbox = makeFakeOutbox();
   const storage = makeStorage();
+  const channel = makeFakeChannel();
+  let clock = 5000;
   const ctrl = LW.createController({
     mode: "manual",
     weighEngine: makeFakeEngineModule(),
     buildRecord: RC.buildRecord,
-    scaleChannel: null,
+    scaleChannel: channel,
     outbox,
     box: { cageId: "CM" },
     storage,
-    now: () => 5000,
+    now: () => clock,
     onEvent: ec.onEvent,
   });
   ctrl.start();
 
-  const rec = ctrl.submitManual(26.3);
-  assert.ok(rec, "应返回 record");
-  assert.equal(rec.weight_g, 26.3);
-  assert.equal(rec.ordinal, 1);
-  assert.ok(rec.record_id, "buildRecord 应自动补 record_id");
-  assert.ok(rec.recorded_at, "buildRecord 应自动补 recorded_at");
+  // 推一条读数（人眼看天平稳定后）
+  clock = 5500;
+  channel.feed({ grams: 26.3, raw: 263, sequence: 1, receivedAtEpochMs: 5500 });
+  // 0.3s 后点按钮录入（未超 stale 阈值）
+  clock = 5800;
+  const result = ctrl.submitManual();
+
+  assert.ok(result && result.ok, "应返回 ok:true 结果");
+  assert.ok(result.record, "结果应含 record");
+  assert.equal(result.record.weight_g, 26.3);
+  assert.equal(result.record.ordinal, 1);
+  assert.equal(result.weight_g, 26.3);
+  assert.ok(result.record.record_id, "buildRecord 应自动补 record_id");
+  assert.ok(result.record.recorded_at, "buildRecord 应自动补 recorded_at");
 
   // accepted + recorded 事件
   const acceptedEv = ec.events.find((e) => e.type === "accepted");
@@ -297,35 +310,108 @@ test("manual: submitManual(26.3) → 记录生成 + 写草稿", () => {
   assert.equal(draft.records.length, 1);
   assert.equal(draft.records[0].weight_g, 26.3);
   assert.equal(draft.mode, "manual");
+  // weight_source 保持 "manual"（人眼判定、手动触发）
+  assert.equal(draft.records[0].weight_source, undefined, "record 不带 weight_source（batch 级字段）");
 
   assert.equal(ctrl.getState().mouseCount, 1);
   assert.equal(ctrl.getState().state, "manual");
+  assert.equal(ctrl.getState().lastGrams, 26.3);
 });
 
-test("manual: 非法值拒绝（NaN / -1 / 超界）", () => {
+test("manual: stale 拒绝（无读数 / 读数超 2.5s）", () => {
+  const outbox = makeFakeOutbox();
+  const channel = makeFakeChannel();
+  let clock = 0;
   const ctrl = LW.createController({
     mode: "manual",
     weighEngine: makeFakeEngineModule(),
     buildRecord: RC.buildRecord,
-    scaleChannel: null,
-    outbox: makeFakeOutbox(),
+    scaleChannel: channel,
+    outbox,
+    box: { cageId: "CM" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+  });
+  ctrl.start();
+
+  // 1) 无读数 → stale
+  clock = 1000;
+  let r = ctrl.submitManual();
+  assert.ok(r && !r.ok && r.reason === "stale", "无读数应 reason:stale");
+  assert.equal(r.record, null);
+
+  // 2) 推读数，但超过阈值才录入 → stale
+  clock = 2000;
+  channel.feed({ grams: 20.0, raw: 200, sequence: 1, receivedAtEpochMs: 2000 });
+  clock = 2000 + LW._MANUAL_STALE_MS + 1; // 超过 2.5s
+  r = ctrl.submitManual();
+  assert.ok(r && !r.ok && r.reason === "stale", "读数过期应 reason:stale");
+  assert.equal(ctrl.getState().mouseCount, 0, "stale 不应生成记录");
+});
+
+test("manual: zero 拒绝（grams <= 0）", () => {
+  const outbox = makeFakeOutbox();
+  const channel = makeFakeChannel();
+  let clock = 0;
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox,
+    box: { cageId: "CM" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+  });
+  ctrl.start();
+
+  // 推一个 0 读数（空秤）→ grams <= 0 → zero
+  clock = 1000;
+  channel.feed({ grams: 0.0, raw: 0, sequence: 1, receivedAtEpochMs: 1000 });
+  clock = 1100;
+  const r = ctrl.submitManual();
+  assert.ok(r && !r.ok && r.reason === "zero", "grams<=0 应 reason:zero");
+  assert.equal(r.record, null);
+  assert.equal(ctrl.getState().mouseCount, 0, "zero 不应生成记录");
+});
+
+test("manual: 显式注入 weight（测试用）— 范围校验 + 边界", () => {
+  // 显式 weight 参数跳过读数判定，仅做 [0, MAX_GRAMS] 范围校验。
+  const outbox = makeFakeOutbox();
+  const channel = makeFakeChannel();
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox,
     box: { cageId: "CM" },
     storage: makeStorage(),
     now: () => 0,
     onEvent: () => {},
   });
   ctrl.start();
-  assert.equal(ctrl.submitManual(NaN), null);
-  assert.equal(ctrl.submitManual(-1), null);
-  assert.equal(ctrl.submitManual(0 - 0.001), null);
-  assert.equal(ctrl.submitManual(LW._MAX_GRAMS + 0.1), null);
-  assert.equal(ctrl.submitManual("abc"), null); // 非数字
-  assert.equal(ctrl.submitManual(undefined), null);
-  assert.equal(ctrl.submitManual(Infinity), null);
-  // 边界合法
-  assert.ok(ctrl.submitManual(0));
-  assert.ok(ctrl.submitManual(LW._MAX_GRAMS));
+  // 非法注入（NaN/负/超界/非数字/Infinity）→ invalid
+  function reason(v) { const r = ctrl.submitManual(v); return r && r.reason; }
+  assert.equal(reason(NaN), "invalid");
+  assert.equal(reason(-1), "invalid");
+  assert.equal(reason(0 - 0.001), "invalid");
+  assert.equal(reason(LW._MAX_GRAMS + 0.1), "invalid");
+  assert.equal(reason("abc"), "invalid");
+  assert.equal(reason(Infinity), "invalid");
+  // 边界合法（显式注入 0 允许，与读数路径 zero 拒绝语义不同）
+  assert.ok(ctrl.submitManual(0).ok);
+  assert.ok(ctrl.submitManual(LW._MAX_GRAMS).ok);
   assert.equal(ctrl.getState().mouseCount, 2);
+});
+
+test("manual: 构造校验 — 缺 scaleChannel 抛错（manual 也需要天平）", () => {
+  assert.throws(() => LW.createController({
+    mode: "manual", weighEngine: makeFakeEngineModule(), buildRecord: RC.buildRecord,
+    outbox: makeFakeOutbox(), box: { cageId: "X" },
+  }), /scaleChannel/);
 });
 
 /* ------------------------------------------------------------------ */
@@ -464,7 +550,7 @@ test("finishBox: enqueue batch + 草稿清除 + 返回 count", () => {
     mode: "manual",
     weighEngine: makeFakeEngineModule(),
     buildRecord: RC.buildRecord,
-    scaleChannel: null,
+    scaleChannel: makeFakeChannel(),
     outbox,
     box: { cageId: "CF", strain: "Balb" },
     deviceId: "devX",
@@ -474,6 +560,7 @@ test("finishBox: enqueue batch + 草稿清除 + 返回 count", () => {
     onEvent: () => {},
   });
   ctrl.start();
+  // 显式注入重量（测试用，跳过读数判定）
   ctrl.submitManual(10.0);
   ctrl.submitManual(11.0);
 
@@ -599,13 +686,13 @@ test("tick 定时器: start 启动、stop 清除", () => {
   assert.equal(timers._count(), 0, "stop 后定时器应清除");
 });
 
-test("manual 模式不创建 tick 定时器", () => {
+test("manual 模式不创建 tick 定时器（manual 不建引擎）", () => {
   const timers = makeFakeTimers();
   const ctrl = LW.createController({
     mode: "manual",
     weighEngine: makeFakeEngineModule(),
     buildRecord: RC.buildRecord,
-    scaleChannel: null,
+    scaleChannel: makeFakeChannel(),
     outbox: makeFakeOutbox(),
     box: { cageId: "C0" },
     storage: makeStorage(),
@@ -948,7 +1035,7 @@ test("dev 采集: finishBox 无 readings 参数（非 dev 路径）→ enqueue �
     mode: "manual",
     weighEngine: makeFakeEngineModule(),
     buildRecord: RC.buildRecord,
-    scaleChannel: null,
+    scaleChannel: makeFakeChannel(),
     outbox,
     box: { cageId: "CD6" },
     storage: makeStorage(),
@@ -960,4 +1047,56 @@ test("dev 采集: finishBox 无 readings 参数（非 dev 路径）→ enqueue �
   ctrl.finishBox();
   assert.equal(outbox._enqueued.length, 1);
   assert.equal(outbox._enqueued[0].readings, null, "非 dev 路径 enqueue 不带 readings");
+});
+
+/* ------------------------------------------------------------------ */
+/* 9. manual 模式 dev 采集：现在有 channel → collectReadings=true 能采到读数
+/*    （此前 manual 恒返回 null payload，现在应能采到——这是"人眼判定"标注样本）
+/* ------------------------------------------------------------------ */
+test("dev 采集: manual 模式 collectReadings=true → 读数进缓冲 + payload 非空", () => {
+  const channel = makeFakeChannel();
+  let clock = 0;
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "CDM" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+    collectReadings: true,
+  });
+  ctrl.start();
+  // 推两条读数
+  clock = 100; channel.feed({ grams: 23.5, raw: 235, sequence: 1, receivedAtEpochMs: 100 });
+  clock = 250; channel.feed({ grams: 23.6, raw: 236, sequence: 2, receivedAtEpochMs: 250 });
+
+  const payload = ctrl.getReadingsPayload();
+  assert.ok(payload, "manual 模式 collectReadings=true + 有读数 → 应返回 payload");
+  assert.equal(payload.readings.length, 2, "应采到 2 条读数");
+  assert.equal(payload.readings[0].grams, 23.5);
+  assert.equal(payload.readings[1].grams, 23.6);
+});
+
+test("dev 采集: manual 模式 'weight' 直读事件发到 UI（manual 也直显大数字）", () => {
+  const ec = makeEventCollector();
+  const channel = makeFakeChannel();
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "CDM2" },
+    storage: makeStorage(),
+    now: () => 0,
+    onEvent: ec.onEvent,
+  });
+  ctrl.start();
+  channel.feed({ grams: 19.8, raw: 198, sequence: 1, receivedAtEpochMs: 100 });
+  const w = ec.events.find((e) => e.type === "weight");
+  assert.ok(w, "manual 模式也应收到 'weight' 直读事件");
+  assert.equal(w.payload.grams, 19.8);
 });

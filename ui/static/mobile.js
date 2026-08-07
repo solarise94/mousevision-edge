@@ -795,7 +795,7 @@
     // 操作分组列表（开始录制 ›、箱子管理 ›）
     content.appendChild(h("div", { class: "group-title" }, "操作"));
     const opGroup = h("div", { class: "group" }, [
-      // 开始录制：未连接时 label3 置灰但可点（进手动模式）
+      // 开始录制：未连接天平时点击会 toast 并停留（三种模式都需要天平）
       groupNavRow("开始录制", null, () => startRecording(), "home-start-rec"),
       groupNavRow("箱子管理", null, () => go("/manage")),
     ]);
@@ -972,6 +972,11 @@
   }
 
   function startRecording() {
+    // 三种模式现在都需要天平：未连接时直接 toast 并停留，不再放行（含手动）。
+    if (scaleConn.state !== "connected") {
+      toast("请先连接天平");
+      return;
+    }
     if (state.currentBox) go("/mode");
     else go("/scan");
   }
@@ -993,7 +998,7 @@
     const modes = [
       { id: "post_match", label: "后匹配", desc: "连续录像，自动记录每只，事后审核", requireScale: true, icon: "▶" },
       { id: "announce", label: "即时报数", desc: "每只暂停确认重量，语音报数", requireScale: true, icon: "♪" },
-      { id: "manual", label: "手动", desc: "人工输入每只克数，无需天平", requireScale: false, icon: "✎" },
+      { id: "manual", label: "手动", desc: "天平读数稳定后，点击按钮录入", requireScale: true, icon: "✎" },
     ];
     let selectedMode = currentRecordMode();
     const cardsWrap = h("div", { class: "mode-cards" });
@@ -1024,7 +1029,7 @@
     content.appendChild(cardsWrap);
     if (!connected) {
       content.appendChild(h("div", { class: "group-footer mode-footer-note" },
-        "天平未连接：后匹配 / 即时报数需先连接天平；可选择手动模式。"));
+        "天平未连接：请先在首页连接天平。"));
     }
     // 底部固定主按钮
     const startBtn = h("button", { class: "btn btn-p", onClick: () => {
@@ -1387,11 +1392,15 @@
     document.documentElement.classList.add("camera-mode", "record-light");
     const box = state.currentBox;
     // 录制模式与重量来源：必须在所有引用 recordMode/weightSource 的 DOM 构造之前计算
-    // （manualPanel、weightSource 判断等都在下方同步执行，TDZ 要求先声明）。
-    // 纯 app 化：无天平桥时只允许 manual（OCR 视频判定已彻底移除）。
+    // （manualRecordBtn、weightSource 判断等都在下方同步执行，TDZ 要求先声明）。
+    // 三种模式现在都连天平（manual 也是人眼看天平读数后点按钮录入）。
+    //   - weightSource：通道模式（native_ble 用本地 BLE 通道）
+    //   - reportedSource：上报给后端的 weight_source（manual 仍为 "manual"）
     const scaleAvailable = ScaleBridge.detectNativeBridge();
     const recordMode = currentRecordMode();
-    const weightSource = recordMode === "manual" ? "manual" : (scaleAvailable ? "native_ble" : "manual");
+    const weightSource = scaleAvailable ? "native_ble" : "manual";
+    // manual 模式上报来源保持 "manual"（人眼判定、手动触发）；其余模式为 "ble_k797"
+    const reportedSource = recordMode === "manual" ? "manual" : (scaleAvailable ? "ble_k797" : "manual");
     const titleEl = h("h1", {}, `实时称重 · ${box.cageId}`);
     function setTitle(text) { titleEl.textContent = text; }
     const switchCamBtn = h(
@@ -1505,35 +1514,42 @@
       "已记录 0 只"
     );
 
-    // 手动模式：克数输入 + 确认本只（替代 BLE 自动读数）。iOS 输入框风格。
-    const manualInput = h("input", {
-      class: "ios-input manual-weight-input", type: "number", inputmode: "decimal",
-      step: "0.1", min: "0", max: "6553.5", placeholder: "输入克数，如 25.4",
-    });
-    const manualSubmit = h("button", { class: "btn btn-p manual-submit-btn", type: "button" }, "确认本只");
-    const manualPanel = h("div", { class: "manual-panel", hidden: recordMode !== "manual" },
-      [manualInput, manualSubmit]);
+    // 手动模式：天平照常连接，人眼判定读数稳定后点按钮录入当前读数（无键盘输入）。
+    // 按钮文案动态带当前读数（"记录当前重量 · 23.5 g"）；无读数时禁用并显示 "--"。
+    let manualLiveGrams = null; // 最近一次有效 BLE 读数（控制器 'weight' 事件驱动刷新）
+    const manualSubmit = h(
+      "button",
+      { class: "btn btn-p rt-btn-manual", type: "button", hidden: recordMode !== "manual" },
+      "记录当前重量 · --"
+    );
+    manualSubmit.disabled = true;
+    function refreshManualButton() {
+      if (recordMode !== "manual") return;
+      if (typeof manualLiveGrams === "number" && isFinite(manualLiveGrams)) {
+        manualSubmit.textContent = "记录当前重量 · " + Number(manualLiveGrams).toFixed(1) + " g";
+        manualSubmit.disabled = false;
+      } else {
+        manualSubmit.textContent = "记录当前重量 · --";
+        manualSubmit.disabled = true;
+      }
+    }
     manualSubmit.addEventListener("click", () => {
-      const val = parseFloat(manualInput.value);
-      if (!isFinite(val) || val < 0 || val > 6553.5) {
-        toast("请输入有效克数（0 ~ 6553.5）");
+      if (!ctrl) return;
+      // 无参调用：控制器读当前天平读数（新鲜度/零值校验在控制器内完成）。
+      const result = ctrl.submitManual();
+      if (!result || !result.ok) {
+        const reason = result && result.reason;
+        if (reason === "stale") toast("读数中断，请稍候再录");
+        else if (reason === "zero") toast("请先放上小鼠");
+        else toast("记录失败，请重试");
         return;
       }
-      // 纯 app 化：交给本地控制器校验并生成记录（控制器内部发 'accepted' 事件
-      // 驱动 mouseCount/weight 显示）。控制器校验失败（非 manual 模式 / 越界）→ toast。
-      const rec = ctrl && ctrl.submitManual(val);
-      if (rec) {
-        manualInput.value = "";
-      } else {
-        toast("记录失败，请重试");
-      }
-    });
-    manualInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); manualSubmit.click(); }
+      // 成功：控制器内部发 'accepted' 驱动 mouseCount；这里补一个轻量 toast 反馈。
+      toast("第 " + ctrl.getState().mouseCount + " 只：" + Number(result.weight_g).toFixed(1) + " g");
     });
 
     const dockChildren = [stateIndicator, weightDisplay, qualityHints, confirmGuide, actionButtons, mouseCount];
-    if (recordMode === "manual") dockChildren.push(manualPanel);
+    if (recordMode === "manual") dockChildren.push(manualSubmit);
     const dock = h(
       "div",
       { class: "realtime-dock", style: "padding:8px 16px 16px" },
@@ -1889,7 +1905,7 @@
           }
           break;
         case "manual":
-          setQualityHints([]);
+          setQualityHints(["看天平读数稳定后，点「记录当前重量」"]);
           break;
       }
     }
@@ -1940,8 +1956,13 @@
       }
       if (type === "weight") {
         // BLE 直读（每次有效读数）。announced 态保留引擎确认值，不被直读覆盖。
+        // manual 模式同样直读大数字 + 刷新「记录当前重量」按钮文案/可用态。
         if (rtState !== "announced" && rtState !== "accepted") {
           setBleWeightDisplay(payload.grams);
+        }
+        if (recordMode === "manual") {
+          manualLiveGrams = (typeof payload.grams === "number" && isFinite(payload.grams)) ? payload.grams : null;
+          refreshManualButton();
         }
         return;
       }
@@ -2084,21 +2105,21 @@
 
     /* --- 构造本地称重控制器（判定/记录/草稿/outbox 全本地）--- */
     function createLocalController() {
-      // manual 模式无天平通道；announce/post_match 用 startScaleChannel 创建的通道。
-      const channelForCtrl = recordMode === "manual" ? null : scaleChannel;
+      // 三种模式现在都连天平：manual 也是只读订阅读数（人眼判定后点按钮录入）。
+      // 上报来源：manual 仍为 "manual"，announce/post_match 为 "ble_k797"。
       return LocalWeigh.createController({
         mode: recordMode,
         weighEngine: WeighEngine,
         // 真秤实测：放鼠有稳定瞬态，需稳定判定持续满 ~0.8s 真实时间才播报，
         // 否则重量还在爬升/抖动就确认（最小稳定时长门槛，仅 App 运行时设置，
-        // 引擎默认 stable_min_span_ms=0 不变、不影响单测）。
+        // 引擎默认 stable_min_span_ms=0 不变、不影响单测）。manual 不建引擎，配置忽略。
         engineConfig: { stable_min_span_ms: 800 },
-        scaleChannel: channelForCtrl,
+        scaleChannel: scaleChannel,
         outbox: reportOutbox,
         box: { cageId: box.cageId, strain: box.strain },
         deviceId: scaleConn.selectedDeviceId || "scale01",
         projectId: state.projectId,
-        weightSource: weightSource === "native_ble" ? "ble_k797" : weightSource,
+        weightSource: reportedSource,
         storage: localStorage,
         buildRecord: ReportClient.buildRecord,
         // 当前录像相对毫秒（用于 accept 时记 clip_start_ms，供服务端抽帧）
