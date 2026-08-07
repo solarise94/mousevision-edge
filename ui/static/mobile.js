@@ -3337,10 +3337,13 @@
                   "DEV 模式：本次会话采集天平读数时间序列，随记录上报")
                 : null,
             ]),
-        h("div", { class: "card" }, [
-          h("div", { class: "li-sub" }, "管理端"),
-          h("button", { class: "btn ghost", onClick: () => (location.href = apiUrl("/?intent=manage")) }, "打开管理端"),
-        ]),
+        // 本地版无服务器，管理端入口无意义（点开只会到登录页），不渲染。
+        IS_LOCAL_EDITION
+          ? null
+          : h("div", { class: "card" }, [
+            h("div", { class: "li-sub" }, "管理端"),
+            h("button", { class: "btn ghost", onClick: () => (location.href = apiUrl("/?intent=manage")) }, "打开管理端"),
+          ]),
       ])
     );
     mount(screen);
