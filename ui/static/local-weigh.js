@@ -42,6 +42,12 @@
   // manual 模式：读数超过该时长视为 stale（人眼判定后点按钮录入，期间读数应保持新鲜）
   var MANUAL_STALE_MS = 2500;
 
+  // 改进 A：manual 模式"清秤门槛"——成功录入一只后，要求天平读数回落到 ≤该克数
+  // 才允许录入下一只（防止上一只还没拿走/残留重量导致连点生成重复记录）。
+  var MANUAL_CLEAR_THRESHOLD_G = 3;
+  // 改进 A：manual 模式防抖——两次成功录入之间至少间隔该毫秒数（防止抖动/误连点）。
+  var MANUAL_MIN_INTERVAL_MS = 800;
+
   // engine tick 周期（处理 wait_clear 超时等无新读数也要推进的情况）
   var DEFAULT_TICK_MS = 150;
 
@@ -155,6 +161,14 @@
     var projectId = opts.projectId || "default";
     var weightSource = opts.weightSource || DEFAULT_WEIGHT_SOURCE[mode];
 
+    // 起始序号：同一箱"继续录制"时由调用方传入 box.next_ordinal，避免从 1 重号。
+    // 默认 1；强制为整数 ≥1（NaN/<1 回退 1）。草稿恢复时以草稿里的 startOrdinal 为准
+    // （崩溃恢复后续号必须与崩溃前一致，否则恢复的记录与新增记录会错位/重号）。
+    var startOrdinal = 1;
+    if (typeof opts.startOrdinal === "number" && isFinite(opts.startOrdinal) && Math.floor(opts.startOrdinal) === opts.startOrdinal && opts.startOrdinal >= 1) {
+      startOrdinal = opts.startOrdinal;
+    }
+
     // dev 采集：开启后订阅每条天平读数进缓冲，finishBox 时随记录上报。
     // 默认 false（非 dev 模式零开销：不采集、不附字段）。
     var collectReadings = !!opts.collectReadings;
@@ -198,6 +212,13 @@
     // stale 标志
     var stale = false;
 
+    // 改进 A：manual 模式辅助状态——
+    //   manualNeedsClear：成功录入一只后置 true，要求收到 ≤CLEAR_THRESHOLD_G 的有效
+    //     读数才清除（秤已清空、可放下一只）；为 true 时 submitManual 返回 not_cleared。
+    //   manualLastAcceptedAtMs：最近一次成功录入的时钟值，用于 800ms 最小间隔防抖。
+    var manualNeedsClear = false;
+    var manualLastAcceptedAtMs = 0;
+
     // dev 读数采集缓冲（仅 collectReadings=true 时填充）
     // 每条 {t_ms(相对会话开始), grams, raw, sequence, rssi, stable, receivedAtEpochMs}
     var readingsBuffer = [];
@@ -217,6 +238,8 @@
         records: records.slice(),
         startedAt: startedAt,
         realtimeT0: realtimeT0,
+        // 起始序号也随草稿持久化：崩溃恢复后续号必须与崩溃前一致
+        startOrdinal: startOrdinal,
       };
     }
 
@@ -231,7 +254,9 @@
      * 返回生成的 record。
      * ================================================================== */
     function appendRecord(weightG, weightRaw) {
-      var ordinal = records.length + 1;
+      // ordinal = startOrdinal + records.length：同一箱"继续录制"时 startOrdinal 由
+      // 调用方传入（box.next_ordinal），保证后续号续接而非从 1 重号。
+      var ordinal = startOrdinal + records.length;
       var recInput = {
         ordinal: ordinal,
         weight_g: weightG,
@@ -328,6 +353,14 @@
       if (reading && typeof reading.grams === "number" && isFinite(reading.grams)) {
         emit("weight", { grams: reading.grams });
       }
+      // 改进 A：manual 模式清秤门槛——成功录入一只后 manualNeedsClear=true，
+      // 收到 ≤MANUAL_CLEAR_THRESHOLD_G 的有效读数视为"秤已清空、可放下一只"，
+      // 清除该标志（下一次 submitManual 即可录入）。仅 manual 模式生效。
+      if (mode === "manual" && manualNeedsClear &&
+        reading && typeof reading.grams === "number" && isFinite(reading.grams) &&
+        reading.grams <= MANUAL_CLEAR_THRESHOLD_G) {
+        manualNeedsClear = false;
+      }
       // dev 采集：把完整读数时间序列进缓冲（相对会话开始的毫秒时间戳）
       if (readingsCollecting && reading) {
         var recvMs = (typeof reading.receivedAtEpochMs === "number") ? reading.receivedAtEpochMs : now();
@@ -375,6 +408,12 @@
         records = draft.records.slice();
         // realtimeT0 恢复（保留原录制起点）
         if (typeof draft.realtimeT0 === "number") realtimeT0 = draft.realtimeT0;
+        // startOrdinal 以草稿为准：崩溃恢复后续号必须与崩溃前一致，
+        // 否则恢复出的 N 条记录之后会从"当前 startOrdinal + N"继续，
+        // 而恢复的记录的 ordinal 已是历史值，会出现错位/重号。
+        if (typeof draft.startOrdinal === "number" && isFinite(draft.startOrdinal) && Math.floor(draft.startOrdinal) === draft.startOrdinal && draft.startOrdinal >= 1) {
+          startOrdinal = draft.startOrdinal;
+        }
         emit("draft_resumed", { count: records.length });
       }
 
@@ -453,14 +492,21 @@
      *   成功 → { ok:true, record:<record>, weight_g:<g> }
      *   无读数 / 读数超过 MANUAL_STALE_MS → { ok:false, reason:"stale", record:null }
      *   grams <= 0 → { ok:false, reason:"zero", record:null }
+     *   上一只还没清秤（读数仍 > 清秤门槛）→ { ok:false, reason:"not_cleared", record:null }
+     *   距上次成功录入 < 800ms（防抖）→ { ok:false, reason:"too_fast", record:null }
      *   非 manual 模式 / 显式注入越界 → { ok:false, reason:"invalid", record:null }
+     *
+     * 改进 A（清秤门槛 + 防抖）仅在生产路径（无 weightG 注入）生效；显式注入
+     * 跳过这两个门槛，便于测试直接构造记录。manualNeedsClear 由 handleReading
+     * 在收到 ≤MANUAL_CLEAR_THRESHOLD_G 的有效读数时自动清除。
      * ================================================================== */
     function submitManual(weightG) {
       if (mode !== "manual") return { ok: false, reason: "invalid", record: null };
 
+      var injected = arguments.length > 0 && typeof weightG !== "undefined";
       var grams;
-      if (arguments.length > 0 && typeof weightG !== "undefined") {
-        // 显式注入（测试用）：只做范围校验，不查 lastReading/新鲜度
+      if (injected) {
+        // 显式注入（测试用）：只做范围校验，不查 lastReading/新鲜度/清秤/防抖
         if (typeof weightG !== "number" || !isFinite(weightG) || weightG < 0 || weightG > MAX_GRAMS) {
           return { ok: false, reason: "invalid", record: null };
         }
@@ -470,6 +516,14 @@
         if (!lastReading) return { ok: false, reason: "stale", record: null };
         var ageMs = now() - (lastReading.receivedAtEpochMs || 0);
         if (ageMs > MANUAL_STALE_MS) return { ok: false, reason: "stale", record: null };
+        // 改进 A：清秤门槛——上一只录入后要求秤回落到 ≤门槛 才允许录下一只
+        if (manualNeedsClear) {
+          return { ok: false, reason: "not_cleared", record: null };
+        }
+        // 改进 A：防抖——距上次成功录入 < 800ms 拒绝（防误连点）
+        if (manualLastAcceptedAtMs > 0 && (now() - manualLastAcceptedAtMs) < MANUAL_MIN_INTERVAL_MS) {
+          return { ok: false, reason: "too_fast", record: null };
+        }
         grams = lastReading.grams;
         if (!(typeof grams === "number" && isFinite(grams) && grams > 0 && grams <= MAX_GRAMS)) {
           return { ok: false, reason: "zero", record: null };
@@ -477,6 +531,12 @@
       }
 
       var rec = appendRecord(grams, null);
+      // 改进 A：成功录入后置位清秤门槛 + 记录入录时间（防抖基线）。仅在真实读数
+      // 路径（非测试注入）置位——显式注入跳过这两个门槛，便于测试连续构造记录。
+      if (!injected) {
+        manualNeedsClear = true;
+        manualLastAcceptedAtMs = now();
+      }
       emit("accepted", {
         ordinal: records.length,
         weight_g: grams,
@@ -520,6 +580,9 @@
       records = [];
       weightCandidate = null;
       lastReading = null;
+      // 改进 A：manual 辅助状态也随批次重置（下一箱从头开始）
+      manualNeedsClear = false;
+      manualLastAcceptedAtMs = 0;
       // dev 采集缓冲也随批次清空（下一箱重新累计）
       readingsBuffer = [];
       return { count: count, batchId: batchId };
@@ -558,6 +621,8 @@
         mode: mode,
         state: engineState,
         mouseCount: records.length,
+        // 下一只将分配的序号（只读，便于调试/断言"续号正确"）
+        nextOrdinal: startOrdinal + records.length,
         weightCandidate: weightCandidate,
         lastGrams: lastGrams,
         stale: stale,
@@ -587,5 +652,7 @@
     _MAX_GRAMS: MAX_GRAMS,
     _DEFAULT_TICK_MS: DEFAULT_TICK_MS,
     _MANUAL_STALE_MS: MANUAL_STALE_MS,
+    _MANUAL_CLEAR_THRESHOLD_G: MANUAL_CLEAR_THRESHOLD_G,
+    _MANUAL_MIN_INTERVAL_MS: MANUAL_MIN_INTERVAL_MS,
   };
 });

@@ -41,6 +41,17 @@
     sessionStorage.setItem("mv.currentBox", JSON.stringify(box));
     if (box) localStorage.setItem("mv.lastCageId", box.cageId);
   }
+  /* 归一化 nextOrdinal：兼容两种 box 形状——云版 api.box() / 本地 LocalStore box
+   * 用 snake_case 的 next_ordinal；setCurrentBox 存进 state.currentBox 的是
+   * camelCase 的 nextOrdinal。<1 或 NaN 时回退 1。"继续录制"时用作 local-weigh
+   * 控制器的 startOrdinal，避免从 1 重号。 */
+  function normalizeStartOrdinal(box) {
+    if (!box) return 1;
+    var raw = box.next_ordinal != null ? box.next_ordinal : box.nextOrdinal;
+    var n = parseInt(raw, 10);
+    if (!isFinite(n) || n < 1) return 1;
+    return n;
+  }
   loadCurrentBox();
 
   /* ------------------------------------------------------------------ *
@@ -1550,6 +1561,8 @@
         cageId: cage,
         strain: box ? box.strain : "其他",
         mouseNoPad: box ? box.mouse_no_pad : 2,
+        // 续号：云版/缓存 box 带 next_ordinal；缺省回退 1
+        nextOrdinal: normalizeStartOrdinal(box),
       });
       go("/mode");
     }
@@ -1724,12 +1737,14 @@
     }
     manualSubmit.addEventListener("click", () => {
       if (!ctrl) return;
-      // 无参调用：控制器读当前天平读数（新鲜度/零值校验在控制器内完成）。
+      // 无参调用：控制器读当前天平读数（新鲜度/零值/清秤/防抖校验在控制器内完成）。
       const result = ctrl.submitManual();
       if (!result || !result.ok) {
         const reason = result && result.reason;
         if (reason === "stale") toast("读数中断，请稍候再录");
         else if (reason === "zero") toast("请先放上小鼠");
+        else if (reason === "not_cleared") toast("请先取下上一只并清秤");
+        else if (reason === "too_fast") toast("录入过快，请稍候");
         else toast("记录失败，请重试");
         return;
       }
@@ -2332,6 +2347,8 @@
     function createLocalController() {
       // 三种模式现在都连天平：manual 也是只读订阅读数（人眼判定后点按钮录入）。
       // 上报来源：manual 仍为 "manual"，announce/post_match 为 "ble_k797"。
+      // startOrdinal：取 box.nextOrdinal（setCurrentBox 时从 box.next_ordinal 归一化），
+      // "继续录制"时续接历史序号，避免从 1 重号。<1/NaN 时 normalizeStartOrdinal 回退 1。
       return LocalWeigh.createController({
         mode: recordMode,
         weighEngine: WeighEngine,
@@ -2342,6 +2359,7 @@
         scaleChannel: scaleChannel,
         outbox: reportOutbox,
         box: { cageId: box.cageId, strain: box.strain },
+        startOrdinal: normalizeStartOrdinal(box),
         deviceId: scaleConn.selectedDeviceId || "scale01",
         projectId: state.projectId,
         weightSource: reportedSource,
@@ -2391,6 +2409,10 @@
       //    随 outbox 持久化，reload 不丢；上传时 report-client 转成 photos 文件字段）。
       let result = null;
       let enqueueErr = null;
+      // 入队前先记录当前已确认只数：enqueue 抛错时 finishBox 不会返回 count，
+      // 用此兜底让完成页能正确显示"共 N 只"（而非误导性的 0 只）。
+      let recordedBeforeEnqueue = 0;
+      try { recordedBeforeEnqueue = ctrl ? ctrl.getState().mouseCount : 0; } catch (_) {}
       try {
         if (ctrl) { try { attachRecordPhotos(ctrl._records()); } catch (_) {} }
         let readingsPayload = null;
@@ -2400,6 +2422,8 @@
         result = ctrl ? ctrl.finishBox(blob, readingsPayload) : { count: 0, batchId: null };
       } catch (e) {
         enqueueErr = e;
+        // 兜底：enqueue 失败时也给出 count，避免完成页显示"共 0 只"
+        result = { count: recordedBeforeEnqueue, batchId: null };
       }
       // 3) 触发立即补传（在线即发；离线由 outbox 退避重试 / online 事件补传）
       const flushP = reportOutbox.flush().catch(function () {});
@@ -2427,8 +2451,6 @@
       // 复用 attachRecordPhotos——与云版同一段合并逻辑。
       const recordsWithPhoto = records.slice();
       attachRecordPhotos(recordsWithPhoto);
-      // 本地模式未走 ctrl.finishBox，需手动清草稿，避免下一箱恢复旧记录
-      try { localStorage.removeItem(LocalWeigh._draftKey(box.cageId)); } catch (_) {}
 
       let runId = null;
       let saveErr = null;
@@ -2443,9 +2465,19 @@
       } catch (e) {
         saveErr = e;
       }
-      // 视频证据保存到 IndexedDB（不阻断：失败仅影响证据缺失）
+      // Bug 修复：草稿必须在 saveRecords 成功之后才能清。之前在 saveRecords 之前
+      // removeItem，若保存失败则草稿已被删，崩溃/重进会丢全部记录。现在 saveErr
+      // 时保留草稿（下次进录制页 start() 会恢复，记录不丢）。草稿里的 records 不带
+      // photo（photo 是 finishBox 时才合并的），恢复后重新走完成流程即可，可接受。
+      if (!saveErr) {
+        try { localStorage.removeItem(LocalWeigh._draftKey(box.cageId)); } catch (_) {}
+      }
+      // 视频证据保存到 IndexedDB（不阻断：失败仅影响证据缺失，不回滚记录保存）。
+      // 改进：捕获失败状态，传给 renderReportLocalDone 显示一行警告。
+      let videoSaveErr = null;
       if (runId && blob) {
-        try { await localStore.saveVideo(runId, box.cageId, blob); } catch (_) {}
+        try { await localStore.saveVideo(runId, box.cageId, blob); }
+        catch (e) { videoSaveErr = e; }
       }
       // 共享通道：仅当开关开 + 已注入 shareToken + 有记录时，把同一份 records+视频
       // enqueue 到共享 outbox（不持久化视频 Blob，reload 后仅补传记录+照片）。
@@ -2470,7 +2502,7 @@
           shareErr = e;
         }
       }
-      renderReportLocalDone(box, count, saveErr, { shareEnqueued, shareErr });
+      renderReportLocalDone(box, count, saveErr, { shareEnqueued, shareErr, videoSaveErr });
     }
 
     finishBtn.addEventListener("click", function () {
@@ -2593,16 +2625,24 @@
    *   - renderReportUploading：展示"上报中"（含已记录只数 + 待补传批数）
    *   - updateReportUploadingDone：flush 完成后展示"已上报 N 只 / 待补传 M 批"
    * ================================================================== */
-  function reportDoneCard(box, recordedCount, sent, remaining, enqueueErr) {
+  function reportDoneCard(box, recordedCount, sent, remaining, enqueueErr, failInfo) {
+    failInfo = failInfo || {};
+    const deadCount = typeof failInfo.deadCount === "number" ? failInfo.deadCount : 0;
+    const authFailed = !!failInfo.authFailed;
     const hasPending = remaining > 0;
+    // 服务器拒收（死信）或鉴权失败 → 明确的失败提示，不能误显示"已上报"
+    const hasServerFailure = deadCount > 0 || authFailed;
     const titleText = enqueueErr
       ? "本地记录已保存（入队失败）"
-      : (hasPending ? "已记录，等待联网补传" : "本箱已上报");
-    const icon = hasPending || enqueueErr ? "↑" : "✓";
-    const iconBg = hasPending || enqueueErr ? "var(--orange)" : "var(--green)";
+      : (hasServerFailure
+        ? (deadCount > 0 ? "部分记录上传失败" : "上报失败")
+        : (hasPending ? "已记录，等待联网补传" : "本箱已上报"));
+    const icon = (hasPending || enqueueErr || hasServerFailure) ? "↑" : "✓";
+    const iconBg = (hasPending || enqueueErr || hasServerFailure) ? "var(--orange)" : "var(--green)";
     const subParts = [`${box.cageId} · 共 ${recordedCount} 只`];
     if (sent > 0) subParts.push(`已上报 ${sent} 批`);
     if (remaining > 0) subParts.push(`待补传 ${remaining} 批（离线）`);
+    if (deadCount > 0) subParts.push(`${deadCount} 批被服务器拒收`);
     const card = h("div", { class: "card" }, [
       h("div", { class: "center-status" }, [
         h("div", { class: "check-circle", style: `background:${iconBg}` }, icon),
@@ -2612,9 +2652,17 @@
     ]);
     if (enqueueErr) {
       card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
-        `入队异常：${enqueueErr.message || enqueueErr}`));
+        `入队异常：${enqueueErr.message || enqueueErr}（记录已保留在本机，请检查存储后重试）`));
     }
-    if (hasPending) {
+    if (deadCount > 0) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
+        `${deadCount} 条上传失败（服务器拒绝），记录已保留在本机，请检查数据/网络后重试`));
+    }
+    if (authFailed) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
+        "上报失败：令牌失效或无权限，请检查令牌后重试（记录已保留）"));
+    }
+    if (hasPending && !hasServerFailure) {
       card.appendChild(h("p", { class: "li-sub" },
         "联网后自动补传，可在本箱记录中查看结果。"));
     }
@@ -2644,9 +2692,21 @@
   function updateReportUploadingDone(box, finishResult, sent, remaining, durationSec, enqueueErr) {
     const recordedCount = (finishResult && typeof finishResult.count === "number")
       ? finishResult.count : 0;
+    // 暴露失败状态：死信条数（服务器拒收）+ 最近一次 flush 是否鉴权失败。
+    // UI 据此明确显示失败，避免"已上报"误导（token 错误时记录本已永久进死信）。
+    let deadCount = 0;
+    let authFailed = false;
+    try {
+      if (typeof reportOutbox.deadLetters === "function") {
+        deadCount = reportOutbox.deadLetters().length;
+      }
+      if (typeof reportOutbox.lastAuthFailed === "function") {
+        authFailed = !!reportOutbox.lastAuthFailed();
+      }
+    } catch (_) {}
     const screen = h("div", { class: "screen" });
     screen.appendChild(appbar("本箱完成", {}));
-    const card = reportDoneCard(box, recordedCount, sent, remaining, enqueueErr);
+    const card = reportDoneCard(box, recordedCount, sent, remaining, enqueueErr, { deadCount, authFailed });
     const content = h("div", { class: "content" }, [
       card,
       h("button", {
@@ -2661,8 +2721,9 @@
   }
 
   /* 本地版完成页：数据仅保存在本机。saveErr 时提示保存异常。
-   * shareOpts：{shareEnqueued, shareErr}——共享开关开启并成功 enqueue 时，
-   * 追加「共享数据将在联网后上传」提示；enqueue 失败显示异常但本地保存不受影响。 */
+   * shareOpts：{shareEnqueued, shareErr, videoSaveErr}——共享开关开启并成功
+   * enqueue 时，追加「共享数据将在联网后上传」提示；enqueue 失败显示异常但本地
+   * 保存不受影响；videoSaveErr 时追加「视频证据保存失败」警告（记录已保存）。 */
   function renderReportLocalDone(box, count, saveErr, shareOpts) {
     shareOpts = shareOpts || {};
     const screen = h("div", { class: "screen" });
@@ -2679,13 +2740,18 @@
     ]);
     if (saveErr) {
       card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
-        `保存失败：${saveErr.message || saveErr}`));
+        `保存失败：${saveErr.message || saveErr}（草稿已保留，重进录制可恢复）`));
     } else if (shareOpts.shareEnqueued) {
       card.appendChild(h("p", { class: "li-sub", style: "color:var(--label2)" },
         "已加入共享队列，将在联网后上传"));
     } else if (shareOpts.shareErr) {
       card.appendChild(h("p", { class: "li-sub", style: "color:var(--orange)" },
         `共享入队失败：${shareOpts.shareErr.message || shareOpts.shareErr}（本地已保存）`));
+    }
+    // 视频证据保存失败：不影响记录保存结果，只追加一行警告
+    if (shareOpts.videoSaveErr) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--orange)" },
+        "记录已保存，但视频证据保存失败"));
     }
     const content = h("div", { class: "content" }, [
       card,
@@ -2877,7 +2943,13 @@
         h("button", {
           class: "btn primary",
           onClick: () => {
-            setCurrentBox({ cageId: cage, strain: strain || "其他", mouseNoPad: box ? box.mouse_no_pad : 2 });
+            setCurrentBox({
+              cageId: cage,
+              strain: strain || "其他",
+              mouseNoPad: box ? box.mouse_no_pad : 2,
+              // 续号：box 由 api.box() 加载，含 next_ordinal；缺省回退 1
+              nextOrdinal: normalizeStartOrdinal(box),
+            });
             // 与首页「开始录制」一致：先选记录模式（后匹配/即时报数/手动）再进录制。
             go("/mode");
           },

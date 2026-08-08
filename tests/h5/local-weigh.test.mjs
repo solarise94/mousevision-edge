@@ -1100,3 +1100,257 @@ test("dev 采集: manual 模式 'weight' 直读事件发到 UI（manual 也直�
   assert.ok(w, "manual 模式也应收到 'weight' 直读事件");
   assert.equal(w.payload.grams, 19.8);
 });
+
+/* ================================================================== */
+/* Bug 2: startOrdinal —— 同一箱"继续录制"序号续接而非从 1 重号。
+/* ================================================================== */
+
+test("startOrdinal: 默认为 1（未传 → ordinal 从 1 开始）", () => {
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: makeFakeChannel(),
+    outbox: makeFakeOutbox(),
+    box: { cageId: "SO1" },
+    storage: makeStorage(),
+    now: () => 0,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  // 显式注入（跳过清秤/防抖门槛），便于直接断言 ordinal
+  const r1 = ctrl.submitManual(10.0);
+  const r2 = ctrl.submitManual(11.0);
+  assert.equal(r1.record.ordinal, 1);
+  assert.equal(r2.record.ordinal, 2);
+  assert.equal(ctrl.getState().nextOrdinal, 3, "nextOrdinal = startOrdinal + records.length");
+});
+
+test("startOrdinal: 传入 5 → 新记录 ordinal 从 5 开始续号", () => {
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: makeFakeChannel(),
+    outbox: makeFakeOutbox(),
+    box: { cageId: "SO2" },
+    startOrdinal: 5,
+    storage: makeStorage(),
+    now: () => 0,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  const r1 = ctrl.submitManual(20.0);
+  const r2 = ctrl.submitManual(21.0);
+  const r3 = ctrl.submitManual(22.0);
+  assert.equal(r1.record.ordinal, 5, "首条 ordinal = startOrdinal");
+  assert.equal(r2.record.ordinal, 6);
+  assert.equal(r3.record.ordinal, 7);
+  assert.equal(ctrl.getState().nextOrdinal, 8);
+});
+
+test("startOrdinal: 非整数 / <1 / NaN → 回退 1", () => {
+  for (const bad of [0, -1, 1.5, NaN, "abc", null, undefined]) {
+    const ctrl = LW.createController({
+      mode: "manual",
+      weighEngine: makeFakeEngineModule(),
+      buildRecord: RC.buildRecord,
+      scaleChannel: makeFakeChannel(),
+      outbox: makeFakeOutbox(),
+      box: { cageId: "SO3" },
+      startOrdinal: bad,
+      storage: makeStorage(),
+      now: () => 0,
+      onEvent: () => {},
+    });
+    ctrl.start();
+    const r = ctrl.submitManual(10.0);
+    assert.equal(r.record.ordinal, 1, `startOrdinal=${JSON.stringify(bad)} 应回退 1`);
+  }
+});
+
+test("startOrdinal: 草稿恢复后续号一致（崩溃恢复场景）", () => {
+  const storage = makeStorage();
+  // 模拟：上一会话 startOrdinal=10，已录 3 条（ordinal 10/11/12），崩溃留下草稿
+  storage.setItem(LW._draftKey("SO4"), JSON.stringify({
+    cageId: "SO4",
+    mode: "manual",
+    startOrdinal: 10,
+    records: [
+      { record_id: "a", ordinal: 10, weight_g: 20.0, recorded_at: "2026-01-01T00:00:00Z" },
+      { record_id: "b", ordinal: 11, weight_g: 21.0, recorded_at: "2026-01-01T00:00:01Z" },
+      { record_id: "c", ordinal: 12, weight_g: 22.0, recorded_at: "2026-01-01T00:00:02Z" },
+    ],
+    startedAt: 1000,
+    realtimeT0: 999,
+  }));
+  // 新控制器即使传了不同的 startOrdinal，恢复草稿后也应以草稿里的 startOrdinal 为准
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: makeFakeChannel(),
+    outbox: makeFakeOutbox(),
+    box: { cageId: "SO4" },
+    startOrdinal: 1, // 故意传 1，验证草稿的 10 优先
+    storage,
+    now: () => 5000,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  assert.equal(ctrl.getState().mouseCount, 3, "恢复 3 条");
+  assert.equal(ctrl.getState().nextOrdinal, 13, "nextOrdinal = 10 + 3 = 13（草稿 startOrdinal 优先）");
+  // 继续录入一条 → ordinal 应为 13（不重号）
+  const r = ctrl.submitManual(23.0);
+  assert.equal(r.record.ordinal, 13, "崩溃恢复后续号接续，不重号");
+});
+
+test("草稿持久化: startOrdinal 随草稿写入 storage", () => {
+  const storage = makeStorage();
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: makeFakeChannel(),
+    outbox: makeFakeOutbox(),
+    box: { cageId: "SO5" },
+    startOrdinal: 7,
+    storage,
+    now: () => 0,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  ctrl.submitManual(10.0);
+  const draft = JSON.parse(storage.getItem(LW._draftKey("SO5")));
+  assert.equal(draft.startOrdinal, 7, "草稿应含 startOrdinal 字段");
+});
+
+/* ================================================================== */
+/* 改进 A：manual 模式清秤门槛 + 防抖
+/* ================================================================== */
+
+test("manual 清秤门槛: 成功录入后下一条需读数回落 ≤门槛 才接受", () => {
+  const channel = makeFakeChannel();
+  let clock = 1000;
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "MC1" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+  });
+  ctrl.start();
+
+  // 推读数 25g，录入第 1 只（成功）
+  channel.feed({ grams: 25.0, raw: 250, sequence: 1, receivedAtEpochMs: 1000 });
+  clock = 2000; // 超过防抖间隔
+  const r1 = ctrl.submitManual();
+  assert.ok(r1.ok, "第 1 只应录入成功");
+
+  // 秤上还有上一只（读数仍 25g）→ 录入第 2 只应被清秤门槛拒绝
+  channel.feed({ grams: 25.0, raw: 250, sequence: 2, receivedAtEpochMs: 2000 });
+  clock = 3000; // 超过防抖
+  const r2 = ctrl.submitManual();
+  assert.ok(!r2.ok, "未清秤 → 拒绝");
+  assert.equal(r2.reason, "not_cleared");
+
+  // 取下小鼠，秤回落到 2g（≤门槛）→ 清除标志
+  clock = 4000;
+  channel.feed({ grams: 2.0, raw: 20, sequence: 3, receivedAtEpochMs: 4000 });
+  // 再放新小鼠 22g，录入应成功
+  clock = 5000;
+  channel.feed({ grams: 22.0, raw: 220, sequence: 4, receivedAtEpochMs: 5000 });
+  clock = 6000; // 超过防抖
+  const r3 = ctrl.submitManual();
+  assert.ok(r3.ok, "清秤后 → 录入成功");
+  assert.equal(r3.record.weight_g, 22.0);
+});
+
+test("manual 清秤门槛: 恰好等于门槛值（3g）也视为清秤", () => {
+  const channel = makeFakeChannel();
+  let clock = 1000;
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "MC2" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  channel.feed({ grams: 25.0, raw: 250, sequence: 1, receivedAtEpochMs: 1000 });
+  clock = 2000;
+  assert.ok(ctrl.submitManual().ok);
+  // 回落到恰好门槛值 3g → 清除
+  clock = 3000;
+  channel.feed({ grams: LW._MANUAL_CLEAR_THRESHOLD_G, raw: 30, sequence: 2, receivedAtEpochMs: 3000 });
+  clock = 4000;
+  channel.feed({ grams: 22.0, raw: 220, sequence: 3, receivedAtEpochMs: 4000 });
+  clock = 5000;
+  const r = ctrl.submitManual();
+  assert.ok(r.ok, "恰好等于门槛值应清除标志");
+});
+
+test("manual 防抖: 距上次成功录入 <800ms 拒绝（too_fast）", () => {
+  const channel = makeFakeChannel();
+  let clock = 1000;
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: channel,
+    outbox: makeFakeOutbox(),
+    box: { cageId: "MC3" },
+    storage: makeStorage(),
+    now: () => clock,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  // 第 1 只
+  channel.feed({ grams: 25.0, raw: 250, sequence: 1, receivedAtEpochMs: 1000 });
+  clock = 1000;
+  assert.ok(ctrl.submitManual().ok, "第 1 只成功");
+
+  // 立即清秤 + 放新小鼠（读数合法）
+  clock = 1100; // 仅过 100ms < 800ms
+  channel.feed({ grams: 2.0, raw: 20, sequence: 2, receivedAtEpochMs: 1100 }); // 清秤
+  clock = 1200;
+  channel.feed({ grams: 22.0, raw: 220, sequence: 3, receivedAtEpochMs: 1200 });
+  clock = 1300; // 距上次成功录入 300ms < 800ms
+  const r = ctrl.submitManual();
+  assert.ok(!r.ok, "<800ms 应被防抖拒绝");
+  assert.equal(r.reason, "too_fast");
+
+  // 等够 800ms 后再录入 → 成功
+  clock = 1000 + LW._MANUAL_MIN_INTERVAL_MS + 1;
+  const r2 = ctrl.submitManual();
+  assert.ok(r2.ok, "≥800ms 后录入成功");
+  assert.equal(r2.record.weight_g, 22.0);
+});
+
+test("manual 门槛/防抖: 显式注入 weightG 跳过门槛与防抖（测试用）", () => {
+  // 验证显式注入路径不被清秤/防抖阻塞——已有 finishBox 测试隐含覆盖，
+  // 这里显式断言连续显式注入都成功。
+  const ctrl = LW.createController({
+    mode: "manual",
+    weighEngine: makeFakeEngineModule(),
+    buildRecord: RC.buildRecord,
+    scaleChannel: makeFakeChannel(),
+    outbox: makeFakeOutbox(),
+    box: { cageId: "MC4" },
+    storage: makeStorage(),
+    now: () => 0,
+    onEvent: () => {},
+  });
+  ctrl.start();
+  const r1 = ctrl.submitManual(10.0);
+  const r2 = ctrl.submitManual(11.0); // 紧接着，显式注入
+  assert.ok(r1.ok && r2.ok, "显式注入连续调用都成功（跳过门槛/防抖）");
+});

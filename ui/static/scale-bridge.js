@@ -172,9 +172,25 @@
     function onReadingEvent(ev) {
       var detail = ev && ev.detail;
       if (!isValidReading(detail)) return;
-      // 乱序/重复：sequence 必须 > 已接受的最大值
-      if (detail.sequence <= lastSequence) {
+      // 去重：BLE 序号在扫描器进程内单调递增。
+      //   - sequence === lastSequence：同一事件的重复投递 → 丢弃。
+      //   - sequence < lastSequence（严格小于）：扫描器重启（原生 Android 修复后，
+      //     App 从后台恢复会重启扫描、sequence 从 1 重新计数）。此时重置基线并
+      //     接受该读数——否则重启后所有读数因 sequence 回退被丢弃，克数永远卡死。
+      //     出现下降只可能是重启（进程内不会回退），故不累加 droppedOutOfOrder。
+      if (detail.sequence === lastSequence) {
         droppedOutOfOrder += 1;
+        return;
+      }
+      if (detail.sequence < lastSequence) {
+        // 扫描器重启：重置基线，接受该读数（不计入乱序丢弃）
+        lastSequence = detail.sequence;
+        lastReading = detail;
+        lastReadingAtMs = now();
+        pushStaleChange();
+        for (var i = 0; i < readingCbs.length; i++) {
+          try { readingCbs[i](detail); } catch (_) {}
+        }
         return;
       }
       lastSequence = detail.sequence;

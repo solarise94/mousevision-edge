@@ -215,6 +215,9 @@
     var baseIntervalMs = typeof opts.baseIntervalMs === "number" ? opts.baseIntervalMs : DEFAULT_BASE_INTERVAL_MS;
     var maxIntervalMs = typeof opts.maxIntervalMs === "number" ? opts.maxIntervalMs : DEFAULT_MAX_INTERVAL_MS;
 
+    // 死信存储键：在 outbox 主键后追加 ".dead"，与主队列同生命周期、同 storage。
+    var deadKey = key + ".dead";
+
     // 内部队列：[{clientBatchId, enqueuedAt, batch:{cage_id,...,records:[...]}, videoBlobRef?}]
     // videoBlobRef 不参与 JSON 序列化（见 persist）。
     var queue = [];
@@ -226,10 +229,21 @@
     var retryTimer = null;
     var consecutiveFailures = 0;
     var inFlight = false; // 防止 flush 重入
+    // 最近一次 flush 是否因鉴权（401/403）失败停止；用于 UI 暴露"令牌失效"状态。
+    // 每次 flush 开始不主动清零——只有成功发出至少一批（kind==="ok"）才视为恢复。
+    var lastAuthFailed = false;
+    // 最近一次 persist 是否成功落盘（quota/不可写时为 false）。供 UI 监控。
+    var lastPersistOk = true;
 
-    /* ---------- 持久化 ---------- */
+    /* ---------- 持久化 ----------
+     * 返回 boolean：true=成功落盘；false=storage 不可用或抛错（quota/不可写）。
+     * 调用方按需决定是否重试/抛错（enqueue 失败要抛、flush 内部失败仍吞）。
+     */
     function persist() {
-      if (!storage || typeof storage.setItem !== "function") return;
+      if (!storage || typeof storage.setItem !== "function") {
+        lastPersistOk = false;
+        return false;
+      }
       try {
         // 只序列化可 JSON 化的字段：剥掉 videoBlobRef（Blob/File 不可序列化，
         // 且我们有意不持久化视频，见文件头注释）。
@@ -240,9 +254,25 @@
           return o;
         });
         storage.setItem(key, JSON.stringify({ v: 1, queue: serializable }));
+        // 死信一并落盘：4xx 拒收的批次也持久化（独立 key），reload 后仍可查/重发。
+        persistDead();
+        lastPersistOk = true;
+        return true;
       } catch (_) {
-        // 存储失败（quota / 不可写）不应阻断 enqueue 主流程；记录已入内存队列，
-        // 下次成功 persist 时再落盘。调用方可通过 onChange 监控 pendingCount。
+        // 存储失败（quota / 不可写）不应阻断 flush 主流程；记录已入内存队列，
+        // 下次成功 persist 时再落盘。调用方可通过 lastPersistOk()/onChange 监控。
+        lastPersistOk = false;
+        return false;
+      }
+    }
+
+    /* 死信持久化（独立 key，便于排查与隔离）。失败仅置 lastPersistOk=false，不抛错。 */
+    function persistDead() {
+      if (!storage || typeof storage.setItem !== "function") return;
+      try {
+        storage.setItem(deadKey, JSON.stringify({ v: 1, dead: deadLetter }));
+      } catch (_) {
+        lastPersistOk = false;
       }
     }
 
@@ -269,6 +299,20 @@
       } catch (_) {
         // 损坏的存储：清空内存队列避免使用半截数据。原 storage 不动（保守）。
         queue = [];
+      }
+      // 死信恢复（独立 key）：损坏时保守清空，不影响主队列。
+      try {
+        var draw = storage.getItem(deadKey);
+        if (draw && typeof draw === "string") {
+          var dparsed = JSON.parse(draw);
+          if (dparsed && Array.isArray(dparsed.dead)) {
+            deadLetter = dparsed.dead.filter(function (d) {
+              return d && typeof d === "object" && d.batch && Array.isArray(d.batch.records);
+            });
+          }
+        }
+      } catch (_) {
+        deadLetter = [];
       }
     }
 
@@ -341,8 +385,12 @@
     /* ---------- 判定单批次发送结果 ----------
      * 返回：
      *   "ok"     —— 成功，移出队列
-     *   "retry"  —— 网络/5xx，保留重试
-     *   "dead"   —— 4xx 参数错误，进死信
+     *   "retry"  —— 网络/5xx/可重试 4xx（408/409/425/429 等），保留重试
+     *   "dead"   —— 确定的 payload 校验错误（400/413/422），进死信
+     *   "auth"   —— 鉴权失败（401/403）：保留在队列、停止本轮 flush（避免连打）、
+     *               通过 lastAuthFailed() 暴露给 UI 提示"令牌失效"。
+     * 注意：原来所有 4xx 都进死信，导致 token 错误时记录永久丢失且界面显示
+     * "已上报"。现在把 401/403 分离为可恢复的 auth（换 token 后即可继续）。
      */
     function classifyResult(res) {
       // fetch reject（网络错误）在外层捕获，归类为 retry
@@ -354,8 +402,11 @@
         // body 缺失或 ok 非 true：保守视为 retry（可能后端还在处理）
         return "retry";
       }
-      if (status >= 400 && status < 500) return "dead"; // 参数错误
-      // 5xx / 其它 → retry
+      // 鉴权失败：token 失效/无权限 → 保留重试（换 token 后可恢复），不丢数据
+      if (status === 401 || status === 403) return "auth";
+      // 确定的 payload 校验错误 → 死信（避免坏批次卡死整条队列）
+      if (status === 400 || status === 413 || status === 422) return "dead";
+      // 其余 4xx（408 超时/409 冲突/425 太早/429 限流）与 5xx → 可重试
       return "retry";
     }
 
@@ -427,12 +478,14 @@
           if (r.kind === "ok") {
             queue.shift();
             sentCount += 1;
+            // 成功发出至少一批 → 视为鉴权已恢复（之前可能是 token 临时失效）
+            lastAuthFailed = false;
             persist();
             notify();
             return step(); // 继续下一批
           }
           if (r.kind === "dead") {
-            // 4xx：进死信，移出队列，不阻塞后续
+            // 400/413/422 确定校验错误：进死信，移出队列，不阻塞后续
             var dead = queue.shift();
             var deadEntry = {
               clientBatchId: dead.clientBatchId,
@@ -446,6 +499,15 @@
             persist();
             notify();
             return step(); // 继续下一批（不死信卡死）
+          }
+          if (r.kind === "auth") {
+            // 401/403：token 失效/无权限 → 保留该批及后续，停止本轮 flush（避免连打），
+            // 暴露 lastAuthFailed=true 让 UI 提示"令牌失效，请检查后重试"。
+            lastAuthFailed = true;
+            inFlight = false;
+            consecutiveFailures += 1;
+            rescheduleRetry();
+            return { sent: sentCount, remaining: queue.length };
           }
           // retry：停止，保留该批及后续（离线不丢）
           inFlight = false;
@@ -526,7 +588,16 @@
         if (videoOpt != null) item.videoBlobRef = videoOpt;
         if (readingsOpt && typeof readingsOpt === "object") item.readings = readingsOpt;
         queue.push(item);
-        persist();
+        // enqueue 的 persist 失败必须抛错：通知调用方"这批没落盘"。
+        // 批次保留在内存队列（不回滚）——下次 persist（enqueue/flush）会再试，
+        // 一旦 storage 恢复即可落盘/补传，最大化数据保留。调用方（finishBoxFlow）
+        // 捕获后保留草稿/提示用户。与 flush 内部的 persist（吞错不阻断）区分。
+        var ok = persist();
+        if (!ok) {
+          // 通知 onChange 反映内存队列里这一批（虽未落盘），再抛错
+          notify();
+          throw new Error("enqueue: 持久化失败（storage 不可写/quota）");
+        }
         notify();
         // 已 start 且当前没有排程 → 安排一次尽快重试（用 base 间隔）
         if (started) rescheduleRetry();
@@ -559,6 +630,12 @@
 
       // 连续失败计数（测试用）
       consecutiveFailures: function () { return consecutiveFailures; },
+
+      // 最近一次 persist 是否成功落盘（只读状态，供 UI/测试监控）
+      lastPersistOk: function () { return lastPersistOk; },
+
+      // 最近一次 flush 是否因鉴权（401/403）失败停止（只读状态）
+      lastAuthFailed: function () { return lastAuthFailed; },
 
       start: function () {
         if (started) return;

@@ -140,7 +140,7 @@ test("读数校验：grams=0 / raw=0 是合法真实零点", () => {
   ch.stop();
 });
 
-test("乱序 / 重复 sequence 被丢弃并计数", () => {
+test("重复 sequence 被丢弃并计数（sequence === lastSequence）", () => {
   const env = makeFakeEnv();
   const ch = SB.createScaleChannel({
     windowScope: fakeWindowWithBridge(env.native),
@@ -154,13 +154,67 @@ test("乱序 / 重复 sequence 被丢弃并计数", () => {
   ch.onReading((r) => seen.push(r.sequence));
 
   env.dispatchReading(goodReading({ sequence: 10 }));
-  env.dispatchReading(goodReading({ sequence: 10 })); // 重复
-  env.dispatchReading(goodReading({ sequence: 5 }));  // 回退
-  env.dispatchReading(goodReading({ sequence: 11 })); // 正常
-  env.dispatchReading(goodReading({ sequence: 9 }));  // 回退
+  env.dispatchReading(goodReading({ sequence: 10 })); // 重复（===）→ 丢弃
+  env.dispatchReading(goodReading({ sequence: 11 })); // 正常递增 → 接受
+  env.dispatchReading(goodReading({ sequence: 11 })); // 重复（===）→ 丢弃
 
   assert.deepEqual(seen, [10, 11]);
-  assert.equal(ch.getState().droppedOutOfOrder, 3);
+  assert.equal(ch.getState().droppedOutOfOrder, 2, "仅重复（===）计入丢弃");
+  ch.stop();
+});
+
+/* Bug 4：原生扫描器重启后 sequence 从 1 重新计数，读数被去重全丢。
+ * 修复：sequence < lastSequence（严格小于）视为扫描器重启——重置基线并接受该读数。 */
+test("扫描器重启：sequence 严格下降 → 重置基线并接受（不计入乱序丢弃）", () => {
+  const env = makeFakeEnv();
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  const seen = [];
+  ch.onReading((r) => seen.push(r.sequence));
+
+  // 先正常递增到 100
+  env.dispatchReading(goodReading({ sequence: 100 }));
+  env.dispatchReading(goodReading({ sequence: 101 }));
+  // 扫描器重启：sequence 回到 1（严格下降）→ 重置基线、接受
+  env.dispatchReading(goodReading({ sequence: 1 }));
+  // 重启后继续递增
+  env.dispatchReading(goodReading({ sequence: 2 }));
+  env.dispatchReading(goodReading({ sequence: 3 }));
+
+  assert.deepEqual(seen, [100, 101, 1, 2, 3], "重启后的读数都应被接受");
+  assert.equal(ch.getState().droppedOutOfOrder, 0, "重启重置不计入乱序丢弃");
+  // 基线已重置为 3
+  assert.equal(ch.getState().lastReading.sequence, 3);
+  ch.stop();
+});
+
+test("扫描器重启后 sequence === lastSequence 仍丢弃（重复事件）", () => {
+  const env = makeFakeEnv();
+  const ch = SB.createScaleChannel({
+    windowScope: fakeWindowWithBridge(env.native),
+    nativeBridge: env.native,
+    now: env.now, perfNow: env.perfNow,
+    addEventListener: env.addEventListener, removeEventListener: env.removeEventListener,
+    setInterval: env.setInterval, clearInterval: env.clearInterval,
+  });
+  ch.start();
+  const seen = [];
+  ch.onReading((r) => seen.push(r.sequence));
+
+  env.dispatchReading(goodReading({ sequence: 50 }));
+  // 重启：回到 1
+  env.dispatchReading(goodReading({ sequence: 1 }));
+  // 重启后的重复（===）→ 丢弃
+  env.dispatchReading(goodReading({ sequence: 1 }));
+
+  assert.deepEqual(seen, [50, 1]);
+  assert.equal(ch.getState().droppedOutOfOrder, 1, "重启后重复仍计入丢弃");
   ch.stop();
 });
 

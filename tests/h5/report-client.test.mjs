@@ -324,17 +324,190 @@ test("flush 4xx：该批进 deadLetter，不阻塞后续批次", async () => {
   assert.equal(dl[0].failedAt != null, true);
 });
 
-test("flush 422 也是 4xx → 进死信", async () => {
+test("flush 413 / 422 也是确定的 payload 错误 → 进死信", async () => {
   const storage = makeStorage();
   const fetchFn = makeFakeFetch({
-    responses: [{ status: 422, _body: { ok: false } }],
+    responses: [
+      { status: 413, _body: { ok: false } }, // payload too large
+      { status: 422, _body: { ok: false } }, // unprocessable
+    ],
     defaultResponse: () => ({ status: 200, _body: { ok: true } }),
   });
   const ob = RC.createOutbox({ storage, fetchFn });
-  ob.enqueue({ cage_id: "X", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "X1", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "X2", records: [aRecord(1, 2)] });
   await ob.flush();
-  assert.equal(ob.deadLetters().length, 1);
+  assert.equal(ob.deadLetters().length, 2, "413 和 422 都应进死信");
   assert.equal(ob.pending(), 0);
+});
+
+test("flush 401/403：归为 auth，保留在队列、停止本轮 flush、暴露 lastAuthFailed", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 401, _body: { ok: false, detail: "invalid token" } }, // C1 → auth
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "A1", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "A2", records: [aRecord(1, 2)] }); // 不会被发（auth 停止本轮）
+  const res = await ob.flush();
+  assert.equal(res.sent, 0, "auth 失败 → 未发出任何一批");
+  assert.equal(res.remaining, 2, "两批都保留在队列");
+  assert.equal(ob.pending(), 2);
+  assert.equal(ob.deadLetters().length, 0, "auth 不进死信（可恢复）");
+  assert.equal(ob.lastAuthFailed(), true, "暴露 lastAuthFailed=true");
+
+  // 403 同样归类为 auth
+  const storage2 = makeStorage();
+  const fetchFn2 = makeFakeFetch({
+    responses: [{ status: 403, _body: { ok: false } }],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob2 = RC.createOutbox({ storage: storage2, fetchFn: fetchFn2 });
+  ob2.enqueue({ cage_id: "B1", records: [aRecord(1, 1)] });
+  await ob2.flush();
+  assert.equal(ob2.pending(), 1, "403 也保留");
+  assert.equal(ob2.lastAuthFailed(), true);
+});
+
+test("flush auth 失败后换 token 成功 → lastAuthFailed 复位、队列清空", async () => {
+  const storage = makeStorage();
+  let token = "stale";
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 401, _body: { ok: false } }, // 旧 token 失败
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }), // 后续成功
+  });
+  const ob = RC.createOutbox({ storage, fetchFn, token: () => token });
+  ob.enqueue({ cage_id: "A1", records: [aRecord(1, 1)] });
+  await ob.flush();
+  assert.equal(ob.lastAuthFailed(), true);
+  // 换新 token 后重试
+  token = "fresh";
+  const res = await ob.flush();
+  assert.equal(res.sent, 1);
+  assert.equal(ob.pending(), 0);
+  assert.equal(ob.lastAuthFailed(), false, "成功后 lastAuthFailed 复位");
+});
+
+test("flush 408/429/409/425：归为 retry（保留重试，不进死信也不算 auth）", async () => {
+  for (const status of [408, 409, 425, 429]) {
+    const storage = makeStorage();
+    const fetchFn = makeFakeFetch({
+      responses: [{ status, _body: { ok: false } }],
+      defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+    });
+    const ob = RC.createOutbox({ storage, fetchFn });
+    ob.enqueue({ cage_id: "R", records: [aRecord(1, 1)] });
+    await ob.flush();
+    assert.equal(ob.pending(), 1, `status ${status} 应保留重试`);
+    assert.equal(ob.deadLetters().length, 0, `status ${status} 不应进死信`);
+    assert.equal(ob.lastAuthFailed(), false, `status ${status} 不应算 auth`);
+  }
+});
+
+/* 死信持久化：4xx 死信批次落独立 key（<storageKey>.dead），reload 后仍可查。 */
+test("死信持久化：flush 4xx 后死信落盘；新建 outbox 读同一 storage 后死信恢复", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 400, _body: { ok: false } }, // 死信
+      { status: 200, _body: { ok: true } },  // 成功
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob1 = RC.createOutbox({ storage, fetchFn, now: () => 1000 });
+  ob1.enqueue({ cage_id: "BAD", records: [aRecord(1, 1)] });
+  ob1.enqueue({ cage_id: "OK", records: [aRecord(1, 2)] });
+  await ob1.flush();
+  assert.equal(ob1.deadLetters().length, 1);
+  const dlId = ob1.deadLetters()[0].clientBatchId;
+
+  // 死信已落盘到 <storageKey>.dead
+  const deadRaw = storage.getItem(RC.DEFAULT_STORAGE_KEY + ".dead");
+  assert.ok(typeof deadRaw === "string", "死信应落盘到 .dead key");
+  const dparsed = JSON.parse(deadRaw);
+  assert.equal(dparsed.dead.length, 1);
+  assert.equal(dparsed.dead[0].clientBatchId, dlId);
+  assert.equal(dparsed.dead[0].batch.cage_id, "BAD");
+
+  // reload：新建 outbox 读同一 storage，死信恢复
+  const ob2 = RC.createOutbox({ storage, fetchFn: makeFakeFetch(), now: () => 2000 });
+  const dl = ob2.deadLetters();
+  assert.equal(dl.length, 1, "reload 后死信应恢复");
+  assert.equal(dl[0].clientBatchId, dlId);
+  assert.equal(dl[0].batch.cage_id, "BAD");
+  assert.equal(dl[0].reason, "4xx");
+  // deadLetters() 返回形状不变（clientBatchId/enqueuedAt/batch/failedAt/reason）
+  assert.ok(typeof dl[0].failedAt === "number");
+});
+
+test("死信持久化：损坏的 .dead key 不影响主队列恢复（保守清空死信）", async () => {
+  const storage = makeStorage();
+  storage.setItem(RC.DEFAULT_STORAGE_KEY + ".dead", "not-json{");
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  assert.equal(ob.deadLetters().length, 0, "损坏的死信存储 → 死信清空");
+  assert.equal(ob.pending(), 0, "主队列不受影响");
+});
+
+/* enqueue 持久化失败抛错：storage 不可写/quota → enqueue 抛错，但批次保留在内存队列
+ * （下次 persist 再试，最大化数据保留）。flush 内部的 persist 仍吞错不阻断。 */
+test("enqueue 持久化失败：storage.setItem 抛错 → enqueue 抛错但批次保留在内存队列", () => {
+  const storage = makeStorage();
+  // 让 setItem 直接抛错（quota exceeded）。
+  storage.setItem = () => { throw new Error("quota exceeded"); };
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  assert.throws(
+    () => ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }),
+    /持久化失败/,
+    "enqueue 在 persist 失败时应抛错"
+  );
+  // 批次保留在内存队列（不回滚）：pending=1，下次 persist 恢复后可落盘/补传
+  assert.equal(ob.pending(), 1, "persist 失败 → 批次保留在内存队列（不回滚）");
+  assert.equal(ob.lastPersistOk(), false, "lastPersistOk 暴露失败状态");
+});
+
+test("enqueue 持久化失败后 storage 恢复 → 下次 enqueue 落盘成功（含前一批）", () => {
+  const store = {};
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  // 第一次：setItem 抛错 → enqueue 抛错但批次留在内存队列
+  storage.setItem = () => { throw new Error("quota"); };
+  assert.throws(() => ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }), /持久化失败/);
+  assert.equal(ob.pending(), 1, "失败批次留在内存队列");
+  // 恢复 setItem → 再 enqueue 一批，persist 把两批都落盘
+  storage.setItem = (k, v) => { store[k] = String(v); };
+  ob.enqueue({ cage_id: "C2", records: [aRecord(1, 2)] });
+  assert.equal(ob.pending(), 2);
+  assert.equal(ob.lastPersistOk(), true);
+  const parsed = JSON.parse(storage.getItem(RC.DEFAULT_STORAGE_KEY));
+  assert.equal(parsed.queue.length, 2, "两批都落盘（前一批被保留下次 persist 恢复）");
+});
+
+test("lastPersistOk：正常情况为 true；storage 缺失时 enqueue 抛错且 lastPersistOk=false", () => {
+  // 无 storage 注入且全局无 localStorage → enqueue 必须抛错（不能静默丢）
+  const origLocalStorage = globalThis.localStorage;
+  Object.defineProperty(globalThis, "localStorage", { value: undefined, configurable: true });
+  try {
+    const ob = RC.createOutbox({ fetchFn: makeFakeFetch() });
+    assert.throws(() => ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }), /持久化失败/);
+    assert.equal(ob.lastPersistOk(), false, "enqueue 持久化失败后 lastPersistOk=false");
+  } finally {
+    Object.defineProperty(globalThis, "localStorage", { value: origLocalStorage, configurable: true });
+  }
+});
+
+test("lastPersistOk：正常 storage 时为 true", () => {
+  const ob = RC.createOutbox({ storage: makeStorage(), fetchFn: makeFakeFetch() });
+  ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+  assert.equal(ob.lastPersistOk(), true);
 });
 
 /* ================================================================== *
