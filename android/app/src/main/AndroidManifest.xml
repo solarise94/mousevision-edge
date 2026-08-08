@@ -32,10 +32,14 @@
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- networkSecurityConfig：让 WebView 用内置 ISRG 根自行校验 API 域名证书链，
+         详见 res/xml/network_security_config.xml。符合规范的 WebView（Android 7+）
+         配置后直接完成链验证，不会触发 onReceivedSslError。 -->
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="false">
         <activity

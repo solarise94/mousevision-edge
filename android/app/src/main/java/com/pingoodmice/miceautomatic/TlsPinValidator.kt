@@ -8,6 +8,7 @@ import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.KeyStore
+import java.security.MessageDigest
 import java.security.cert.CertificateException
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
@@ -37,12 +38,17 @@ import javax.net.ssl.X509TrustManager
  * - [warmup] 与缓存过期后的重验，都在后台线程做真实 TLS 握手，绝不触碰主线程；
  * - 任何异常都安全失败为 false（全 catch），保证回调不会被网络异常拖垮。
  *
- * 缓存语义：
+ * 缓存语义（绑定具体 leaf SPKI，而非"主机健康状态"）：
  * - 验证通过缓存 VALID_MS（10 分钟）；窗口内直接返回 true；
- * - 窗口外返回 false，并（非阻塞地）触发一次后台重新验证以刷新缓存。
+ * - 窗口外返回 false，并（非阻塞地）触发一次后台重新验证以刷新缓存；
+ * - 验证成功时除了记时间戳，还记录对端 leaf 证书的 SPKI SHA-256，可通过
+ *   [verifiedLeafSpkiSha256] 读出。该值用于 SslError 放行时绑定"当前报错证书"：
+ *   仅当报错证书的 leaf SPKI 与后台握手验证过的 SPKI 完全一致才放行，防止缓存窗口内
+ *   攻击者用另一张（即便我们也认）或无效证书也蒙混过关。缓存因此不再是"主机可信"的
+ *   粗粒度结论，而是绑定到具体叶子证书的细粒度断言。
  *
- * 注意：本类只判断「服务器链是否锚定到内置根」，不替代 host 白名单（host/port 校验
- * 仍在 MainActivity.isTrustedApiServer）。
+ * 注意：本类只判断「服务器链是否锚定到内置根 + 当前证书是否就是那次验证的证书」，
+ * 不替代 host 白名单（host/port 校验仍在 MainActivity.isTrustedApiServer）。
  *
  * @param context 任意 context，内部取 applicationContext。
  * @param host 受信 API 服务器主机名（用于 SNI 与证书校验）。
@@ -65,6 +71,30 @@ class TlsPinValidator(
 
         /** 后台 TLS 握手超时（毫秒）。服务器走 FRP，给足时间但要有上限避免线程长期挂起。 */
         private const val HANDSHAKE_TIMEOUT_MS = 15_000
+
+        /**
+         * 计算 X509 证书的 SPKI SHA-256，返回小写十六进制字符串。
+         *
+         * 取 subjectPublicKeyInfo 的 DER 编码（即 X509Certificate.getPublicKey().getEncoded()）
+         * 做 SHA-256。该值是证书"身份"的稳定指纹：同一密钥对签出的证书（即便换发/
+         * 续期）SPKI 相同；不同密钥必然不同。因此既能绑定"当前报错证书是否就是后台
+         * 验证过的那一张"，又对证书正常轮换保持鲁棒（只要密钥不变即视为同一证书）。
+         *
+         * 返回 64 位小写 hex（无分隔符），便于常量时间字符串相等比较。
+         */
+        internal fun spkiSha256Hex(cert: X509Certificate): String {
+            val spki = cert.publicKey.encoded
+            val digest = MessageDigest.getInstance("SHA-256").digest(spki)
+            val sb = StringBuilder(digest.size * 2)
+            for (b in digest) {
+                val v = b.toInt() and 0xFF
+                sb.append(HEX_LOWER[v ushr 4])
+                sb.append(HEX_LOWER[v and 0x0F])
+            }
+            return sb.toString()
+        }
+
+        private val HEX_LOWER = "0123456789abcdef".toCharArray()
     }
 
     /**
@@ -72,8 +102,14 @@ class TlsPinValidator(
      *
      * @property trusted 上一次后台握手是否成功（链锚定到内置根）。
      * @property verifiedAtMono 上一次成功验证的单调时钟时间戳（elapsedRealtime）。
+     * @property leafSpkiSha256 对端 leaf 证书的 SPKI SHA-256（小写 hex）。仅 trusted=true
+     *  时有意义；用于绑定 SslError 放行时"当前报错证书"与后台验证证书的一致性。
      */
-    private data class CachedResult(val trusted: Boolean, val verifiedAtMono: Long)
+    private data class CachedResult(
+        val trusted: Boolean,
+        val verifiedAtMono: Long,
+        val leafSpkiSha256: String?,
+    )
 
     /** 缓存槽：AtomicReference 保证主线程读 / 后台线程写的可见性与原子性。
      *  初始为 null：未验证过 → 视为不可信，直到首次后台握手成功。 */
@@ -108,6 +144,20 @@ class TlsPinValidator(
     }
 
     /**
+     * 主线程同步读取：后台握手验证过的对端 leaf 证书 SPKI SHA-256（小写 hex）。
+     *
+     * 仅当缓存新鲜（trusted 且在 [VALID_MS] 窗口内）时返回，否则返回 null。
+     * 用于 [MainActivity] 的 onReceivedSslError：放行前比对"当前报错证书的 leaf SPKI"
+     * 是否与本值完全一致，确保放行的是后台真正验证过的同一张证书，而非缓存窗口内
+     * 被偷换的任意证书。
+     */
+    fun verifiedLeafSpkiSha256(): String? {
+        val c = cache.get()
+        val fresh = c != null && c.trusted && (nowMono() - c.verifiedAtMono) <= VALID_MS
+        return if (fresh) c!!.leafSpkiSha256 else null
+    }
+
+    /**
      * 预热：onCreate 时调用一次，后台发起首次 TLS 验证，使后续进入页面时缓存可能已就绪。
      * 非阻塞；失败静默（仅打日志），不影响应用启动。
      */
@@ -129,6 +179,7 @@ class TlsPinValidator(
     /** 后台线程：加载内置根 → 构造 TrustManager → 发起一次 TLS 握手验证服务器链。 */
     private fun verifyOnBackground() {
         var result = false
+        var leafSpki: String? = null
         var socket: SSLSocket? = null
         var raw: Socket? = null
         try {
@@ -156,8 +207,15 @@ class TlsPinValidator(
             val peerChain = session.peerCertificates
             if (peerChain.isNotEmpty()) {
                 result = true
+                // 记录对端 leaf 证书的 SPKI SHA-256，供 onReceivedSslError 放行时绑定
+                // "当前报错证书"与"本次后台验证证书"的一致性（防缓存窗口内证书被偷换）。
+                val leaf = peerChain[0] as? X509Certificate
+                if (leaf != null) {
+                    leafSpki = spkiSha256Hex(leaf)
+                }
                 Log.i(TAG, "verify ok: chain anchored to pinned ISRG roots " +
-                    "(serverChainSize=${peerChain.size}, cipher=${session.cipherSuite})")
+                    "(serverChainSize=${peerChain.size}, cipher=${session.cipherSuite}, " +
+                    "leafSpki=${leafSpki ?: "unknown"})")
             } else {
                 Log.w(TAG, "verify fail: empty peer certificate chain")
             }
@@ -178,9 +236,10 @@ class TlsPinValidator(
             try { raw?.close() } catch (_: IOException) { /* ignore */ }
             synchronized(verifyLock) { verifying = false }
         }
-        // 无论成功失败都写缓存：成功记录时间戳（窗口内复用），失败也记录便于排错
-        // （失败时 trusted=false，每次 isServerChainTrusted 都会再触发重验）。
-        cache.set(CachedResult(result, nowMono()))
+        // 无论成功失败都写缓存：成功记录时间戳（窗口内复用）+ leaf SPKI，失败也记录
+        // 便于排错（失败时 trusted=false、leafSpkiSha256=null，每次 isServerChainTrusted
+        // 都会再触发重验）。
+        cache.set(CachedResult(result, nowMono(), leafSpki))
     }
 
     /**

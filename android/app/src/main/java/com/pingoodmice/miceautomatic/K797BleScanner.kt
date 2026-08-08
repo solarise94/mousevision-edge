@@ -28,7 +28,8 @@ import java.util.concurrent.ConcurrentHashMap
  * - 身份 = Local Name "K797" + Manufacturer ID 0x0000 + 9 字节前缀；
  * - 真实 BLE 地址是随机私有地址，**不进读数**（读数 address 固定 "diagnostic-only"），
  *   地址仅作发现表的 deviceId；
- * - sequence 进程内单调，start 时清零，每条派发的读数 +1（H5 靠它去重）；
+ * - sequence 进程内单调递增，每条派发的读数 +1（H5 靠它去重）；start **不清零**，
+ *   仅进程重启时归零（有意偏离 ScaleSourceBase.start 的对齐规则，见下方"有意差异点"）；
  * - stable 派生：连续相同 raw ≥3（raw 一变计数重置为 1）；
  * - stale：单调时钟 elapsedRealtime，>15s 无合法包；stale 绝不产生 0g 读数；
  *   scanning 未收过包不进 stale；
@@ -43,6 +44,11 @@ import java.util.concurrent.ConcurrentHashMap
  *   侧 Activity onPause 会停扫描省电，onResume 再 start；若每次 start 都清选择，回
  *   前台后会丢秤、H5 通道误以为还连着。鸿蒙侧 start 清选择，Android 侧保留，系有意
  *   偏离 ScaleSourceBase.start 的对齐规则。
+ * - sequence 跨 stop/start 不清零（进程内单调递增，仅进程重启归零）。原因同上：
+ *   weigh-engine 内部有 `r.sequence <= lastSequence` 的去重，若 start 清零，onPause→
+ *   stop、onResume→start 后序号从 0 重计，H5 会拒绝所有低序号读数，自动判稳长期失效。
+ *   鸿蒙侧 start 清零，Android 侧因前后台切换频繁改为不清零，系有意偏离
+ *   ScaleSourceBase.start 的对齐规则。
  */
 class K797BleScanner(
     context: Context,
@@ -123,6 +129,7 @@ class K797BleScanner(
         @Synchronized set
 
     // 序号与 stale 派生状态（handleParseResult 在 mainHandler 线程上调用，无需额外锁）。
+    // sequenceCounter 进程内单调递增，start 不清零（仅进程重启归零）。
     private var sequenceCounter = 0
     private var lastReadingAtEpochMs: Long? = null
     private var lastReadingAtMonotonicMs: Long? = null
@@ -163,15 +170,19 @@ class K797BleScanner(
 
     /** 网页请求开始扫描（幂等）。
      *
-     * 注意：selectedDeviceId 跨 stop/start 保留（仅 [clearScaleDevice] 清除），
-     * 以支持 Activity onPause/onResume 后台恢复后选秤不丢。这是与 HarmonyOS 侧
-     * ScaleSourceBase.start 的有意差异点（鸿蒙侧 start 会清选择；Android 侧因
-     * 生命周期前后台切换频繁，需保留选择避免每次回前台都丢秤）。 */
+     * 注意（两处与 HarmonyOS 侧 ScaleSourceBase.start 的有意差异）：
+     * - selectedDeviceId 跨 stop/start 保留（仅 [clearScaleDevice] 清除），以支持
+     *   Activity onPause/onResume 后台恢复后选秤不丢。
+     * - sequenceCounter **不清零**：进程内单调递增，仅进程重启归零。原因：weigh-engine
+     *   内部有 `r.sequence <= lastSequence` 去重，若每次 start 清零，onPause→stop、
+     *   onResume→start 后序号从 0 重计，H5 会拒绝所有低序号读数，自动判稳长期失效。
+     *   stable 派生状态（lastRaw / consecutiveSameRaw）仍随 start 重置：它们与序号
+     *   无关，重置只是让"连续相同"计数从新会话重新累计，不影响已派发读数的去重。 */
     fun start() {
         if (started) return
         started = true
-        // 序号与派生状态在每次 start 时清零（H5 侧会处理序号重置）。
-        sequenceCounter = 0
+        // sequenceCounter 不清零（见方法注释：进程内单调，防 stop/start 后序号倒退）；
+        // stable 派生状态重置（与序号无关，仅重置"连续相同"累计）。
         lastReadingAtMonotonicMs = null
         lastReadingAtEpochMs = null
         lastRaw = null

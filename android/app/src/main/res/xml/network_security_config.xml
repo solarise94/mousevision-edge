@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Network Security Config：让 WebView 自己用内置 ISRG 根做证书链验证。
+
+    背景：weight.pingoodmice.top 走 FRP，证书为 Let's Encrypt ECDSA 链（根 ISRG
+    Root X2，另有 X1 交叉签名）。卓易通等旧版 Android 兼容容器内的 WebView 信任库
+    较旧，不信任 X2，导致 ERR_CERT_AUTHORITY_INVALID。Android 7+ 的 WebView 遵循
+    应用的 Network Security Config，配置后符合规范的 WebView 会直接对 API 域名
+    完成正常链验证，根本不会触发 onReceivedSslError。
+
+    策略：
+    - base-config：默认使用系统信任库（不影响其他域名与合成域本地拦截）；
+    - domain-config（weight.pingoodmice.top，不含子域）：信任锚叠加内置 ISRG 根
+      （res/raw/isrg_roots.pem）+ 系统信任库。叠加系统是为了正常设备上即便我们
+      内置 PEM 将来过期也不至断连；LE 链本来就能通过系统信任库。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config>
+        <domain includeSubdomains="false">weight.pingoodmice.top</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/isrg_roots" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

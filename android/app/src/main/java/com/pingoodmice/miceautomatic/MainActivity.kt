@@ -20,6 +20,7 @@ import android.webkit.WebViewClient
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.security.MessageDigest
 
 /**
  * Android 外壳 Activity：WebView 加载打包进 APK 的本地 H5 + 注入 JS 桥 + BLE 扫描 K797 广播秤。
@@ -133,29 +134,45 @@ class MainActivity : Activity(), K797BleScanner.Listener {
             }
 
             /**
-             * 放行真实服务器 host 的 SSL 证书错误（仅在证书链锚定到内置 ISRG 根时）。
+             * 放行真实服务器 host 的 SSL 证书错误（仅在证书链锚定到内置 ISRG 根
+             * **且当前报错证书与后台握手验证过的证书 leaf SPKI 完全一致**时）。
              *
              * 背景：weight.pingoodmice.top 走 FRP，证书为 Let's Encrypt ECDSA 链
              * （根 ISRG Root X2，另有 X1 交叉签名）。卓易通等 Android 兼容容器内的
              * WebView 信任库较旧，不信任 X2 ECDSA 链，导致 ERR_CERT_AUTHORITY_INVALID
              * 无法加载页面。HarmonyOS 原生 WebView（ArkWeb）信任库较新无此问题。
              *
-             * 安全策略（不再全量放行）：
-             * - 仅当 URL 命中受信服务器（isTrustedApiServer）**且** TlsPinValidator 后台
-             *   握手结论为「服务器链锚定到内置 ISRG 根」时才 proceed；
-             * - 否则 cancel。
+             * 主方案是 Network Security Config（见 res/xml/network_security_config.xml）：
+             * 符合规范的 WebView 配置后直接用内置 ISRG 根完成链验证，根本不会走到本回调。
+             * 本方法是兜底加固：仅当 NSC 被某些容器忽略、错误仍上报时才触发。
+             *
+             * 安全策略（三重绑定，缺一不可）：
+             * - URL 命中受信服务器（isTrustedApiServer）；
+             * - TlsPinValidator 后台握手缓存新鲜且结论为「服务器链锚定到内置 ISRG 根」；
+             * - **当前报错证书的 leaf SPKI 与缓存的 leaf SPKI 完全一致**（防缓存窗口内
+             *   被攻击者用另一张或无效证书偷换后也蒙混 proceed）。
+             *   - API 29+：用 SslCertificate.getX509Certificate()（API 29 新增）取 leaf
+             *     X509 证书，算 SPKI SHA-256 比对；
+             *   - API 26-28：SslCertificate 无法提取真实证书（getX509Certificate 在 29
+             *     才有，bundle.getX509Certificates 返回的也是不可信的渲染用副本），无法
+             *     绑定 → 一律 cancel（安全默认）。这些老系统上若 NSC 生效则根本不会走到
+             *     这里；若 NSC 被容器忽略，表现就是连不上而非被劫持，符合安全权衡。
              * 合成域（app.miceautomatic.local）走拦截器，永远不产生真实 TLS，不经过本逻辑。
              *
              * 线程约束：onReceivedSslError 在主线程同步返回，绝不能做网络 IO；
-             * tlsValidator.isServerChainTrusted() 只读后台握手缓存结论，非阻塞。
+             * tlsValidator 只读后台握手缓存结论，非阻塞。
              */
             override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
                 val url = error?.url
-                val trusted = url != null &&
-                    isTrustedApiServer(Uri.parse(url)) &&
+                val hostTrusted = url != null && isTrustedApiServer(Uri.parse(url)) &&
                     ::tlsValidator.isInitialized &&
                     tlsValidator.isServerChainTrusted()
-                if (handler != null && trusted) {
+                // 仅当主机可信且当前报错证书 leaf SPKI 与缓存一致时才放行；
+                // SPKI 不一致或无法提取 → 一律 cancel。
+                val proceed = hostTrusted &&
+                    error != null &&
+                    currentLeafMatchesPinned(error)
+                if (handler != null && proceed) {
                     handler.proceed()
                 } else if (handler != null) {
                     handler.cancel()
@@ -344,6 +361,60 @@ class MainActivity : Activity(), K797BleScanner.Listener {
     /** 仅真实 API 服务器（SSL 错误放行等场景，合成域不涉及真实 TLS）。 */
     private fun isTrustedApiServer(uri: Uri): Boolean =
         uri.scheme == "https" && uri.host == TRUSTED_HOST && uri.port == TRUSTED_PORT
+
+    /**
+     * 判断当前 SslError 报错的 leaf 证书是否与 TlsPinValidator 后台握手验证过的 leaf
+     * 证书 SPKI 完全一致。
+     *
+     * - API 29+：用 [SslCertificate.getX509Certificate]（API 29 新增）取出真实 X509 leaf，
+     *   取其 publicKey 编码做 SHA-256，与 [tlsValidator.verifiedLeafSpkiSha256] 小写 hex
+     *   比对（常量时间）。
+     * - API 26-28：[SslCertificate.getX509Certificate] 不存在、bundle 取出的证书也不是
+     *   可信副本，无法可靠绑定 → 返回 false（安全默认，一律 cancel）。
+     *
+     * 调用前应已确认 [tlsValidator.isServerChainTrusted] 为 true（缓存新鲜），否则本方法
+     * 读到的 pinned SPKI 为 null，必返回 false。
+     */
+    @SuppressLint("NewApi")
+    private fun currentLeafMatchesPinned(error: SslError): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // API 26-28 无法从 SslError 提取真实 leaf 证书：getX509Certificate 在 API 29
+            // 才有；老系统上若 Network Security Config 生效则不会走到本回调，若被容器忽略
+            // 表现为连不上而非被劫持。一律按不匹配处理（安全默认）。
+            return false
+        }
+        val cert = error.certificate ?: return false
+        // API 29 新增：从 SslCertificate 还原真实 X509 证书（内部 Bundle 带 DER）。
+        val x509 = cert.getX509Certificate() ?: return false
+        val currentSpki = spkiSha256Hex(x509)
+        val pinnedSpki = tlsValidator.verifiedLeafSpkiSha256() ?: return false
+        return constantTimeHexEquals(currentSpki, pinnedSpki)
+    }
+
+    /** X509 证书 SPKI SHA-256 → 小写 hex（与 TlsPinValidator.spkiSha256Hex 算法一致）。 */
+    private fun spkiSha256Hex(cert: java.security.cert.X509Certificate): String {
+        val spki = cert.publicKey.encoded
+        val digest = MessageDigest.getInstance("SHA-256").digest(spki)
+        val sb = StringBuilder(digest.size * 2)
+        for (b in digest) {
+            val v = b.toInt() and 0xFF
+            sb.append(HEX_LOWER[v ushr 4])
+            sb.append(HEX_LOWER[v and 0x0F])
+        }
+        return sb.toString()
+    }
+
+    /** 小写 hex 常量时间相等比较：先比长度（长度本身不是秘密），再逐位 OR 累积差异。 */
+    private fun constantTimeHexEquals(a: String, b: String): Boolean {
+        if (a.length != b.length) return false
+        var diff = 0
+        for (i in a.indices) {
+            diff = diff or (a[i].code xor b[i].code)
+        }
+        return diff == 0
+    }
+
+    private val HEX_LOWER = "0123456789abcdef".toCharArray()
 
     /** 从 assets 读取文件并包装为 WebResourceResponse；缺失返回 404。 */
     private fun assetResponse(assetPath: String, mimeType: String, encoding: String?): WebResourceResponse {
