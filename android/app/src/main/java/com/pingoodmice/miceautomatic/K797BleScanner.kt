@@ -37,6 +37,12 @@ import java.util.concurrent.ConcurrentHashMap
  * - 旧版兜底：start 4s 后若从未调用过 selectScaleDevice/clearScaleDevice 且无选择且
  *   发现表非空 → 自动选 rssi 最强；4s 时表为空则每 4s 重试直到页面用 API 或 stop；
  *   getScaleDevices 是纯查询，**不算**触发兜底取消。
+ *
+ * 与 HarmonyOS 侧的有意差异点：
+ * - selectedDeviceId 跨 stop/start 保留（仅 clearScaleDevice 清除）。原因：Android
+ *   侧 Activity onPause 会停扫描省电，onResume 再 start；若每次 start 都清选择，回
+ *   前台后会丢秤、H5 通道误以为还连着。鸿蒙侧 start 清选择，Android 侧保留，系有意
+ *   偏离 ScaleSourceBase.start 的对齐规则。
  */
 class K797BleScanner(
     context: Context,
@@ -127,9 +133,12 @@ class K797BleScanner(
     /** 发现表：deviceId(=BLE 地址) → DiscoveredDevice。ConcurrentHashMap 因扫描回调
      *  可能在 binder 线程上投递，过期清理在 mainHandler 上跑，两者都需要读写。 */
     private val devices: MutableMap<String, DiscoveredDevice> = ConcurrentHashMap()
+    /** 选中的设备 deviceId（=BLE 地址）。跨 stop/start 保留（仅 clearScaleDevice 清除），
+     *  以支持 onPause/onResume 后台恢复后选秤不丢；详见类头注释的有意差异点。 */
     @Volatile private var selectedDeviceId: String? = null
     /** 本次 start 以来页面是否调用过 selectScaleDevice/clearScaleDevice。
-     *  getScaleDevices 是纯查询，不算。一旦为 true 永久取消本次扫描的兜底。 */
+     *  getScaleDevices 是纯查询，不算。一旦为 true 永久取消本次扫描的兜底。
+     *  stop/start 会重置（与 selectedDeviceId 的保留策略不同）。 */
     @Volatile private var devicesApiTouched = false
     @Volatile private var legacyFallbackDone = false
 
@@ -152,17 +161,22 @@ class K797BleScanner(
     // 公开 API（由 ScaleJavascriptBridge / MainActivity 调用，必须在主线程）
     // ============================================================
 
-    /** 网页请求开始扫描（幂等）。 */
+    /** 网页请求开始扫描（幂等）。
+     *
+     * 注意：selectedDeviceId 跨 stop/start 保留（仅 [clearScaleDevice] 清除），
+     * 以支持 Activity onPause/onResume 后台恢复后选秤不丢。这是与 HarmonyOS 侧
+     * ScaleSourceBase.start 的有意差异点（鸿蒙侧 start 会清选择；Android 侧因
+     * 生命周期前后台切换频繁，需保留选择避免每次回前台都丢秤）。 */
     fun start() {
         if (started) return
         started = true
-        // 序号与派生状态在每次 start 时清零（与 ScaleSourceBase.start 一致）。
+        // 序号与派生状态在每次 start 时清零（H5 侧会处理序号重置）。
         sequenceCounter = 0
         lastReadingAtMonotonicMs = null
         lastReadingAtEpochMs = null
         lastRaw = null
         consecutiveSameRaw = 0
-        selectedDeviceId = null
+        // selectedDeviceId 保留（见方法注释）；发现表与兜底标记重置。
         devicesApiTouched = false
         legacyFallbackDone = false
         devices.clear()
@@ -170,7 +184,10 @@ class K797BleScanner(
         onStart()
     }
 
-    /** 网页请求停止扫描（幂等）。清表/清选择/清兜底定时器。 */
+    /** 网页请求停止扫描（幂等）。清表/清兜底定时器。
+     *
+     * selectedDeviceId 保留（仅 [clearScaleDevice] 清除）：onPause 调本方法后，
+     * onResume 恢复扫描时选择仍有效。 */
     fun stop() {
         if (!started) return
         started = false
@@ -179,7 +196,7 @@ class K797BleScanner(
         cancelExpireSweep()
         onStop()
         devices.clear()
-        selectedDeviceId = null
+        // selectedDeviceId 保留：跨 stop/start，支持 onPause/onResume 后台恢复。
         devicesApiTouched = false
         legacyFallbackDone = false
         transition("off", "扫描已停止", force = true)

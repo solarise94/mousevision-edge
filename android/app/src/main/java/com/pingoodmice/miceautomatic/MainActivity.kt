@@ -61,6 +61,7 @@ class MainActivity : Activity(), K797BleScanner.Listener {
 
     private lateinit var webView: WebView
     private lateinit var scanner: K797BleScanner
+    private lateinit var tlsValidator: TlsPinValidator
     private var pendingCameraRequest: PermissionRequest? = null
 
     // 读数 / 设备表 UI 节流状态（仅主线程访问，无需同步）。
@@ -69,15 +70,26 @@ class MainActivity : Activity(), K797BleScanner.Listener {
     private var lastDevicesJson: String? = null
     private var lastDevicesPushMs = 0L
 
+    // H5 是否请求过扫描（startScaleScan 置 true / stopScaleScan 置 false）。
+    // 仅主线程访问（JS 桥回调与 onResume 都在主线程）。用于 onPause 停扫描后，onResume
+    // 自动恢复扫描，避免回到前台后页面以为还连着但原生扫描已停、选秤丢失。
+    private var scaleScanRequested = false
+
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         scanner = K797BleScanner(this, this)
+        // TLS 校验器：内置 ISRG 根做证书 pinning，替代旧版对 SslError 全放行。
+        // onCreate 预热一次后台握手，使缓存尽快进入可信窗口。
+        tlsValidator = TlsPinValidator(this, TRUSTED_HOST, TRUSTED_PORT)
         webView = WebView(this)
         setContentView(webView)
 
         // 称量页必须常亮（对齐鸿蒙侧行为）。
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // 后台预热 TLS 校验：非阻塞，失败静默（仅日志）。
+        tlsValidator.warmup()
 
         webView.settings.javaScriptEnabled = true
         webView.settings.domStorageEnabled = true
@@ -85,8 +97,8 @@ class MainActivity : Activity(), K797BleScanner.Listener {
         webView.addJavascriptInterface(
             ScaleJavascriptBridge(
                 context = this,
-                startScaleScan = { runOnUiThread { ensureBlePermissionAndStart() } },
-                stopScaleScan = { runOnUiThread { scanner.stop() } },
+                startScaleScan = { runOnUiThread { scaleScanRequested = true; ensureBlePermissionAndStart() } },
+                stopScaleScan = { runOnUiThread { scaleScanRequested = false; scanner.stop() } },
                 getScaleStatusJson = { scanner.statusJson() },
                 getScaleDevicesJson = { scanner.devicesJson() },
                 selectScaleDevice = { id -> runOnUiThread { scanner.selectScaleDevice(id) } },
@@ -121,19 +133,29 @@ class MainActivity : Activity(), K797BleScanner.Listener {
             }
 
             /**
-             * 放行真实服务器 host 的 SSL 证书错误。
+             * 放行真实服务器 host 的 SSL 证书错误（仅在证书链锚定到内置 ISRG 根时）。
              *
-             * 背景：weight.pingoodmice.top 走 FRP，证书由 FRP 服务商签发为
-             * Let's Encrypt ECDSA 链（ISRG Root X2）。卓易通等 Android 兼容容器
-             * 内的 WebView 信任库较旧，不信任 X2 ECDSA 链，导致 ERR_CERT_AUTHORITY_INVALID
+             * 背景：weight.pingoodmice.top 走 FRP，证书为 Let's Encrypt ECDSA 链
+             * （根 ISRG Root X2，另有 X1 交叉签名）。卓易通等 Android 兼容容器内的
+             * WebView 信任库较旧，不信任 X2 ECDSA 链，导致 ERR_CERT_AUTHORITY_INVALID
              * 无法加载页面。HarmonyOS 原生 WebView（ArkWeb）信任库较新无此问题。
              *
-             * 仅放行真实服务器（TRUSTED_HOST:TRUSTED_PORT）；合成域走拦截器，永远
-             * 不会产生 SSL 错误，不在此处放行。信任边界已由主机白名单约束。
+             * 安全策略（不再全量放行）：
+             * - 仅当 URL 命中受信服务器（isTrustedApiServer）**且** TlsPinValidator 后台
+             *   握手结论为「服务器链锚定到内置 ISRG 根」时才 proceed；
+             * - 否则 cancel。
+             * 合成域（app.miceautomatic.local）走拦截器，永远不产生真实 TLS，不经过本逻辑。
+             *
+             * 线程约束：onReceivedSslError 在主线程同步返回，绝不能做网络 IO；
+             * tlsValidator.isServerChainTrusted() 只读后台握手缓存结论，非阻塞。
              */
             override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
                 val url = error?.url
-                if (handler != null && url != null && isTrustedApiServer(Uri.parse(url))) {
+                val trusted = url != null &&
+                    isTrustedApiServer(Uri.parse(url)) &&
+                    ::tlsValidator.isInitialized &&
+                    tlsValidator.isServerChainTrusted()
+                if (handler != null && trusted) {
                     handler.proceed()
                 } else if (handler != null) {
                     handler.cancel()
@@ -177,6 +199,12 @@ class MainActivity : Activity(), K797BleScanner.Listener {
     override fun onResume() {
         super.onResume()
         if (::webView.isInitialized) webView.onResume()
+        // 回到前台后恢复扫描：仅当 H5 之前请求过扫描（startScaleScan 已调用、未 stop）。
+        // scanner.start() 内部幂等去重（started 标记）；权限不足会再走授权请求。
+        // 配合 K797BleScanner.stop()/start() 保留 selectedDeviceId，回前台后选秤不丢。
+        if (scaleScanRequested && ::scanner.isInitialized) {
+            ensureBlePermissionAndStart()
+        }
     }
 
     override fun onPause() {
