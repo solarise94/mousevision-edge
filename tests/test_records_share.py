@@ -176,6 +176,31 @@ def _jpeg_bytes(size: int = 32) -> bytes:
     return buf.tobytes()
 
 
+def _tiny_video_bytes(n_frames: int = 12, fps: float = 10.0, size=(48, 36)) -> bytes:
+    """A tiny but real, decodable mp4 (for share/report video-upload tests)."""
+    import cv2
+    import numpy as np
+
+    w, h = size
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    buf_path = None
+    # 用临时文件写视频再用 cv2 读回字节（VideoWriter 需要文件后缀）。
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+        buf_path = tf.name
+    writer = cv2.VideoWriter(buf_path, fourcc, fps, (w, h))
+    try:
+        for i in range(n_frames):
+            img = np.full((h, w, 3), (i * 11 + 5) % 250, dtype=np.uint8)
+            writer.write(img)
+    finally:
+        writer.release()
+    from pathlib import Path
+
+    return Path(buf_path).read_bytes()
+
+
 def test_share_with_uploaded_photo(make_client):
     app_mod = make_client(_SHARE_TOKEN)
     with TestClient(app_mod.app) as c:
@@ -259,3 +284,95 @@ def test_share_idempotency_is_isolated_from_lab_report(make_client):
         assert shr.status_code == 201, shr.text
         assert shr.json()["count"] == 1
         assert shr.json()["skipped"] == []
+
+
+# --------------------------------------------------------------------------- #
+# 5. Regression: 带 video 共享时，shared/ 目录预先不存在 → 仍成功（曾 500）。
+# --------------------------------------------------------------------------- #
+
+
+def test_share_with_video_when_shared_dir_missing(make_client, tmp_path):
+    """Bug 复现：新部署首次「带视频共享」必 500。
+
+    根因：persist_report_records 在 create_run_dir（负责 mkdir）之前就向
+    ``output_root/.report_upload_*`` 写临时视频；share 端点的 output_root 是
+    ``<root>/shared/``，新部署时该目录尚不存在 → FileNotFoundError → 500。
+    修复：写临时视频前先 ``output_root.mkdir(parents=True, exist_ok=True)``。
+    """
+    app_mod = make_client(_SHARE_TOKEN)
+    # 显式断言 precondition：shared/ 目录尚未存在（模拟新部署）。
+    shared_root = Path(app_mod.DEFAULT_OUTPUT) / "shared"
+    assert not shared_root.exists(), "precondition: shared/ 不应预存在"
+
+    video_bytes = _tiny_video_bytes()
+
+    with TestClient(app_mod.app) as c:
+        payload = [{"record_id": "shr-vid-1", "ordinal": 1, "weight_g": 21.0}]
+        files = [("video", ("v.mp4", video_bytes, "video/mp4"))]
+        res = _post_share(c, payload, files=files)
+        assert res.status_code == 201, res.text
+        body = res.json()
+        assert body["ok"] is True
+        assert body["count"] == 1
+
+        # run 落在 shared/ 下，证据视频落到 run 目录里。
+        run_dir = shared_root / body["run_dir"]
+        assert run_dir.is_dir()
+        assert (run_dir / "source.mp4").is_file()
+        # 无残留 .report_upload_* 临时文件。
+        leftovers = list(shared_root.glob(".report_upload_*"))
+        assert leftovers == [], f"残留临时视频文件: {leftovers}"
+
+
+def test_share_with_video_then_idempotent_rereport_no_temp_leak(make_client, tmp_path):
+    """带视频共享成功后，重复上报同 record_id（幂等全跳过）不应残留临时文件，
+    也不应在 shared/ 下残留 .report_upload_*。"""
+    app_mod = make_client(_SHARE_TOKEN)
+    shared_root = Path(app_mod.DEFAULT_OUTPUT) / "shared"
+    video_bytes = _tiny_video_bytes()
+
+    with TestClient(app_mod.app) as c:
+        payload = [{"record_id": "shr-vid-2", "ordinal": 1, "weight_g": 21.0}]
+        files = [("video", ("v.mp4", video_bytes, "video/mp4"))]
+        first = _post_share(c, payload, files=files)
+        assert first.status_code == 201
+
+        # 重复上报（带同一 video）→ 全部跳过，不写 run；video 应被 drain 掉，
+        # 不应在 shared/ 下残留 .report_upload_*。
+        second = _post_share(c, payload, files=files)
+        assert second.status_code == 200, second.text
+        body = second.json()
+        assert body["count"] == 0
+        assert body["run_id"] is None
+
+        leftovers = list(shared_root.glob(".report_upload_*"))
+        assert leftovers == [], f"残留临时视频文件: {leftovers}"
+
+
+def test_share_does_not_touch_boxes_table(make_client):
+    """即使 report_api.configure 传入了 boxes_store，share 端点也不推进箱子编号。
+
+    共享数据与实验室箱子编号完全隔离：共享记录上报后 boxes 表的 next_ordinal
+    不应被推进。
+    """
+    app_mod = make_client(_SHARE_TOKEN)
+    with TestClient(app_mod.app) as c:
+        # 预先建一个箱子，记录其 next_ordinal。
+        cage = "SHARE-BOX-01"
+        app_mod.box_registry.create(cage_id=cage)
+        before = app_mod.box_registry.get(cage)
+        assert before is not None
+        next_before = before["next_ordinal"]
+
+        # 共享上报含 ordinal [1,2] 的记录。
+        payload = [
+            {"record_id": f"shr-box-{i}", "ordinal": i, "weight_g": 20.0 + i}
+            for i in (1, 2)
+        ]
+        res = _post_share(c, payload)
+        assert res.status_code == 201, res.text
+
+        # boxes 表的 next_ordinal 未变（共享不应推进箱子编号）。
+        after = app_mod.box_registry.get(cage)
+        assert after is not None
+        assert after["next_ordinal"] == next_before

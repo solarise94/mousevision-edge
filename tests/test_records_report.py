@@ -73,9 +73,10 @@ def _post(
     video_name="v.mp4",
     readings_obj=None,
     photos=None,
+    _cage: str = "C57-023",
 ):
     data = {
-        "cage_id": "C57-023",
+        "cage_id": _cage,
         "project_id": "default",
         "device_id": "phone-01",
         "records": json.dumps(records),
@@ -682,3 +683,109 @@ def test_report_all_duplicates_with_photos_no_new_run(client):
     assert sorted(body["skipped"]) == ["rec-001"]
 
     assert len(app_mod.registry.list_runs()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 9. 上报后服务端推进箱子 next_ordinal（防同箱下次录制从旧编号重号）。
+# --------------------------------------------------------------------------- #
+
+
+def test_report_advances_box_next_ordinal(client):
+    """上报含 ordinal [3,4] 的记录后，该箱 next_ordinal == 5（max+1）。
+
+    Bug：persist_report_records 持久化记录后不推进 boxes 表 → 下次手机端
+    取到的 next_ordinal 还是旧值 → 同一箱多个「第 1 只」。修复后服务端兜底
+    推进 next_ordinal = max(本次写入 ordinal) + 1。
+    """
+    c, app_mod = client
+    cage = "C57-ADV-01"
+    app_mod.box_registry.create(cage_id=cage)
+
+    payload = [
+        {"record_id": "adv-3", "ordinal": 3, "weight_g": 21.0},
+        {"record_id": "adv-4", "ordinal": 4, "weight_g": 22.0},
+    ]
+    res = _post(c, payload, _cage=cage)
+    assert res.status_code == 201, res.text
+
+    box = app_mod.box_registry.get(cage)
+    assert box is not None
+    assert box["next_ordinal"] == 5, "next_ordinal 应推进至本次最大 ordinal + 1"
+
+
+def test_report_advances_next_ordinal_is_monotonic(client):
+    """next_ordinal 推进是单调的：再上报更小 ordinal 不应回退 next_ordinal。"""
+    c, app_mod = client
+    cage = "C57-ADV-02"
+    app_mod.box_registry.create(cage_id=cage)
+
+    # 第一次推进：上报 ordinal 3 → advance(at_least=4) → next_ordinal=4。
+    _post(
+        c,
+        [{"record_id": "mono-3", "ordinal": 3, "weight_g": 21.0}],
+        _cage=cage,
+    )
+    box = app_mod.box_registry.get(cage)
+    assert box is not None
+    assert box["next_ordinal"] == 4
+    # 第二次上报更小 ordinal（2）→ advance(at_least=3) → max(4,3)=4 不回退。
+    _post(
+        c,
+        [{"record_id": "mono-2", "ordinal": 2, "weight_g": 20.0}],
+        _cage=cage,
+    )
+    box = app_mod.box_registry.get(cage)
+    assert box is not None
+    assert box["next_ordinal"] == 4
+
+
+def test_report_auto_creates_box_and_advances_next_ordinal(client):
+    """箱子不存在时上报 → 自动建箱且 next_ordinal == max+1。
+
+    与 reserve_ordinal 的自动建箱语义一致：未注册的 cage_id 直接兜底建箱，
+    不需要手动 create。mouse_no_start 保持默认 1，next_ordinal 推进至 5。
+    """
+    c, app_mod = client
+    cage = "BALB-AUTO-01"
+    assert app_mod.box_registry.get(cage) is None  # precondition: 箱子不存在
+
+    payload = [
+        {"record_id": "auto-3", "ordinal": 3, "weight_g": 21.0},
+        {"record_id": "auto-4", "ordinal": 4, "weight_g": 22.0},
+    ]
+    res = _post(c, payload, _cage=cage)
+    assert res.status_code == 201, res.text
+
+    box = app_mod.box_registry.get(cage)
+    assert box is not None, "应自动建箱"
+    assert box["next_ordinal"] == 5
+    assert box["mouse_no_start"] == 1  # 建箱默认值不被覆盖
+
+
+def test_report_duplicate_records_does_not_advance_next_ordinal(client):
+    """重复上报同一批 record_id（幂等全跳过）时不应推进 next_ordinal。
+
+    全部记录已存在 → 不创建新 run、无新写入 → 不调用 advance_next_ordinal。
+    """
+    c, app_mod = client
+    cage = "C57-ADV-03"
+    app_mod.box_registry.create(cage_id=cage)
+
+    payload = [
+        {"record_id": "dup-3", "ordinal": 3, "weight_g": 21.0},
+        {"record_id": "dup-4", "ordinal": 4, "weight_g": 22.0},
+    ]
+    first = _post(c, payload, _cage=cage)
+    assert first.status_code == 201
+    box = app_mod.box_registry.get(cage)
+    assert box is not None
+    next_after_first = box["next_ordinal"]
+    assert next_after_first == 5
+
+    # 重复上报同一批（全部幂等跳过）→ next_ordinal 不应再变。
+    second = _post(c, payload, _cage=cage)
+    assert second.status_code == 200
+    assert second.json()["count"] == 0
+    box = app_mod.box_registry.get(cage)
+    assert box is not None
+    assert box["next_ordinal"] == next_after_first

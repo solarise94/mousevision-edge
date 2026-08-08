@@ -370,3 +370,67 @@ class BoxRegistry:
                 raise
             finally:
                 conn.close()
+
+    def advance_next_ordinal(
+        self, cage_id: str, at_least: int, project_id: str = "default"
+    ) -> int:
+        """服务端兜底推进箱子 ``next_ordinal`` 至少到 ``at_least``，返回新值。
+
+        设备端称重上报（``/api/records/report``）落盘后调用，避免同箱下次
+        录制从旧编号重号。与 :meth:`reserve_ordinal` 的语义互补：
+
+        - 箱子存在 → 在 lock 内 ``UPDATE boxes SET next_ordinal = MAX(next_ordinal, at_least)``；
+          单调推进，永不回退已分配的编号。
+        - 箱子不存在 → 按 reserve_ordinal 的自动建箱逻辑建箱（mouse_no_start 保持
+          默认 1，因为历史记录已在盘上；next_ordinal 直接设为 at_least，下一条
+          录制从该编号开始，不与本次上报的记录重号）。
+
+        注意：本方法不扫盘（不依赖 baseline_records），因为调用方已据本次写入的
+        记录计算好 ``at_least``。共享端点（/api/records/share）不调用此方法，
+        使共享数据不推进实验室箱子编号。
+        """
+        at_least = max(0, int(at_least))
+        with self.lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT next_ordinal FROM boxes WHERE cage_id = ?", (cage_id,)
+                ).fetchone()
+                if row is None:
+                    now = _now()
+                    # 自动建箱：next_ordinal 设为 at_least（下一条录制从此编号起，
+                    # 不与本次上报记录重号）。mouse_no_start 保持默认 1。
+                    conn.execute(
+                        """
+                        INSERT INTO boxes (
+                            cage_id, project_id, strain, notes,
+                            mouse_no_start, mouse_no_pad, next_ordinal,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, '', 1, 2, ?, ?, ?)
+                        """,
+                        (
+                            cage_id,
+                            project_id,
+                            strain_from_cage(cage_id),
+                            at_least,
+                            now,
+                            now,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                    return at_least
+                current = int(row["next_ordinal"])
+                new_value = max(current, at_least)
+                if new_value != current:
+                    conn.execute(
+                        "UPDATE boxes SET next_ordinal = ?, updated_at = ? WHERE cage_id = ?",
+                        (new_value, _now(), cage_id),
+                    )
+                conn.execute("COMMIT")
+                return new_value
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()

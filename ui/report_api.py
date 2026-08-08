@@ -55,6 +55,7 @@ _registry: Any = None
 _records_meta: Any = None
 _upload_queue: Any = None
 _output_root: Path = Path(".")
+_boxes_store: Any = None
 
 
 def configure(
@@ -62,12 +63,14 @@ def configure(
     records_meta: Any,
     upload_queue: Any,
     output_root: str | Path,
+    boxes_store: Any = None,
 ) -> None:
-    global _registry, _records_meta, _upload_queue, _output_root
+    global _registry, _records_meta, _upload_queue, _output_root, _boxes_store
     _registry = registry
     _records_meta = records_meta
     _upload_queue = upload_queue
     _output_root = Path(output_root)
+    _boxes_store = boxes_store
 
 
 def _existing_record_dir_for(
@@ -402,6 +405,7 @@ async def report_records(
         output_root=_output_root,
         registry=_registry,
         upload_queue=_upload_queue,
+        boxes_store=_boxes_store,
         cage=cage,
         project=project,
         device=device,
@@ -435,6 +439,7 @@ async def persist_report_records(
     finish_status: str = "device_report",
     extra_manifest: dict[str, Any] | None = None,
     log_prefix: str = "report_api",
+    boxes_store: Any = None,
 ) -> JSONResponse:
     """Shared persistence core for device-reported weighing records.
 
@@ -443,6 +448,9 @@ async def persist_report_records(
     supplies the output root, registry/queue (``None`` isolates storage),
     weight source and optional extra manifest fields (e.g. ``shared`` /
     ``app_version``). Returns the JSONResponse.
+
+    ``boxes_store`` 仅 lab report 端点传入（用于上报后推进箱子 next_ordinal）；
+    share 端点保持 ``None``，使共享数据不触碰实验室箱子编号。
     """
     try:
         records_payload = json.loads(records)
@@ -468,12 +476,19 @@ async def persist_report_records(
     # only move it into the run dir when we actually create a run.
     uploaded_video_path: Path | None = None
     video_suffix = ".mp4"
+    # 原始临时视频路径：用于异常兜底清理。一旦 replace 进 run_dir 即置 None，
+    # 这样后续异常不会误删已并入 run 的证据视频。
+    tmp_video_path: Path | None = None
     if video is not None and to_write:
         video_suffix = _video_suffix(video.filename, video.content_type)
-        tmp_video = output_root / f".report_upload_{uuid.uuid4().hex}{video_suffix}"
+        # output_root 在 share 端点是 <root>/shared/，新部署时可能尚不存在；
+        # create_run_dir 负责建 run 目录但在此之后才调用，这里先确保父目录存在
+        # （对主 report 端点幂等无害）。
+        output_root.mkdir(parents=True, exist_ok=True)
+        tmp_video_path = output_root / f".report_upload_{uuid.uuid4().hex}{video_suffix}"
         size = 0
         try:
-            with tmp_video.open("wb") as handle:
+            with tmp_video_path.open("wb") as handle:
                 while True:
                     chunk = await video.read(1024 * 1024)
                     if not chunk:
@@ -481,12 +496,14 @@ async def persist_report_records(
                     size += len(chunk)
                     handle.write(chunk)
             if size == 0:
-                tmp_video.unlink(missing_ok=True)
-                tmp_video = None  # type: ignore[assignment]
+                tmp_video_path.unlink(missing_ok=True)
+                tmp_video_path = None
         except Exception:
-            tmp_video.unlink(missing_ok=True)
+            tmp_video_path.unlink(missing_ok=True)
             raise
-        uploaded_video_path = tmp_video if (tmp_video and tmp_video.exists()) else None
+        uploaded_video_path = (
+            tmp_video_path if (tmp_video_path and tmp_video_path.exists()) else None
+        )
     elif video is not None:
         # Nothing to write (everything skipped) but a video was uploaded:
         # drain and discard so the multipart body is fully consumed.
@@ -544,181 +561,217 @@ async def persist_report_records(
     )
     run_id = str(manifest["run_id"])
 
-    evidence_rel: str | None = None
-    if uploaded_video_path is not None:
-        target_video = run_dir / f"source{video_suffix}"
-        uploaded_video_path.replace(target_video)
-        uploaded_video_path = target_video
-        evidence_rel = target_video.name
-
-    # dev readings: optional time series of raw scale readings for this session,
-    # collected by the H5 client in dev mode (for future model training). Read +
-    # validate (bounded size, JSON dict with a 'readings' list); on any failure
-    # we skip it without failing the whole report. Original bytes written as-is.
-    readings_saved = False
-    if readings is not None:
-        try:
-            parsed_readings, _reason = await _read_dev_readings(readings)
-            if parsed_readings is not None:
-                (run_dir / "readings.json").write_text(
-                    json.dumps(parsed_readings, ensure_ascii=False), encoding="utf-8"
-                )
-                readings_saved = True
-        except Exception:  # noqa: BLE001 — readings must never fail the report
-            log.exception("%s: failed to persist readings for run %s", log_prefix, run_id)
-            readings_saved = False
-
-    written_records: list[dict[str, Any]] = []
-    record_ids: list[str] = []
-    photos_extracted = 0
-    photos_uploaded = 0
-
-    # Pre-extract one representative frame from the video to reuse when a
-    # record has no clip_start_ms but a video is present.
-    fallback_frame: np.ndarray | None = None
-    if uploaded_video_path is not None:
-        fallback_frame = _extract_video_frame(uploaded_video_path, None)
-
-    for rec in to_write:
-        ordinal = int(rec["ordinal"])
-        mouse_dir = run_dir / f"mouse_{ordinal:03d}"
-        # Collisions inside a single report (same ordinal twice) should
-        # not happen after record_id dedup, but guard anyway.
-        mouse_dir.mkdir(parents=True, exist_ok=True)
-
-        recorded_at = rec.get("recorded_at")
-        if recorded_at:
-            try:
-                datetime.fromisoformat(str(recorded_at))
-                timestamp = str(recorded_at)
-            except ValueError:
-                timestamp = datetime.now().isoformat(timespec="seconds")
-        else:
-            timestamp = datetime.now().isoformat(timespec="seconds")
-
-        record: dict[str, Any] = {
-            "record_id": rec["record_id"],
-            "run_id": run_id,
-            "cage_id": cage,
-            "box_id": cage,
-            "project_id": project,
-            "ordinal": ordinal,
-            "actual_ordinal": ordinal,
-            "weight": rec["weight_g"],
-            "confidence": 1.0,
-            "timestamp": timestamp,
-            "device": device,
-            "photo": "photo.jpg",
-            "weight_source": wsrc,
-            "needs_review": False,
-            "requires_manual_weight": False,
-            "verification_method": "设备本地称重上报",
-        }
-        # 照片来源语义：device_capture=手机端上传、video_frame=服务端抽帧、placeholder=占位。
-        # 上传照片优先；没有则走视频抽帧 → 占位兜底链。
-        photo_source = "placeholder"
-        if rec.get("weight_raw") is not None:
-            record["weight_raw"] = rec["weight_raw"]
-        if rec.get("clip_start_ms") is not None:
-            record["clip_start_ms"] = rec["clip_start_ms"]
-        if rec.get("clip_end_ms") is not None:
-            record["clip_end_ms"] = rec["clip_end_ms"]
-        if evidence_rel:
-            record["evidence_video"] = evidence_rel
-
-        photo_path = mouse_dir / "photo.jpg"
-        produced_real_frame = False
-        # 1) 服务端优先：该 record_id 有上传照片（已过 JPEG/PNG 魔数校验）→ 直接采用。
-        uploaded = uploaded_photos.get(rec["record_id"])
-        if uploaded is not None:
-            photo_path.write_bytes(uploaded)
-            produced_real_frame = True
-            photo_source = "device_capture"
-        else:
-            # 2) 视频抽帧兜底（无上传照片时）。
-            if uploaded_video_path is not None:
-                clip_start = rec.get("clip_start_ms")
-                frame = _extract_video_frame(
-                    uploaded_video_path,
-                    float(clip_start) if clip_start is not None else None,
-                )
-                if frame is None:
-                    frame = fallback_frame
-                if frame is not None:
-                    produced_real_frame = _write_frame_photo(photo_path, frame)
-                    photo_source = "video_frame"
-        if not produced_real_frame:
-            # 3) 最后兜底：占位图，记录仍可见。
-            _write_placeholder_photo(
-                photo_path, label=f"{cage} #{ordinal:03d} {rec['weight_g']}g"
-            )
-        else:
-            if photo_source == "device_capture":
-                photos_uploaded += 1
-            else:
-                photos_extracted += 1
-
-        record["photo_source"] = photo_source
-
-        (mouse_dir / "record.json").write_text(
-            json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        bump_record_count(run_dir)
-        written_records.append(record)
-        record_ids.append(rec["record_id"])
-
-        # Enqueue directly as PENDING: these are final, locally-judged
-        # records. No HELD / postflight phase applies. The share path passes
-        # upload_queue=None so public data never enters the lab queue.
-        if upload_queue is not None:
-            try:
-                upload_queue.enqueue(
-                    record,
-                    mouse_dir / "record.json",
-                    photo_path if photo_path.is_file() else None,
-                    status=UploadStatus.PENDING,
-                )
-            except Exception:
-                log.exception(
-                    "%s: upload_queue.enqueue failed (record_id=%s)",
-                    log_prefix,
-                    rec["record_id"],
-                )
-
-    # Refresh manifest with the aggregate provenance + evidence info.
-    manifest = {
-        **manifest,
-        "record_count": len(written_records),
-        "weight_source": wsrc,
-        "device_id": device,
-        "mode": mode,
-        "evidence_video": evidence_rel,
-    }
-    if strain:
-        manifest["strain"] = strain
-    if readings_saved:
-        manifest["readings_file"] = "readings.json"
-    if extra_manifest:
-        manifest.update(extra_manifest)
-    write_manifest(run_dir, manifest)
-    finish_run(run_dir, status=finish_status)
-
+    # 临时视频兜底清理：create_run_dir 之后、replace 之前若抛异常会残留
+    # .report_upload_* 临时文件；replace 成功后 tmp_video_path 被置 None，
+    # 此 finally 不再误删已并入 run 的证据视频。
     try:
-        rel_run = str(run_dir.resolve().relative_to(output_root.resolve()))
-    except ValueError:
-        rel_run = run_dir.name
+        evidence_rel: str | None = None
+        if uploaded_video_path is not None:
+            target_video = run_dir / f"source{video_suffix}"
+            uploaded_video_path.replace(target_video)
+            uploaded_video_path = target_video
+            evidence_rel = target_video.name
+            # 视频已原子替换进 run 目录：清理指针，避免后续异常误删已并入 run 的证据。
+            tmp_video_path = None
 
-    return JSONResponse(
-        {
-            "ok": True,
-            "run_id": run_id,
-            "run_dir": rel_run,
-            "count": len(written_records),
-            "record_ids": record_ids,
-            "photos_extracted": photos_extracted,
-            "photos_uploaded": photos_uploaded,
-            "skipped": skipped,
-            "readings_saved": readings_saved,
-        },
-        status_code=201,
-    )
+        # dev readings: optional time series of raw scale readings for this session,
+        # collected by the H5 client in dev mode (for future model training). Read +
+        # validate (bounded size, JSON dict with a 'readings' list); on any failure
+        # we skip it without failing the whole report. Original bytes written as-is.
+        readings_saved = False
+        if readings is not None:
+            try:
+                parsed_readings, _reason = await _read_dev_readings(readings)
+                if parsed_readings is not None:
+                    (run_dir / "readings.json").write_text(
+                        json.dumps(parsed_readings, ensure_ascii=False), encoding="utf-8"
+                    )
+                    readings_saved = True
+            except Exception:  # noqa: BLE001 — readings must never fail the report
+                log.exception("%s: failed to persist readings for run %s", log_prefix, run_id)
+                readings_saved = False
+
+        written_records: list[dict[str, Any]] = []
+        record_ids: list[str] = []
+        photos_extracted = 0
+        photos_uploaded = 0
+
+        # Pre-extract one representative frame from the video to reuse when a
+        # record has no clip_start_ms but a video is present.
+        fallback_frame: np.ndarray | None = None
+        if uploaded_video_path is not None:
+            fallback_frame = _extract_video_frame(uploaded_video_path, None)
+
+        for rec in to_write:
+            ordinal = int(rec["ordinal"])
+            mouse_dir = run_dir / f"mouse_{ordinal:03d}"
+            # Collisions inside a single report (same ordinal twice) should
+            # not happen after record_id dedup, but guard anyway.
+            mouse_dir.mkdir(parents=True, exist_ok=True)
+
+            recorded_at = rec.get("recorded_at")
+            if recorded_at:
+                try:
+                    datetime.fromisoformat(str(recorded_at))
+                    timestamp = str(recorded_at)
+                except ValueError:
+                    timestamp = datetime.now().isoformat(timespec="seconds")
+            else:
+                timestamp = datetime.now().isoformat(timespec="seconds")
+
+            record: dict[str, Any] = {
+                "record_id": rec["record_id"],
+                "run_id": run_id,
+                "cage_id": cage,
+                "box_id": cage,
+                "project_id": project,
+                "ordinal": ordinal,
+                "actual_ordinal": ordinal,
+                "weight": rec["weight_g"],
+                "confidence": 1.0,
+                "timestamp": timestamp,
+                "device": device,
+                "photo": "photo.jpg",
+                "weight_source": wsrc,
+                "needs_review": False,
+                "requires_manual_weight": False,
+                "verification_method": "设备本地称重上报",
+            }
+            # 照片来源语义：device_capture=手机端上传、video_frame=服务端抽帧、placeholder=占位。
+            # 上传照片优先；没有则走视频抽帧 → 占位兜底链。
+            photo_source = "placeholder"
+            if rec.get("weight_raw") is not None:
+                record["weight_raw"] = rec["weight_raw"]
+            if rec.get("clip_start_ms") is not None:
+                record["clip_start_ms"] = rec["clip_start_ms"]
+            if rec.get("clip_end_ms") is not None:
+                record["clip_end_ms"] = rec["clip_end_ms"]
+            if evidence_rel:
+                record["evidence_video"] = evidence_rel
+
+            photo_path = mouse_dir / "photo.jpg"
+            produced_real_frame = False
+            # 1) 服务端优先：该 record_id 有上传照片（已过 JPEG/PNG 魔数校验）→ 直接采用。
+            uploaded = uploaded_photos.get(rec["record_id"])
+            if uploaded is not None:
+                photo_path.write_bytes(uploaded)
+                produced_real_frame = True
+                photo_source = "device_capture"
+            else:
+                # 2) 视频抽帧兜底（无上传照片时）。
+                if uploaded_video_path is not None:
+                    clip_start = rec.get("clip_start_ms")
+                    frame = _extract_video_frame(
+                        uploaded_video_path,
+                        float(clip_start) if clip_start is not None else None,
+                    )
+                    if frame is None:
+                        frame = fallback_frame
+                    if frame is not None:
+                        produced_real_frame = _write_frame_photo(photo_path, frame)
+                        photo_source = "video_frame"
+            if not produced_real_frame:
+                # 3) 最后兜底：占位图，记录仍可见。
+                _write_placeholder_photo(
+                    photo_path, label=f"{cage} #{ordinal:03d} {rec['weight_g']}g"
+                )
+            else:
+                if photo_source == "device_capture":
+                    photos_uploaded += 1
+                else:
+                    photos_extracted += 1
+
+            record["photo_source"] = photo_source
+
+            (mouse_dir / "record.json").write_text(
+                json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            bump_record_count(run_dir)
+            written_records.append(record)
+            record_ids.append(rec["record_id"])
+
+            # Enqueue directly as PENDING: these are final, locally-judged
+            # records. No HELD / postflight phase applies. The share path passes
+            # upload_queue=None so public data never enters the lab queue.
+            if upload_queue is not None:
+                try:
+                    upload_queue.enqueue(
+                        record,
+                        mouse_dir / "record.json",
+                        photo_path if photo_path.is_file() else None,
+                        status=UploadStatus.PENDING,
+                    )
+                except Exception:
+                    log.exception(
+                        "%s: upload_queue.enqueue failed (record_id=%s)",
+                        log_prefix,
+                        rec["record_id"],
+                    )
+
+        # Refresh manifest with the aggregate provenance + evidence info.
+        manifest = {
+            **manifest,
+            "record_count": len(written_records),
+            "weight_source": wsrc,
+            "device_id": device,
+            "mode": mode,
+            "evidence_video": evidence_rel,
+        }
+        if strain:
+            manifest["strain"] = strain
+        if readings_saved:
+            manifest["readings_file"] = "readings.json"
+        if extra_manifest:
+            manifest.update(extra_manifest)
+        write_manifest(run_dir, manifest)
+        finish_run(run_dir, status=finish_status)
+
+        # 服务端兜底推进箱子 next_ordinal：本次写入记录的最大 ordinal + 1，
+        # 防止同箱下次录制从旧编号重号。仅 lab report 端点传入 boxes_store；
+        # share 端点不传（共享数据不应推进实验室箱子编号）。异常仅记录日志，
+        # 不阻断上报响应。
+        if boxes_store is not None and written_records:
+            try:
+                max_ordinal = max(int(r.get("ordinal", 0)) for r in written_records)
+                boxes_store.advance_next_ordinal(
+                    cage, max_ordinal + 1, project_id=project
+                )
+            except Exception:  # noqa: BLE001 — ordinal 推进不得阻断上报
+                log.exception(
+                    "%s: advance_next_ordinal failed (cage=%s)",
+                    log_prefix,
+                    cage,
+                )
+
+        try:
+            rel_run = str(run_dir.resolve().relative_to(output_root.resolve()))
+        except ValueError:
+            rel_run = run_dir.name
+
+        return JSONResponse(
+            {
+                "ok": True,
+                "run_id": run_id,
+                "run_dir": rel_run,
+                "count": len(written_records),
+                "record_ids": record_ids,
+                "photos_extracted": photos_extracted,
+                "photos_uploaded": photos_uploaded,
+                "skipped": skipped,
+                "readings_saved": readings_saved,
+            },
+            status_code=201,
+        )
+    finally:
+        # 兜底：若临时视频尚未 replace 进 run_dir（create_run_dir 之后、replace
+        # 之前抛异常），清理残留的 .report_upload_* 临时文件。已 replace 的
+        # tmp_video_path 为 None，不会误删 run 内证据视频。
+        if tmp_video_path is not None:
+            try:
+                tmp_video_path.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001 — 清理失败不应掩盖原始异常
+                log.warning(
+                    "%s: failed to clean up temp video %s",
+                    log_prefix,
+                    tmp_video_path,
+                )

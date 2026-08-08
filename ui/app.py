@@ -796,6 +796,7 @@ report_api.configure(
     records_meta=records_meta,
     upload_queue=upload_queue,
     output_root=str(DEFAULT_OUTPUT),
+    boxes_store=box_registry,
 )
 app.include_router(report_api.router)
 
