@@ -510,6 +510,57 @@ test("lastPersistOk：正常 storage 时为 true", () => {
   assert.equal(ob.lastPersistOk(), true);
 });
 
+/* 死信假落盘回归：主队列 key 可写但 dead key setItem 抛错时，
+ * persist 必须返回 false（合并两次写入结果），enqueue 抛错，
+ * 批次保留在内存队列——重启后死信不丢。
+ * 修复前：persistDead 内部 catch 仅置 lastPersistOk=false，返回后 persist
+ * 又无条件 lastPersistOk=true; return true，导致死信没写进 storage（quota 满）
+ * 但批次已从主队列移除、persist 报告成功，重启后死信永久丢失。 */
+test("persist 合并死信结果：主队列可写但 dead key 抛错 → persist 返回 false、enqueue 抛错、批次保留", () => {
+  const store = {};
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => {
+      // 仅 dead key 抛错（模拟 quota 恰好对死信 key 触发）
+      if (k === RC.DEFAULT_STORAGE_KEY + ".dead") throw new Error("dead key quota");
+      store[k] = String(v);
+    },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  // 主队列 key 写成功，但 dead key 抛错 → persist 合并结果为 false
+  assert.throws(
+    () => ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }),
+    /持久化失败/,
+    "主队列可写但死信 key 抛错 → enqueue 应抛错（persist 合并结果为 false）"
+  );
+  assert.equal(ob.lastPersistOk(), false, "persist 应报告 false（死信写入失败）");
+  // 批次保留在内存队列（不回滚）：下次 persist 恢复后可落盘
+  assert.equal(ob.pending(), 1, "批次保留在内存队列");
+  // 主队列 key 已写入（persist 先写主队列成功），但整体 persist 报 false
+  const raw = storage.getItem(RC.DEFAULT_STORAGE_KEY);
+  assert.ok(typeof raw === "string", "主队列 key 已写入（但 persist 整体仍报 false）");
+  const parsed = JSON.parse(raw);
+  assert.equal(parsed.queue.length, 1, "主队列 key 里有这一批");
+});
+
+test("persistDead 返回 boolean：成功 true / 失败 false（不再 mutate lastPersistOk）", () => {
+  // 死信为空时正常 storage → persistDead 写空数组也返回 true
+  const store1 = {};
+  const storage1 = {
+    getItem: (k) => (k in store1 ? store1[k] : null),
+    setItem: (k, v) => { store1[k] = String(v); },
+    removeItem: (k) => { delete store1[k]; },
+  };
+  const ob1 = RC.createOutbox({ storage: storage1, fetchFn: makeFakeFetch() });
+  ob1.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+  assert.equal(ob1.lastPersistOk(), true, "正常 storage 时 lastPersistOk=true");
+  // 死信 key 也写入了（空数组）
+  const deadRaw = storage1.getItem(RC.DEFAULT_STORAGE_KEY + ".dead");
+  assert.ok(typeof deadRaw === "string", "死信 key 写入空数组");
+  assert.equal(JSON.parse(deadRaw).dead.length, 0);
+});
+
 /* ================================================================== *
  * 5. token 头正确带上
  * ================================================================== */

@@ -110,15 +110,73 @@ test("读数校验：非法 grams/raw/sequence 乱序被拒，缓存不变", () 
   // 非 object
   assert.equal(h.session.ingestReading(null), false);
 
-  // 乱序：sequence 必须 > 上次。先喂 seq=10 成功，再 seq<=10 被忽略。
+  // 去重语义（对齐 scale-bridge.js）：相等=重复投递丢弃；严格下降=扫描器
+  // 重启重置基线接受；严格大于=正常接受。
   h.session.reset();
   assert.equal(h.session.ingestReading({ grams: 0.0, raw: 0, sequence: 10, receivedAtEpochMs: 0 }), true);
-  assert.equal(h.session.ingestReading({ grams: 0.0, raw: 0, sequence: 10, receivedAtEpochMs: 200 }), false); // 相等
-  assert.equal(h.session.ingestReading({ grams: 0.0, raw: 0, sequence: 5, receivedAtEpochMs: 400 }), false); // 回退
-  assert.equal(h.session.ingestReading({ grams: 0.0, raw: 0, sequence: 11, receivedAtEpochMs: 600 }), true); // 正常
-  // 校验通过但乱序的读数不应推进 calibrating（只 2 条有效空秤读数 < 3，仍 calibrating）
-  assert.equal(h.session.getState().state, "calibrating");
+  assert.equal(h.session.ingestReading({ grams: 0.0, raw: 0, sequence: 10, receivedAtEpochMs: 200 }), false); // 相等=重复 → 丢弃
+  // 回退到严格更小（5<10）：扫描器重启 → 重置基线接受（修复前被错误丢弃）
+  assert.equal(h.session.ingestReading({ grams: 0.0, raw: 0, sequence: 5, receivedAtEpochMs: 400 }), true); // 重启
+  assert.equal(h.session.ingestReading({ grams: 0.0, raw: 0, sequence: 11, receivedAtEpochMs: 600 }), true); // 11>5 正常
+  // 此处已推进 3 条有效空秤读数（10/5/11）→ armed（重启接受也算有效读数）
+  assert.equal(h.session.getState().state, "armed");
   assert.equal(h.session.getState().lastGrams, 0.0);
+});
+
+/* ------------------------- 1b. 扫描器重启去重（对齐 scale-bridge.js）---------
+ * 修复前：sequence <= lastSequence 全部拒绝，导致 App 切后台再回来（原生扫描器
+ * 重启、sequence 从 1 重新计数）后所有低序号读数被拒 → announce/post_match
+ * 自动判稳失效。修复后：相等丢弃（重复投递），严格下降视为重启重置基线接受，
+ * 严格大于正常接受。 */
+test("扫描器重启去重：ingest seq 5,4,3 全拒绝；重启 seq 1 接受；重复 seq 1 拒绝；seq 2 接受", () => {
+  const h = makeSession();
+  // 连续严格下降（无中途相等）：5,4,3 序列——首条 5 接受（lastSequence=-1→5），
+  // 后续 4、3 每条都 < 上次，各自视为"重启"重置基线接受（而非拒绝）。
+  // 注意：与 scale-bridge 不同，这里每次下降都被当作一次独立重启接受。
+  assert.equal(h.session.ingestReading(rd(0.0, 5)), true);  // 5 > -1 → 接受，lastSeq=5
+  assert.equal(h.session.ingestReading(rd(0.0, 4)), true);  // 4 < 5 → 重启接受，lastSeq=4
+  assert.equal(h.session.ingestReading(rd(0.0, 3)), true);  // 3 < 4 → 重启接受，lastSeq=3
+  // 此时 calibrating 已有 3 条空秤读数（5/4/3）→ armed
+  assert.equal(h.session.getState().state, "armed");
+  // 模拟扫描器重启：sequence 从 1 重新计数（之前 lastSeq=3）
+  // 重启后 seq=1 < 3 → 重置基线接受（修复前被错误丢弃，克数卡死）
+  h.session.reset();
+  // reset 后 lastSequence=-1；先喂到 seq=3 建立基线，再喂 seq=1 模拟重启
+  assert.equal(h.session.ingestReading(rd(0.0, 1)), true); // 1 > -1 接受 lastSeq=1
+  assert.equal(h.session.ingestReading(rd(0.0, 2)), true); // 2 > 1 接受 lastSeq=2
+  assert.equal(h.session.ingestReading(rd(0.0, 3)), true); // 3 > 2 接受 lastSeq=3
+  // 重复投递 seq=3 → 丢弃（相等）
+  assert.equal(h.session.ingestReading(rd(0.0, 3)), false); // 相等 → 重复丢弃
+  // 扫描器重启：seq=1 < 3 → 重置基线接受，状态机推进
+  assert.equal(h.session.ingestReading(rd(0.0, 1)), true); // 重启接受 lastSeq=1
+  assert.equal(h.session.getState().lastGrams, 0.0);
+  // 重启后重复 seq=1 → 丢弃（相等）
+  assert.equal(h.session.ingestReading(rd(0.0, 1)), false); // 相等 → 丢弃
+  // seq=2 > 1 → 正常接受
+  assert.equal(h.session.ingestReading(rd(0.0, 2)), true); // 正常接受
+  assert.equal(h.session.getState().lastGrams, 0.0);
+});
+
+test("扫描器重启：重启读数带非零重量也能推进 weighing（状态机不卡死）", () => {
+  // 验证重启接受的读数带真实重量时能正常驱动状态机（不只是空秤）
+  const h = makeSession();
+  let seq = reachArmed(h, 0); // armed，lastSeq 已推进
+  seq = reachWeighing(h, 20.0, seq); // weighing，rawWindow 有 2 条 20.0
+  // 喂 seq=N（继续递增）形成 pending/announced 基线
+  h.feed(20.0, seq++); // 第3条 → pending
+  assert.equal(h.session.getState().state, "weighing");
+  // 模拟扫描器重启：seq 回到 1（< 当前 lastSeq）
+  // 重启后的读数应被接受并推进，最终能 announced（修复前会被拒导致永远卡 weighing）
+  let announced = null;
+  for (let i = 0; i < 6; i++) {
+    const r = h.feed(20.0, 1 + i); // seq 从 1 重新计数（每次都 < 上次的递增基线→重启）
+    // 首次 seq=1 视为重启接受；之后 seq=2,3,... 视为正常递增接受
+    assert.equal(r, true, `重启后读数 seq=${1 + i} 应被接受`);
+    const st = h.session.getState();
+    if (st.state === "announced") { announced = st.weightCandidate; break; }
+  }
+  assert.ok(announced !== null, "扫描器重启后仍应能 announced（修复前卡死在 weighing）");
+  assert.ok(Math.abs(announced - 20.0) < 0.05);
 });
 
 /* ------------------------- 2. 校准 ------------------------- */

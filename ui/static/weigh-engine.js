@@ -528,10 +528,25 @@
 
     /* 读数驱动：校验并缓存 BLE 读数，然后推进一次状态机。
      * 返回 true 表示读数已更新缓存；false 表示因 sequence 非单调被忽略。
-     * 读数形状非法时返回 false（缓存不变），不抛错（前端容错）。 */
+     * 读数形状非法时返回 false（缓存不变），不抛错（前端容错）。
+     *
+     * 去重语义（对齐 scale-bridge.js onReadingEvent）：
+     *   - sequence === lastSequence：同一事件的重复投递 → 丢弃，返回 false；
+     *   - sequence < lastSequence（严格小于）：扫描器重启（App 切后台再回来，
+     *     原生扫描器重启、sequence 从 1 重新计数）。视为重启 → 重置基线并接受
+     *     该读数（正常走 lastSequence 更新 + advance），避免重启后所有低序号读数
+     *     被拒导致 announce/post_match 自动判稳失效。BLE 序号进程内单调，
+     *     出现下降只可能是重启，故不视为乱序。
+     *   - sequence > lastSequence：正常接受。
+     * （无 droppedOutOfOrder 计数器——重启重置不计入乱序丢弃，语义一致。） */
     function ingestReading(r) {
       if (!isValidReading(r)) return false;
-      if (r.sequence <= lastSequence) return false;
+      // sequence === lastSequence：重复投递 → 丢弃。
+      // lastSequence 初始 -1，合法 sequence >=0，故首条永远不会命中相等分支。
+      if (r.sequence === lastSequence) return false;
+      // sequence < lastSequence：扫描器重启 → 重置基线，接受该读数。
+      // 不提前 return：走下面的 lastSequence 更新 + advance，状态机正常推进。
+      // （严格大于则正常接受，无需特殊处理。）
       lastSequence = r.sequence;
       bleReading = {
         grams: r.grams,

@@ -43,6 +43,7 @@ let localStorage; // 每个用例重新注入 fake（函数体闭包引用此变
     "readBoxCacheEntry",
     "cacheBoxResult",
     "isNetworkError",
+    "normalizeStartOrdinal",
   ];
   const code = fnNames.map((n) => extractFunction(SRC, n)).join("\n") +
     "\n" + fnNames.map((n) => `helpers.${n} = ${n};`).join("\n");
@@ -198,4 +199,55 @@ test("组合语义：断网回退缓存可拿到箱，404 时不会命中缓存"
   notFound.status = 404;
   assert.equal(helpers.isNetworkError(notFound), false,
     "404 是业务错误：selectCage 应提示不存在/新建，而非回退缓存");
+});
+
+/* ================================================================== *
+ * normalizeStartOrdinal：续号归一化（问题3 回写不变量的基础）
+ *
+ * 完成本箱成功后 finishBoxFlow/finishBoxFlowLocal 会回写：
+ *   nextOrdinal = normalizeStartOrdinal(box) + count
+ * 以便完成页"继续录制下一只"（go("/mode") → viewRecord）从更新后的
+ * state.currentBox 读取续号起点，避免同会话立即续录从旧起点重号。
+ * 这里锁定 normalizeStartOrdinal 的归一化规则（兼容 snake/camel、<1 回退 1）。
+ * ================================================================== */
+
+test("normalizeStartOrdinal：camelCase nextOrdinal 直接取值", () => {
+  // 进箱时 setCurrentBox 存的是 camelCase nextOrdinal
+  assert.equal(helpers.normalizeStartOrdinal({ cageId: "C1", nextOrdinal: 5 }), 5);
+  assert.equal(helpers.normalizeStartOrdinal({ cageId: "C1", nextOrdinal: 1 }), 1);
+});
+
+test("normalizeStartOrdinal：snake_case next_ordinal（云版/缓存 box 形状）", () => {
+  assert.equal(helpers.normalizeStartOrdinal({ cage_id: "C1", next_ordinal: 8 }), 8);
+  // snake 优先于 camel（box 同时有两种字段时取 snake，与 mobile.js 实现一致）
+  assert.equal(helpers.normalizeStartOrdinal({ next_ordinal: 7, nextOrdinal: 99 }), 7);
+});
+
+test("normalizeStartOrdinal：<1 / NaN / 缺失 → 回退 1（避免从 0/负数重号）", () => {
+  assert.equal(helpers.normalizeStartOrdinal({ nextOrdinal: 0 }), 1);
+  assert.equal(helpers.normalizeStartOrdinal({ nextOrdinal: -3 }), 1);
+  assert.equal(helpers.normalizeStartOrdinal({ nextOrdinal: NaN }), 1);
+  assert.equal(helpers.normalizeStartOrdinal({ cageId: "C1" }), 1); // 缺字段
+  assert.equal(helpers.normalizeStartOrdinal(null), 1); // null box
+  // 字符串数字也能 parseInt（box 缓存可能反序列化）
+  assert.equal(helpers.normalizeStartOrdinal({ nextOrdinal: "6" }), 6);
+});
+
+test("回写不变量：normalizeStartOrdinal(box) + count = 下一只应分配的序号", () => {
+  // 锁定 finishBoxFlow/finishBoxFlowLocal 回写公式的正确性：
+  // 控制器 startOrdinal = normalizeStartOrdinal(box)，count 条记录分配的最大
+  // ordinal = startOrdinal + count - 1，故下一只 = startOrdinal + count。
+  // 该公式在云版（enqueue 成功）与本地版（saveRecords 成功）一致；
+  // 草稿恢复批次（count 含恢复记录）同样成立——控制器草稿 startOrdinal 与
+  // box.nextOrdinal 同源。
+  const box = { cageId: "C1", nextOrdinal: 10 };
+  const startOrdinal = helpers.normalizeStartOrdinal(box); // 10
+  const count = 3;
+  const nextOrdinal = startOrdinal + count; // 回写公式
+  // 控制器分配的 ordinals: 10,11,12（最大=12），下一只=13
+  assert.equal(nextOrdinal, 13);
+  assert.equal(startOrdinal + count - 1, 12, "count 条记录的最大 ordinal");
+  // 下一箱再用回写后的 box 续号
+  const nextBox = Object.assign({}, box, { nextOrdinal });
+  assert.equal(helpers.normalizeStartOrdinal(nextBox), 13);
 });

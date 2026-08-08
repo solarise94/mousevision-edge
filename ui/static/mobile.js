@@ -2425,6 +2425,20 @@
         // 兜底：enqueue 失败时也给出 count，避免完成页显示"共 0 只"
         result = { count: recordedBeforeEnqueue, batchId: null };
       }
+      // 回写 nextOrdinal：完成页"继续录制下一只"会直接读 state.currentBox.nextOrdinal
+      // 作为下一箱的 startOrdinal。若不回写，同会话立即续录会从旧起点重号（服务器虽
+      // 已推进，本地 state 没刷）。仅在 enqueue 成功（enqueueErr 为空且 count>0）时回写：
+      // 控制器以 normalizeStartOrdinal(box) 为 startOrdinal，count 条记录分配的最大
+      // ordinal = startOrdinal + count - 1，故下一只 = startOrdinal + count = normalizeStartOrdinal(box) + count
+      // （草稿恢复批次 count 含恢复记录，控制器草稿 startOrdinal 与 box.nextOrdinal 同源，不变量成立）。
+      // enqueue 失败时不回写：草稿保留，下次 start() 会以草稿 startOrdinal 恢复续号。
+      // 用新对象 + setCurrentBox 同步 sessionStorage（viewRecord 闭包里的 box 仍指旧对象，
+      // 但完成页按钮 go("/mode") → viewRecord 会重新读 state.currentBox 拿到新值）。
+      if (!enqueueErr && result && typeof result.count === "number" && result.count > 0) {
+        setCurrentBox(Object.assign({}, box, {
+          nextOrdinal: normalizeStartOrdinal(box) + result.count,
+        }));
+      }
       // 3) 触发立即补传（在线即发；离线由 outbox 退避重试 / online 事件补传）
       const flushP = reportOutbox.flush().catch(function () {});
 
@@ -2471,6 +2485,17 @@
       // photo（photo 是 finishBox 时才合并的），恢复后重新走完成流程即可，可接受。
       if (!saveErr) {
         try { localStorage.removeItem(LocalWeigh._draftKey(box.cageId)); } catch (_) {}
+        // 回写 nextOrdinal（与云版 finishBoxFlow 同源逻辑）：完成页"继续录制下一只"
+        // 会直接读 state.currentBox.nextOrdinal 作下一箱 startOrdinal。仅在 saveRecords
+        // 成功时回写：控制器以 normalizeStartOrdinal(box) 为 startOrdinal，count 条记录
+        // 分配的最大 ordinal = startOrdinal + count - 1，故下一只 = startOrdinal + count
+        // = normalizeStartOrdinal(box) + count（草稿恢复批次 count 含恢复记录，不变量成立）。
+        // saveErr 时不回写：草稿保留，下次 start() 以草稿 startOrdinal 恢复续号。
+        // 用新对象 + setCurrentBox 同步 sessionStorage（完成页 go("/mode") → viewRecord
+        // 重新读 state.currentBox 拿到新值；viewRecord 闭包里的 box 仍指旧对象无影响）。
+        setCurrentBox(Object.assign({}, box, {
+          nextOrdinal: normalizeStartOrdinal(box) + count,
+        }));
       }
       // 视频证据保存到 IndexedDB（不阻断：失败仅影响证据缺失，不回滚记录保存）。
       // 改进：捕获失败状态，传给 renderReportLocalDone 显示一行警告。

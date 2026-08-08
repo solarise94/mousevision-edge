@@ -236,14 +236,20 @@
     var lastPersistOk = true;
 
     /* ---------- 持久化 ----------
-     * 返回 boolean：true=成功落盘；false=storage 不可用或抛错（quota/不可写）。
-     * 调用方按需决定是否重试/抛错（enqueue 失败要抛、flush 内部失败仍吞）。
+     * 返回 boolean：true=主队列与死信都成功落盘；false=storage 不可用或任一抛错
+     * （quota/不可写）。调用方按需决定是否重试/抛错（enqueue 失败要抛、
+     * flush 内部失败仍吞）。
+     *
+     * 注意：必须合并主队列与死信两次写入的结果——死信（4xx 批次）落盘失败时
+     * 若只报告成功，批次已从主队列移除，重启后死信永久丢失（死信假落盘）。
      */
     function persist() {
       if (!storage || typeof storage.setItem !== "function") {
         lastPersistOk = false;
         return false;
       }
+      // 主队列写入。失败直接返回（quota/不可写），不继续写死信（避免部分落盘误报）。
+      var okMain = false;
       try {
         // 只序列化可 JSON 化的字段：剥掉 videoBlobRef（Blob/File 不可序列化，
         // 且我们有意不持久化视频，见文件头注释）。
@@ -254,25 +260,31 @@
           return o;
         });
         storage.setItem(key, JSON.stringify({ v: 1, queue: serializable }));
-        // 死信一并落盘：4xx 拒收的批次也持久化（独立 key），reload 后仍可查/重发。
-        persistDead();
-        lastPersistOk = true;
-        return true;
+        okMain = true;
       } catch (_) {
         // 存储失败（quota / 不可写）不应阻断 flush 主流程；记录已入内存队列，
         // 下次成功 persist 时再落盘。调用方可通过 lastPersistOk()/onChange 监控。
         lastPersistOk = false;
         return false;
       }
+      // 死信一并落盘：4xx 拒收的批次也持久化（独立 key），reload 后仍可查/重发。
+      // 合并两次结果：任一失败都视为本次 persist 失败，避免死信假落盘。
+      var ok = okMain && persistDead();
+      lastPersistOk = ok;
+      return ok;
     }
 
-    /* 死信持久化（独立 key，便于排查与隔离）。失败仅置 lastPersistOk=false，不抛错。 */
+    /* 死信持久化（独立 key，便于排查与隔离）。
+     * 返回 boolean：true=成功落盘（含死信为空时写入空数组也算成功）；
+     * false=storage 不可用或抛错。不抛错、不直接修改 lastPersistOk
+     * （由调用方 persist 合并结果后统一回写）。 */
     function persistDead() {
-      if (!storage || typeof storage.setItem !== "function") return;
+      if (!storage || typeof storage.setItem !== "function") return false;
       try {
         storage.setItem(deadKey, JSON.stringify({ v: 1, dead: deadLetter }));
+        return true;
       } catch (_) {
-        lastPersistOk = false;
+        return false;
       }
     }
 
