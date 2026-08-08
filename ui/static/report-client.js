@@ -148,6 +148,36 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * dataURL → Blob 转换（确认瞬间照片）。
+   * dataURL 形如 "data:image/jpeg;base64,...."，atob 解码需按字节处理，
+   * 不能直接遍历字符串（UTF-16 字符 → 1 字节，会丢高位/越界）。
+   * 返回 {blob, mime}；解析失败返回 null（调用方跳过该照片，不阻断上报）。
+   * ------------------------------------------------------------------ */
+  function dataUrlToBlob(dataUrl) {
+    if (typeof dataUrl !== "string") return null;
+    var m = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
+    if (!m) return null;
+    var mime = m[1] || "image/jpeg";
+    var b64 = m[2] || "";
+    if (!b64) return null;
+    try {
+      var bin = atob(b64);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) {
+        bytes[i] = bin.charCodeAt(i);
+      }
+      return { blob: new Blob([bytes], { type: mime }), mime: mime };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // 文件名安全化：record_id 只保留 [A-Za-z0-9_-]，避免路径/表单注入。
+  function safePhotoStem(recordId) {
+    return String(recordId == null ? "" : recordId).replace(/[^A-Za-z0-9_-]/g, "");
+  }
+
+  /* ------------------------------------------------------------------ *
    * outbox 工厂。opts 全部可选，依赖注入便于测试：
    *   storage      localStorage 兼容对象（getItem/setItem/removeItem）
    *   key          存储键，默认 "mv.reportOutbox.v1"
@@ -268,8 +298,23 @@
       if (b.project_id != null) fd.append("project_id", String(b.project_id));
       if (b.device_id != null) fd.append("device_id", String(b.device_id));
       if (b.weight_source != null) fd.append("weight_source", String(b.weight_source));
-      // records：JSON 字符串数组
+      // records：JSON 字符串数组（photo 字段随 records JSON 保留，幂等重传时仍在）
       fd.append("records", JSON.stringify(b.records || []));
+      // 确认瞬间照片：records 里带 photo(dataURL) 的，每条追加一个文件字段 photos，
+      // filename <record_id>.jpg（record_id 已按 [A-Za-z0-9_-] 过滤防注入）。
+      // 服务端按 filename stem → record_id 建映射；dataURL 转 Blob 用二进制安全 atob。
+      var photos = b.records || [];
+      for (var pi = 0; pi < photos.length; pi++) {
+        var prec = photos[pi];
+        if (!prec || typeof prec.photo !== "string" || !prec.photo) continue;
+        var converted = dataUrlToBlob(prec.photo);
+        if (!converted) continue; // 非法 dataURL → 跳过，仍发记录
+        var stem = safePhotoStem(prec.record_id);
+        if (!stem) continue; // record_id 被过滤空 → 无法对应，跳过
+        try {
+          fd.append("photos", converted.blob, stem + ".jpg");
+        } catch (_) { /* 单个照片异常 → 跳过该照片，仍发记录 */ }
+      }
       // dev 采集的天平读数时间序列：普通对象，附为 JSON Blob 文件字段。
       // 可持久化到 localStorage outbox（与 video Blob 不同），reload 后仍随记录补传。
       if (item.readings && typeof item.readings === "object") {
@@ -555,6 +600,8 @@
     createMemoryStorage: createMemoryStorage,
     readTokenFromDocument: readTokenFromDocument,
     uuid: uuid,
+    dataUrlToBlob: dataUrlToBlob,
+    safePhotoStem: safePhotoStem,
     DEFAULT_STORAGE_KEY: DEFAULT_STORAGE_KEY,
     DEFAULT_ENDPOINT: DEFAULT_ENDPOINT,
     DEFAULT_BASE_INTERVAL_MS: DEFAULT_BASE_INTERVAL_MS,

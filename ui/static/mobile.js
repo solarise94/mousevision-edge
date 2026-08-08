@@ -1754,8 +1754,9 @@
     let finished = false;             // 完成本箱已触发
     let abandoned = false;            // 离开页面（非完成）→ 不上报
 
-    // 本地版照片：accept/手动录入成功时从相机预览抓帧，record_id → dataURL。
-    // 仅 local edition 使用；云版零开销（map 为空、不抓帧）。
+    // 确认瞬间照片：accept/手动录入成功时从相机预览抓帧，record_id → dataURL。
+    // 两版统一：本地版写本机记录、云版随 outbox 上报，服务端优先用上传照片、
+    // 视频抽帧降级为兜底。dataURL 是字符串，可随 records JSON 持久化（reload 不丢）。
     const photoByRecordId = {};
 
     // Pixel-exact 9:16 layout within the host (excludes bottom dock chrome).
@@ -2088,8 +2089,8 @@
       scaleMeta.hidden = false;
     }
 
-    /* 本地版照片抓帧：从相机预览 <video> 抽一帧转 JPEG dataURL。
-     * 画布/帧未就绪或抓取失败 → 返回 null（不阻断记录流程）。仅 local edition 调用。 */
+    /* 确认瞬间照片抓帧：从相机预览 <video> 抽一帧转 JPEG dataURL。
+     * 画布/帧未就绪或抓取失败 → 返回 null（不阻断记录流程）。两版统一调用。 */
     function capturePhoto() {
       try {
         if (!video || typeof video.videoWidth !== "number" || video.videoWidth === 0) return null;
@@ -2178,13 +2179,11 @@
       }
       if (type === "recorded") {
         // 成功录入一只（announce 人工 / post_match 自动 / manual 点按）：
-        // 本地版在此刻从相机预览抓帧存照（云版不抓，零开销）。
-        if (IS_LOCAL_EDITION) {
-          const rec = payload && payload.record;
-          if (rec && rec.record_id) {
-            const p = capturePhoto();
-            if (p) photoByRecordId[String(rec.record_id)] = p;
-          }
+        // 两版统一，在此刻从相机预览抓帧存照（确认瞬间照片，服务端优先用）。
+        const rec = payload && payload.record;
+        if (rec && rec.record_id) {
+          const p = capturePhoto();
+          if (p) photoByRecordId[String(rec.record_id)] = p;
         }
         return;
       }
@@ -2316,6 +2315,20 @@
     }
 
     /* --- 完成本箱：停止录像 → 本地保存（local edition）或 outbox 入队（云版）--- */
+    /* 把确认瞬间抓帧照片（photoByRecordId: record_id → dataURL）合并进记录数组。
+     * 就地 mutate：有照片的记录补上 photo 字段，无照片的记录保持原样。两版共用
+     * 同一段合并逻辑——云版在 finishBox 入队前对控制器内部 records 就地补 photo
+     * （浅拷贝数组，元素仍是同一批 record 对象，随 outbox 持久化 + 上报）；
+     * 本地版在写本机记录前对拷贝数组合并。 */
+    function attachRecordPhotos(records) {
+      (records || []).forEach(function (r) {
+        if (!r) return;
+        const photo = photoByRecordId[String(r.record_id)];
+        if (photo) r.photo = photo;
+      });
+      return records;
+    }
+
     function finishBoxFlow(blob, filename, durationSec, uploadOpts) {
       stopDraw();
       stopStream(stream);
@@ -2332,9 +2345,12 @@
 
       // 2) 累积批次入队 outbox（含视频证据 Blob）→ 返回 {count, batchId}
       //    dev 模式：若控制器采集了读数，附进上报（可序列化、可离线补传）
+      //    照片：在 finishBox 入队前把确认瞬间抓帧合并进 records（就地补 photo 字段，
+      //    随 outbox 持久化，reload 不丢；上传时 report-client 转成 photos 文件字段）。
       let result = null;
       let enqueueErr = null;
       try {
+        if (ctrl) { try { attachRecordPhotos(ctrl._records()); } catch (_) {} }
         let readingsPayload = null;
         if (DEV_MODE && ctrl && typeof ctrl.getReadingsPayload === "function") {
           try { readingsPayload = ctrl.getReadingsPayload(); } catch (_) {}
@@ -2363,11 +2379,10 @@
       try {
         records = (ctrl && typeof ctrl._records === "function") ? ctrl._records() : [];
       } catch (_) {}
-      // 合并照片（photoByRecordId 以 record_id 索引；无照片的记录保持原样）
-      const recordsWithPhoto = records.map(function (r) {
-        const photo = photoByRecordId[String(r.record_id)];
-        return photo ? Object.assign({}, r, { photo: photo }) : r;
-      });
+      // 合并照片（photoByRecordId 以 record_id 索引；无照片的记录保持原样）。
+      // 复用 attachRecordPhotos——与云版同一段合并逻辑。
+      const recordsWithPhoto = records.slice();
+      attachRecordPhotos(recordsWithPhoto);
       // 本地模式未走 ctrl.finishBox，需手动清草稿，避免下一箱恢复旧记录
       try { localStorage.removeItem(LocalWeigh._draftKey(box.cageId)); } catch (_) {}
 

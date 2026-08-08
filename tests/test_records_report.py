@@ -72,6 +72,7 @@ def _post(
     video_bytes=None,
     video_name="v.mp4",
     readings_obj=None,
+    photos=None,
 ):
     data = {
         "cage_id": "C57-023",
@@ -79,21 +80,48 @@ def _post(
         "device_id": "phone-01",
         "records": json.dumps(records),
     }
-    files = {}
+    # 统一用 list-of-pairs（TestClient 支持多值文件字段 / 多字段混用）
+    files: list = []
     if video_bytes is not None:
-        files["video"] = (video_name, video_bytes, "video/mp4")
+        files.append(("video", (video_name, video_bytes, "video/mp4")))
     if readings_obj is not None:
-        files["readings"] = (
-            "readings.json",
-            json.dumps(readings_obj).encode("utf-8"),
-            "application/json",
+        files.append(
+            (
+                "readings",
+                (
+                    "readings.json",
+                    json.dumps(readings_obj).encode("utf-8"),
+                    "application/json",
+                ),
+            )
         )
+    if photos:
+        # photos: list[(record_id, bytes)] → 每个都作为多值字段 photos 追加
+        for rid, content in photos:
+            files.append(("photos", (f"{rid}.jpg", content, "image/jpeg")))
     return client.post(
         "/api/records/report",
         data=data,
         files=files or None,
         headers=_headers(),
     )
+
+
+def _jpeg_bytes(size: int = 32) -> bytes:
+    """A tiny but real JPEG (JFIF) encoded via cv2 — valid magic bytes."""
+    img = np.full((8, 8, 3), 120, dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", img)
+    assert ok
+    return buf.tobytes()
+
+
+def _png_bytes() -> bytes:
+    import io
+
+    img = np.full((8, 8, 3), 80, dtype=np.uint8)
+    ok, buf = cv2.imencode(".png", img)
+    assert ok
+    return buf.tobytes()
 
 
 # --------------------------------------------------------------------------- #
@@ -525,3 +553,132 @@ def test_report_without_readings_has_no_readings_field(client):
     assert body["readings_saved"] is False
     run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
     assert not (run_dir / "readings.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# 8. 确认瞬间照片上传：手机端抓帧随记录上报，服务端优先采用（视频抽帧降级兜底）
+# --------------------------------------------------------------------------- #
+
+
+def test_report_with_uploaded_photos_uses_device_capture(client):
+    """带 photos 上传 → photo.jpg 用上传内容（非占位）、photo_source 正确、计数。"""
+    c, app_mod = client
+    photo = _jpeg_bytes()
+    payload = [
+        {"record_id": "rec-p1", "ordinal": 1, "weight_g": 23.5},
+        {"record_id": "rec-p2", "ordinal": 2, "weight_g": 24.0},
+    ]
+    res = _post(c, payload, photos=[("rec-p1", photo)])
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["photos_uploaded"] == 1
+    assert body["photos_extracted"] == 0  # 无视频、无上传 → 只有 1 条被采用，另 1 条占位
+
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+
+    # 有上传照片的记录：photo.jpg 字节 == 上传内容（非占位）
+    p1 = run_dir / "mouse_001" / "photo.jpg"
+    assert p1.is_file()
+    assert p1.read_bytes() == photo, "photo.jpg 应为手机端上传内容"
+    rec1 = json.loads((run_dir / "mouse_001" / "record.json").read_text("utf-8"))
+    assert rec1["photo_source"] == "device_capture"
+
+    # 无上传照片的记录：走占位兜底（无视频）
+    p2 = run_dir / "mouse_002" / "photo.jpg"
+    assert p2.is_file()
+    assert p2.read_bytes() != photo
+    img2 = cv2.imread(str(p2))
+    assert img2 is not None
+    rec2 = json.loads((run_dir / "mouse_002" / "record.json").read_text("utf-8"))
+    assert rec2["photo_source"] == "placeholder"
+
+
+def test_report_partial_photos_mixed_paths(client, tmp_path):
+    """部分记录有照片、部分没有 → 各自走对应路径（上传 vs 视频抽帧/占位）。"""
+    c, app_mod = client
+    photo = _jpeg_bytes()
+    video_file = tmp_path / "mix.mp4"
+    _write_synthetic_video(video_file, n_frames=20, fps=10.0, size=(48, 36))
+    payload = [
+        {"record_id": "mix-a", "ordinal": 1, "weight_g": 20.0, "clip_start_ms": 500},
+        {"record_id": "mix-b", "ordinal": 2, "weight_g": 21.0, "clip_start_ms": 500},
+        {"record_id": "mix-c", "ordinal": 3, "weight_g": 22.0},  # 无照片 → 抽帧
+    ]
+    res = _post(
+        c,
+        payload,
+        video_bytes=video_file.read_bytes(),
+        video_name="mix.mp4",
+        photos=[("mix-a", photo)],
+    )
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["photos_uploaded"] == 1  # mix-a 上传采用
+    assert body["photos_extracted"] == 2  # mix-b(抽帧) + mix-c(抽帧)
+
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+
+    # mix-a：上传内容
+    pa = run_dir / "mouse_001" / "photo.jpg"
+    assert pa.read_bytes() == photo
+    assert json.loads((run_dir / "mouse_001" / "record.json").read_text("utf-8"))["photo_source"] == "device_capture"
+
+    # mix-b、mix-c：视频抽帧（维度匹配源视频 48x36）
+    for i in (2, 3):
+        p = run_dir / f"mouse_{i:03d}" / "photo.jpg"
+        img = cv2.imread(str(p))
+        assert img is not None
+        assert img.shape[:2] == (36, 48), "应为视频抽帧而非占位"
+        assert json.loads((run_dir / f"mouse_{i:03d}" / "record.json").read_text("utf-8"))["photo_source"] == "video_frame"
+
+
+def test_report_uploaded_png_photo_accepted(client):
+    """上传 PNG 照片（魔数合法）→ 服务端采用，photo_source=device_capture。"""
+    c, app_mod = client
+    png = _png_bytes()
+    payload = [{"record_id": "rec-png", "ordinal": 1, "weight_g": 21.0}]
+    res = _post(c, payload, photos=[("rec-png", png)])
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["photos_uploaded"] == 1
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    p = run_dir / "mouse_001" / "photo.jpg"
+    assert p.read_bytes() == png
+    assert json.loads((run_dir / "mouse_001" / "record.json").read_text("utf-8"))["photo_source"] == "device_capture"
+
+
+def test_report_invalid_photo_bytes_falls_back(client):
+    """伪造非法照片字节 → 魔数校验不通过 → 回退占位/抽帧，不报错。"""
+    c, app_mod = client
+    payload = [{"record_id": "rec-fake", "ordinal": 1, "weight_g": 20.0}]
+    res = _post(c, payload, photos=[("rec-fake", b"not-an-image-at-all")])
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["photos_uploaded"] == 0
+    assert body["photos_extracted"] == 0
+    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    p = run_dir / "mouse_001" / "photo.jpg"
+    assert p.is_file()
+    img = cv2.imread(str(p))
+    assert img is not None  # 占位图仍是可读 JPEG
+    assert json.loads((run_dir / "mouse_001" / "record.json").read_text("utf-8"))["photo_source"] == "placeholder"
+
+
+def test_report_all_duplicates_with_photos_no_new_run(client):
+    """全部重复上报（带 photos）→ 不建 run，照片被 drain。"""
+    c, app_mod = client
+    payload = _records_payload(1)
+    photo = _jpeg_bytes()
+    first = _post(c, payload, photos=[("rec-001", photo)])
+    assert first.status_code == 201
+    runs_before = app_mod.registry.list_runs()
+    assert len(runs_before) == 1
+
+    second = _post(c, payload, photos=[("rec-001", photo)])
+    assert second.status_code == 200
+    body = second.json()
+    assert body["count"] == 0
+    assert body["photos_uploaded"] == 0
+    assert sorted(body["skipped"]) == ["rec-001"]
+
+    assert len(app_mod.registry.list_runs()) == 1

@@ -806,11 +806,137 @@ test("readings: flush 成功后随批次移除（不残留到下批）", async (
   const fetchFn = makeFakeFetch();
   const ob = RC.createOutbox({ storage, fetchFn });
   ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] }, null, aReadingsPayload(1));
-  ob.enqueue({ cage_id: "C2", records: [aRecord(1, 2)] }); // 第二批无 readings
+  ob.enqueue({ cage_id: "C2", records: [aRecord(2, 2)] }); // 第二批无 readings
   await ob.flush();
   assert.equal(fetchFn.calls.length, 2);
   // 第一批带 readings
   assert.notEqual(fetchFn.calls[0].init.body.get("readings"), null);
   // 第二批无 readings
   assert.equal(fetchFn.calls[1].init.body.get("readings"), null);
+});
+
+/* ================================================================== *
+ * 8. 确认瞬间照片：records 里带 photo(dataURL) → 追加 photos 文件字段，
+ *    record_id 特殊字符过滤、持久化往返 photo 不丢
+ * ================================================================== */
+
+/* 构造一个合法 JPEG dataURL（含 1x1 像素 base64） */
+function aPhotoDataUrl() {
+  // 最小 JPEG：ffd8 ffe0 ... ff d9（真实魔数，值任意——客户端不做解码）
+  const bytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0xff, 0xd9]);
+  let bin = "";
+  bytes.forEach((b) => { bin += String.fromCharCode(b); });
+  const b64 = btoa(bin);
+  return "data:image/jpeg;base64," + b64;
+}
+
+test("photos: dataUrlToBlob 正确解码（atob 二进制安全，字节逐一还原）", () => {
+  const url = aPhotoDataUrl();
+  const out = RC.dataUrlToBlob(url);
+  assert.notEqual(out, null);
+  assert.equal(out.mime, "image/jpeg");
+  assert.ok(out.blob instanceof Blob);
+  // 还原后的字节与原 dataURL 中 base64 解码一致（长度 >0）
+  return out.blob.arrayBuffer().then((buf) => {
+    const bytes = new Uint8Array(buf);
+    assert.equal(bytes.length, 14);
+    assert.equal(bytes[0], 0xff);
+    assert.equal(bytes[1], 0xd8);
+    assert.equal(bytes[bytes.length - 1], 0xd9);
+  });
+});
+
+test("photos: safePhotoStem 只保留 [A-Za-z0-9_-]", () => {
+  assert.equal(RC.safePhotoStem("rec-001"), "rec-001");
+  assert.equal(RC.safePhotoStem("a_b.c/d:?x"), "a_bcdx"); // 点/斜杠/冒号/问号被过滤
+  assert.equal(RC.safePhotoStem("../evil/../x"), "evilx");
+  assert.equal(RC.safePhotoStem(""), "");
+});
+
+test("photos: 带 photo 的 record → FormData 有 photos 文件字段且 filename 正确", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const rec = RC.buildRecord({ ordinal: 1, weight_g: 25.0 });
+  rec.photo = aPhotoDataUrl();
+  ob.enqueue({ cage_id: "C1", records: [rec] });
+  await ob.flush();
+
+  assert.equal(fetchFn.calls.length, 1);
+  const fd = fetchFn.calls[0].init.body;
+  const photoField = fd.get("photos");
+  assert.notEqual(photoField, null, "photos 文件字段应被 append");
+  // FormData.get 返回的 File 带 name → filename = <record_id>.jpg
+  assert.equal(photoField.name, rec.record_id + ".jpg");
+  // records JSON 本体里的 photo 字段保留（幂等重传时仍在）
+  const recs = JSON.parse(fd.get("records"));
+  assert.equal(recs[0].photo, rec.photo);
+});
+
+test("photos: record_id 特殊字符 → filename 已按 [A-Za-z0-9_-] 过滤防注入", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const rec = { record_id: "rec/../../evil?x=1", ordinal: 1, weight_g: 22.0, photo: aPhotoDataUrl() };
+  ob.enqueue({ cage_id: "C1", records: [rec] });
+  await ob.flush();
+
+  const fd = fetchFn.calls[0].init.body;
+  const photoField = fd.get("photos");
+  assert.notEqual(photoField, null);
+  const stem = RC.safePhotoStem(rec.record_id);
+  assert.equal(photoField.name, stem + ".jpg");
+  assert.ok(!/[/?=]/.test(photoField.name), "filename 不应含路径/查询特殊字符");
+});
+
+test("photos: 无 photo 字段的记录 → 不追加 photos 文件字段（零开销）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "C1", records: [aRecord(1, 25.0)] });
+  await ob.flush();
+  const fd = fetchFn.calls[0].init.body;
+  assert.equal(fd.get("photos"), null, "无 photo → 不应含 photos 字段");
+});
+
+test("photos: 非法 dataURL → 跳过该照片，仍发记录", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const rec = { record_id: "rec-bad", ordinal: 1, weight_g: 20.0, photo: "data:image/jpeg;base64,!!!!notbase64" };
+  ob.enqueue({ cage_id: "C1", records: [rec] });
+  await ob.flush();
+  const fd = fetchFn.calls[0].init.body;
+  assert.equal(fd.get("photos"), null, "非法 dataURL → 跳过，不 append photos");
+  // 记录本身仍正常发送
+  assert.notEqual(fd.get("records"), null);
+});
+
+test("photos: 持久化往返 —— photo 随 records 存 localStorage，reload 后补传仍带 photos", async () => {
+  const storage = makeStorage();
+  const fetchFn0 = () => Promise.resolve(); // 首次 enqueue 用假 fetch，不入队发送
+  const ob1 = RC.createOutbox({ storage, fetchFn: fetchFn0, now: () => 1000 });
+  const rec = RC.buildRecord({ ordinal: 1, weight_g: 25.3 });
+  rec.photo = aPhotoDataUrl();
+  ob1.enqueue({ cage_id: "C1", records: [rec] });
+  assert.equal(ob1.pending(), 1);
+
+  // storage 落盘：photo 字段随 records JSON 持久化（dataURL 是字符串，不像 Blob 会丢）
+  const parsed = JSON.parse(storage.getItem(RC.DEFAULT_STORAGE_KEY));
+  assert.equal(parsed.queue.length, 1);
+  const storedRec = parsed.queue[0].batch.records[0];
+  assert.equal(storedRec.photo, rec.photo, "photo 字段应持久化到 localStorage");
+
+  // reload：新建 outbox 读同一 storage，用可追踪的 fetchFn 补传
+  const fetchFn = makeFakeFetch();
+  const ob2 = RC.createOutbox({ storage, fetchFn, now: () => 2000 });
+  assert.equal(ob2.pending(), 1, "reload 后队列恢复");
+  await ob2.flush();
+  assert.equal(ob2.pending(), 0, "补传成功");
+  const fd = fetchFn.calls[0].init.body;
+  assert.notEqual(fd.get("photos"), null, "reload 后补传仍带 photos 文件字段");
+  assert.equal(fd.get("photos").name, rec.record_id + ".jpg");
+  // records JSON 里 photo 仍在
+  const recs = JSON.parse(fd.get("records"));
+  assert.equal(recs[0].photo, rec.photo, "reload 后 records JSON 里的 photo 不丢");
 });

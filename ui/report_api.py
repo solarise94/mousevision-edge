@@ -261,6 +261,58 @@ def _write_frame_photo(path: Path, frame: np.ndarray) -> bool:
 # under this for a single box session.
 _READINGS_MAX_BYTES = 10 * 1024 * 1024
 
+# Upper bound for a single uploaded photo (~100-400KB in practice). Well above
+# real photos but bounded so a malicious client can't balloon memory.
+_PHOTO_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """JPEG/PNG magic-number check so garbage bytes fall back, not crash."""
+    if not data:
+        return False
+    if data.startswith(b"\xff\xd8\xff"):  # JPEG SOI + JFIF/exif marker
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):  # PNG signature
+        return True
+    return False
+
+
+async def _read_uploaded_photos(
+    photos: list[UploadFile],
+) -> dict[str, bytes]:
+    """Read uploaded photos and map record_id (filename stem) -> raw bytes.
+
+    The client sends each photo with filename ``<record_id>.jpg``. Only
+    photos whose stem is a non-empty string are kept; body/too-large/IO errors
+    skip that photo without failing the whole report. Returned dict is the
+    magic-validated subset (see :func:`_looks_like_image`).
+    """
+    if not photos:
+        return {}
+    out: dict[str, bytes] = {}
+    for up in photos:
+        if up is None:
+            continue
+        try:
+            stem = Path(up.filename or "").stem or ""
+        except Exception:
+            stem = ""
+        if not stem:
+            try:
+                await up.read()
+            except Exception:
+                pass
+            continue
+        try:
+            data = await up.read(_PHOTO_MAX_BYTES + 1)
+        except Exception:
+            continue
+        if len(data) > _PHOTO_MAX_BYTES or not _looks_like_image(data):
+            continue
+        # 该 record_id 已有照片则保留第一个（与 records 去重语义一致）
+        out.setdefault(stem, data)
+    return out
+
 
 async def _read_dev_readings(upload: UploadFile) -> tuple[dict | None, str | None]:
     """Read + validate the optional dev ``readings`` JSON upload.
@@ -304,6 +356,7 @@ async def report_records(
     records: str = Form(...),
     video: UploadFile | None = File(None),
     readings: UploadFile | None = File(None),
+    photos: list[UploadFile] = File(default_factory=list),
 ) -> JSONResponse:
     """Receive a batch of device-judged weighing records.
 
@@ -374,6 +427,21 @@ async def report_records(
         except Exception:  # noqa: BLE001 — drain robustness
             pass
 
+    # 确认瞬间照片：读取上传照片并按 filename stem → record_id 建映射。
+    # 服务端优先用上传照片；无照片/非法字节时走视频抽帧/占位兜底链。
+    uploaded_photos: dict[str, bytes] = {}
+    if to_write:
+        uploaded_photos = await _read_uploaded_photos(photos)
+    elif photos:
+        # 无写入（全部重复）但上传了照片：drain 掉，避免 multipart body 未消费。
+        for up in photos:
+            if up is None:
+                continue
+            try:
+                await up.read()
+            except Exception:
+                pass
+
     if not to_write:
         # All duplicates: do not create an empty run.
         return JSONResponse(
@@ -384,6 +452,7 @@ async def report_records(
                 "count": 0,
                 "record_ids": [],
                 "photos_extracted": 0,
+                "photos_uploaded": 0,
                 "skipped": skipped,
                 "readings_saved": False,
                 "message": "全部记录已存在，跳过",
@@ -429,6 +498,7 @@ async def report_records(
     written_records: list[dict[str, Any]] = []
     record_ids: list[str] = []
     photos_extracted = 0
+    photos_uploaded = 0
 
     # Pre-extract one representative frame from the video to reuse when a
     # record has no clip_start_ms but a video is present.
@@ -471,6 +541,9 @@ async def report_records(
             "requires_manual_weight": False,
             "verification_method": "设备本地称重上报",
         }
+        # 照片来源语义：device_capture=手机端上传、video_frame=服务端抽帧、placeholder=占位。
+        # 上传照片优先；没有则走视频抽帧 → 占位兜底链。
+        photo_source = "placeholder"
         if rec.get("weight_raw") is not None:
             record["weight_raw"] = rec["weight_raw"]
         if rec.get("clip_start_ms") is not None:
@@ -482,23 +555,37 @@ async def report_records(
 
         photo_path = mouse_dir / "photo.jpg"
         produced_real_frame = False
-        if uploaded_video_path is not None:
-            clip_start = rec.get("clip_start_ms")
-            frame = _extract_video_frame(
-                uploaded_video_path,
-                float(clip_start) if clip_start is not None else None,
-            )
-            if frame is None:
-                frame = fallback_frame
-            if frame is not None:
-                produced_real_frame = _write_frame_photo(photo_path, frame)
+        # 1) 服务端优先：该 record_id 有上传照片（已过 JPEG/PNG 魔数校验）→ 直接采用。
+        uploaded = uploaded_photos.get(rec["record_id"])
+        if uploaded is not None:
+            photo_path.write_bytes(uploaded)
+            produced_real_frame = True
+            photo_source = "device_capture"
+        else:
+            # 2) 视频抽帧兜底（无上传照片时）。
+            if uploaded_video_path is not None:
+                clip_start = rec.get("clip_start_ms")
+                frame = _extract_video_frame(
+                    uploaded_video_path,
+                    float(clip_start) if clip_start is not None else None,
+                )
+                if frame is None:
+                    frame = fallback_frame
+                if frame is not None:
+                    produced_real_frame = _write_frame_photo(photo_path, frame)
+                    photo_source = "video_frame"
         if not produced_real_frame:
-            # Last-resort: placeholder image so the record stays visible.
+            # 3) 最后兜底：占位图，记录仍可见。
             _write_placeholder_photo(
                 photo_path, label=f"{cage} #{ordinal:03d} {rec['weight_g']}g"
             )
         else:
-            photos_extracted += 1
+            if photo_source == "device_capture":
+                photos_uploaded += 1
+            else:
+                photos_extracted += 1
+
+        record["photo_source"] = photo_source
 
         (mouse_dir / "record.json").write_text(
             json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -552,6 +639,7 @@ async def report_records(
             "count": len(written_records),
             "record_ids": record_ids,
             "photos_extracted": photos_extracted,
+            "photos_uploaded": photos_uploaded,
             "skipped": skipped,
             "readings_saved": readings_saved,
         },
