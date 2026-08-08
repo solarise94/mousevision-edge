@@ -70,27 +70,54 @@ def configure(
     _output_root = Path(output_root)
 
 
-def _existing_record_dir_for(record_id: str) -> Path | None:
+def _existing_record_dir_for(
+    record_id: str,
+    output_root: Path,
+    registry: Any = None,
+) -> Path | None:
     """Locate the on-disk mouse dir that already owns ``record_id``.
 
     Used for idempotency: a repeated upload of the same record_id returns
     the existing record instead of creating a duplicate run/mouse dir.
-    Scans manifests' record.json files; output/ is small and run-scoped
-    so this is cheap in practice.
+
+    When ``registry`` is provided (lab report path) the registry index is used
+    to resolve the dir. Otherwise (and as a fallback) the manifests under
+    ``output_root`` are scanned for a ``mouse_*/record.json`` carrying the
+    record_id — this keeps the share path fully isolated from the lab registry
+    while still being cheap for run-scoped output.
     """
-    if not record_id or _registry is None:
+    if not record_id:
+        return None
+    if registry is not None:
+        try:
+            mouse = registry.get_by_record_id(record_id)
+        except Exception:
+            mouse = None
+        if mouse is not None:
+            try:
+                p = output_root / mouse["dir"]
+            except Exception:
+                p = None
+            if p is not None and p.is_dir():
+                return p
+    # Fallback / isolated path: scan run manifests under output_root.
+    if not output_root.is_dir():
         return None
     try:
-        mouse = _registry.get_by_record_id(record_id)
+        for manifest in output_root.glob("run_*/manifest.json"):
+            for mouse_dir in manifest.parent.glob("mouse_*"):
+                rec_file = mouse_dir / "record.json"
+                if not rec_file.is_file():
+                    continue
+                try:
+                    rec = json.loads(rec_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if rec.get("record_id") == record_id:
+                    return mouse_dir
     except Exception:
         return None
-    if mouse is None:
-        return None
-    try:
-        p = _output_root / mouse["dir"]
-    except Exception:
-        return None
-    return p if p.is_dir() else None
+    return None
 
 
 def _is_finite_weight(value: Any) -> bool:
@@ -371,6 +398,52 @@ async def report_records(
     device = (device_id or "unknown").strip() or "unknown"
     wsrc = (weight_source or "device_report").strip() or "device_report"
 
+    return await persist_report_records(
+        output_root=_output_root,
+        registry=_registry,
+        upload_queue=_upload_queue,
+        cage=cage,
+        project=project,
+        device=device,
+        wsrc=wsrc,
+        strain=strain,
+        records=records,
+        video=video,
+        readings=readings,
+        photos=photos,
+        mode="device_report",
+        finish_status="device_report",
+        log_prefix="report_api",
+    )
+
+
+async def persist_report_records(
+    *,
+    output_root: Path,
+    registry: Any,
+    upload_queue: Any,
+    cage: str,
+    project: str,
+    device: str,
+    wsrc: str,
+    strain: str | None,
+    records: str,
+    video: UploadFile | None,
+    readings: UploadFile | None,
+    photos: list[UploadFile],
+    mode: str = "device_report",
+    finish_status: str = "device_report",
+    extra_manifest: dict[str, Any] | None = None,
+    log_prefix: str = "report_api",
+) -> JSONResponse:
+    """Shared persistence core for device-reported weighing records.
+
+    Both the lab report endpoint (``/api/records/report``) and the public
+    share endpoint (``/api/records/share``) funnel through here. The caller
+    supplies the output root, registry/queue (``None`` isolates storage),
+    weight source and optional extra manifest fields (e.g. ``shared`` /
+    ``app_version``). Returns the JSONResponse.
+    """
     try:
         records_payload = json.loads(records)
     except (ValueError, TypeError) as exc:
@@ -386,7 +459,7 @@ async def report_records(
     to_write: list[dict[str, Any]] = []
     for rec in normalized:
         rid = rec["record_id"]
-        if _existing_record_dir_for(rid) is not None:
+        if _existing_record_dir_for(rid, output_root, registry) is not None:
             skipped.append(rid)
         else:
             to_write.append(rec)
@@ -397,7 +470,7 @@ async def report_records(
     video_suffix = ".mp4"
     if video is not None and to_write:
         video_suffix = _video_suffix(video.filename, video.content_type)
-        tmp_video = _output_root / f".report_upload_{uuid.uuid4().hex}{video_suffix}"
+        tmp_video = output_root / f".report_upload_{uuid.uuid4().hex}{video_suffix}"
         size = 0
         try:
             with tmp_video.open("wb") as handle:
@@ -459,12 +532,12 @@ async def report_records(
             }
         )
 
-    # Create one run for this report. mode=device_report keeps it distinct
-    # from realtime / video analysis runs and avoids ordinal collisions.
+    # Create one run for this report. mode keeps it distinct from realtime /
+    # video analysis runs and avoids ordinal collisions.
     run_dir, manifest = create_run_dir(
-        _output_root,
+        output_root,
         cage_id=cage,
-        mode="device_report",
+        mode=mode,
         source_id=device,
         device_id=device,
         project_id=project,
@@ -492,7 +565,7 @@ async def report_records(
                 )
                 readings_saved = True
         except Exception:  # noqa: BLE001 — readings must never fail the report
-            log.exception("report_api: failed to persist readings for run %s", run_id)
+            log.exception("%s: failed to persist readings for run %s", log_prefix, run_id)
             readings_saved = False
 
     written_records: list[dict[str, Any]] = []
@@ -595,10 +668,11 @@ async def report_records(
         record_ids.append(rec["record_id"])
 
         # Enqueue directly as PENDING: these are final, locally-judged
-        # records. No HELD / postflight phase applies.
-        if _upload_queue is not None:
+        # records. No HELD / postflight phase applies. The share path passes
+        # upload_queue=None so public data never enters the lab queue.
+        if upload_queue is not None:
             try:
-                _upload_queue.enqueue(
+                upload_queue.enqueue(
                     record,
                     mouse_dir / "record.json",
                     photo_path if photo_path.is_file() else None,
@@ -606,7 +680,8 @@ async def report_records(
                 )
             except Exception:
                 log.exception(
-                    "report_api: upload_queue.enqueue failed (record_id=%s)",
+                    "%s: upload_queue.enqueue failed (record_id=%s)",
+                    log_prefix,
                     rec["record_id"],
                 )
 
@@ -616,18 +691,20 @@ async def report_records(
         "record_count": len(written_records),
         "weight_source": wsrc,
         "device_id": device,
-        "mode": "device_report",
+        "mode": mode,
         "evidence_video": evidence_rel,
     }
     if strain:
         manifest["strain"] = strain
     if readings_saved:
         manifest["readings_file"] = "readings.json"
+    if extra_manifest:
+        manifest.update(extra_manifest)
     write_manifest(run_dir, manifest)
-    finish_run(run_dir, status="device_report")
+    finish_run(run_dir, status=finish_status)
 
     try:
-        rel_run = str(run_dir.resolve().relative_to(_output_root.resolve()))
+        rel_run = str(run_dir.resolve().relative_to(output_root.resolve()))
     except ValueError:
         rel_run = run_dir.name
 

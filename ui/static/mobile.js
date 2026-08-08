@@ -106,6 +106,48 @@
   });
   reportOutbox.start();
 
+  /* ------------------------------------------------------------------ *
+   * 公众版「共享数据以改善应用」上传通道（local edition 专用）。
+   * 与实验室上报 outbox 完全隔离：
+   *   - 独立 storageKey（mv.shareOutbox.v1）
+   *   - 独立 endpoint（/api/records/share）与独立令牌（MV_CONFIG.shareToken）
+   *   - 仅 IS_LOCAL_EDITION 创建；后端落盘到 <output_root>/shared/，不进实验室
+   *     registry/queue。
+   * 开关关闭时完全不 enqueue（现状：纯本地，不上传）。
+   * ------------------------------------------------------------------ */
+  const SHARE_STORAGE_KEY = "mv.shareDataEnabled.v1";
+  const SHARE_OUTBOX_KEY = "mv.shareOutbox.v1";
+
+  /* config.js 是否注入了共享令牌（无令牌 → 通道不可用，开关禁用）。 */
+  function shareTokenAvailable() {
+    try {
+      return !!(window.MV_CONFIG && typeof window.MV_CONFIG === "object"
+        && typeof window.MV_CONFIG.shareToken === "string"
+        && window.MV_CONFIG.shareToken.length > 0);
+    } catch (_) { return false; }
+  }
+
+  function getShareEnabled() {
+    try { return localStorage.getItem(SHARE_STORAGE_KEY) === "1"; } catch (_) { return false; }
+  }
+  function setShareEnabled(on) {
+    try { localStorage.setItem(SHARE_STORAGE_KEY, on ? "1" : "0"); } catch (_) {}
+  }
+
+  /* 共享 outbox 单例：仅 local edition 创建（云版无此通道）。 */
+  const shareOutbox = IS_LOCAL_EDITION && ReportClient.createOutbox
+    ? ReportClient.createOutbox({
+        storage: localStorage,
+        key: SHARE_OUTBOX_KEY,
+        endpoint: apiUrl("/api/records/share"),
+        token: (function () {
+          try { return (window.MV_CONFIG && window.MV_CONFIG.shareToken) || ""; }
+          catch (_) { return ""; }
+        })(),
+      })
+    : null;
+  if (shareOutbox) shareOutbox.start();
+
   /* 构造并启动一个天平通道，挂载标准读数/状态/stale 回调。
    * deviceId 可选：支持设备选择 API 时传入以锁定设备；否则走旧直连。 */
   function startScaleConnChannel(deviceId) {
@@ -2373,7 +2415,9 @@
 
     /* 本地版完成本箱：把控制器累积的 records 合并抓帧照片，
      * 经 LocalStore.saveRecords 落本机 → run_id；有视频 Blob 则 saveVideo 存 IndexedDB。
-     * 全部数据仅保存在本机，不上传服务器。 */
+     * 本地数据仅保存在本机；若用户开启「共享数据以改善应用」，则把同一份 records
+     * （含照片）+ 视频 Blob 也 enqueue 到独立共享 outbox（后台联网补传），
+     * 绝不改动 LocalStore 的本地数据。 */
     async function finishBoxFlowLocal(blob) {
       let records = [];
       try {
@@ -2403,7 +2447,30 @@
       if (runId && blob) {
         try { await localStore.saveVideo(runId, box.cageId, blob); } catch (_) {}
       }
-      renderReportLocalDone(box, count, saveErr);
+      // 共享通道：仅当开关开 + 已注入 shareToken + 有记录时，把同一份 records+视频
+      // enqueue 到共享 outbox（不持久化视频 Blob，reload 后仅补传记录+照片）。
+      // 失败不阻断本地保存——共享是尽力而为。
+      let shareEnqueued = false;
+      let shareErr = null;
+      if (getShareEnabled() && shareOutbox && count > 0) {
+        try {
+          const shareBatch = {
+            cage_id: box.cageId,
+            strain: box.strain || null,
+            project_id: state.projectId,
+            device_id: scaleConn.selectedDeviceId || "scale01",
+            weight_source: "public_share",
+            records: recordsWithPhoto,
+          };
+          // 视频 Blob 附挂（不持久化；在线补传时随记录一起发）
+          shareOutbox.enqueue(shareBatch, blob || null);
+          shareEnqueued = true;
+          try { shareOutbox.flush(); } catch (_) {}
+        } catch (e) {
+          shareErr = e;
+        }
+      }
+      renderReportLocalDone(box, count, saveErr, { shareEnqueued, shareErr });
     }
 
     finishBtn.addEventListener("click", function () {
@@ -2593,8 +2660,11 @@
     mount(screen);
   }
 
-  /* 本地版完成页：数据仅保存在本机（不上传）。saveErr 时提示保存异常。 */
-  function renderReportLocalDone(box, count, saveErr) {
+  /* 本地版完成页：数据仅保存在本机。saveErr 时提示保存异常。
+   * shareOpts：{shareEnqueued, shareErr}——共享开关开启并成功 enqueue 时，
+   * 追加「共享数据将在联网后上传」提示；enqueue 失败显示异常但本地保存不受影响。 */
+  function renderReportLocalDone(box, count, saveErr, shareOpts) {
+    shareOpts = shareOpts || {};
     const screen = h("div", { class: "screen" });
     screen.appendChild(appbar("本箱完成", {}));
     const card = h("div", { class: "card" }, [
@@ -2610,6 +2680,12 @@
     if (saveErr) {
       card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
         `保存失败：${saveErr.message || saveErr}`));
+    } else if (shareOpts.shareEnqueued) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--label2)" },
+        "已加入共享队列，将在联网后上传"));
+    } else if (shareOpts.shareErr) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--orange)" },
+        `共享入队失败：${shareOpts.shareErr.message || shareOpts.shareErr}（本地已保存）`));
     }
     const content = h("div", { class: "content" }, [
       card,
@@ -3290,6 +3366,11 @@
     try {
       if (IS_LOCAL_EDITION && window.LocalStore) localRecordCount = countRecords(window.LocalStore.exportAll());
     } catch (_) {}
+    // 本地版：共享 outbox 待同步条数（共享开关开启后累积、联网补传）。
+    const sharePending = (IS_LOCAL_EDITION && shareOutbox
+      && typeof shareOutbox.pending === "function") ? shareOutbox.pending() : 0;
+    const shareAvailable = IS_LOCAL_EDITION && shareTokenAvailable();
+    const shareEnabled = IS_LOCAL_EDITION && getShareEnabled();
     // 本地版：导出动作。运行于当前页进程，生成内容并写入下载目录。
     function handleLocalExport(kind) {
       try {
@@ -3323,6 +3404,31 @@
               h("div", { class: "kv" }, [
                 h("span", { class: "k" }, "记录数"),
                 h("span", { class: "v" }, `${localRecordCount} 条`),
+              ]),
+              // 共享数据以改善应用（local edition 专用）：仅在有共享令牌时可用。
+              // 开关状态存 localStorage mv.shareDataEnabled.v1；无令牌则禁用并提示。
+              h("div", { class: "share-row" }, [
+                h("div", { class: "share-row-text" }, [
+                  h("div", { class: "share-row-title" }, "共享数据以改善应用"),
+                  h("div", { class: "share-row-sub" },
+                    shareAvailable
+                      ? (shareEnabled && sharePending > 0
+                        ? `待共享 ${sharePending} 条`
+                        : "开启后，称重记录（含照片/视频）将匿名上传到我们的服务器，仅用于改进识别算法")
+                      : "此构建未配置共享通道"),
+                ]),
+                h("label", { class: "switch" }, [
+                  h("input", {
+                    type: "checkbox",
+                    checked: shareEnabled ? "" : null,
+                    disabled: shareAvailable ? null : "",
+                    onChange: (ev) => {
+                      setShareEnabled(!!ev.target.checked);
+                      toast(ev.target.checked ? "已开启数据共享（联网后上传）" : "已关闭数据共享");
+                    },
+                  }),
+                  h("span", { class: "switch-slider" }),
+                ]),
               ]),
               h("div", { class: "li-sub", style: "margin-top:12px" }, "导出数据"),
               h("button", {
@@ -3391,6 +3497,12 @@
         countRecords,
         csvEscape,
         CSV_HEADERS,
+        // 共享数据开关（local edition 专用）
+        SHARE_STORAGE_KEY,
+        SHARE_OUTBOX_KEY,
+        shareTokenAvailable,
+        getShareEnabled,
+        setShareEnabled,
       };
     }
   } catch (_) {}

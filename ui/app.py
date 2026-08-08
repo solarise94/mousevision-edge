@@ -799,6 +799,15 @@ report_api.configure(
 )
 app.include_router(report_api.router)
 
+# Public data-sharing (local edition opt-in upload): same multipart shape as
+# /api/records/report but routed to an isolated <output_root>/shared/ area,
+# separate token (MOUSEVISION_SHARE_TOKEN), never touching the lab registry /
+# records_meta / upload_queue.
+import ui.share_api as share_api  # noqa: E402
+
+share_api.configure(str(DEFAULT_OUTPUT))
+app.include_router(share_api.router)
+
 # Raw BLE scale capture (for offline engine tuning): phone records every K797
 # reading verbatim and POSTs it here; server persists to output/scale_captures/.
 import ui.capture_api as capture_api  # noqa: E402

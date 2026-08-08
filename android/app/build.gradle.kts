@@ -30,6 +30,11 @@ val miceApiBase: String =
 val miceSyncToken: String =
     providers.gradleProperty("MICE_SYNC_TOKEN")
         .getOrElse(syncProps.getProperty("MICE_SYNC_TOKEN") ?: "")
+// 共享令牌（local 公众版「共享数据以改善应用」上传通道）。
+// 仅 local flavor 注入 config.js；cloud 版写空串（无共享通道）。
+val miceShareToken: String =
+    providers.gradleProperty("MICE_SHARE_TOKEN")
+        .getOrElse(syncProps.getProperty("MICE_SHARE_TOKEN") ?: "")
 
 android {
     namespace = "com.pingoodmice.miceautomatic"
@@ -152,6 +157,9 @@ abstract class GenerateAppConfig : DefaultTask() {
     abstract var syncToken: String
 
     @get:Input
+    abstract var shareToken: String
+
+    @get:Input
     abstract var edition: String
 
     @get:OutputDirectory
@@ -168,6 +176,7 @@ abstract class GenerateAppConfig : DefaultTask() {
             "// 构建期生成：app 独立运行配置（勿手改）\n" +
                 "window.MV_CONFIG = { apiBase: '" + jsStr(apiBase) +
                 "', token: '" + jsStr(syncToken) +
+                "', shareToken: '" + jsStr(shareToken) +
                 "', edition: '" + edition +
                 "', appOrigin: '" + appOrigin + "' };\n",
         )
@@ -182,6 +191,8 @@ listOf("cloud", "local").forEach { flavor ->
         apiBase = miceApiBase
         // local（公众本地版）不携带同步令牌：纯本地不上传。
         syncToken = if (flavor == "local") "" else miceSyncToken
+        // 共享通道仅 local 版注入（云版无共享上传）。
+        shareToken = if (flavor == "local") miceShareToken else ""
         edition = flavor
         outputDir.set(cfgDir)
     }
