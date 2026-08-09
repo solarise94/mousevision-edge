@@ -541,7 +541,11 @@
             if (!persistDead()) {
               // 死信落盘失败：回滚内存死信，该批留在主队列（内存 + 已持久化），
               // 按 retry 语义停止本轮 flush，下轮再试迁移。批次绝不丢。
+              // 同步 lastPersistOk=false：persistDead 按设计不自行回写该状态，
+              // 这里显式置位，避免状态接口把本次落盘失败误报为成功（后续
+              // persist() 成功时会回写 true 恢复）。
               deadLetter.pop();
+              lastPersistOk = false;
               inFlight = false;
               consecutiveFailures += 1;
               rescheduleRetry();

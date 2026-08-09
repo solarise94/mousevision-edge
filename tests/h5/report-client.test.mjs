@@ -501,12 +501,15 @@ test("死信迁移：dead key 写入失败时批次留在主队列不丢，修�
   assert.equal(pDead.dead.length, 0, "持久化死信为空（迁移写入抛错，未新增）");
   // flush 按 retry 语义停止本轮（consecutiveFailures 累加）
   assert.ok(ob.consecutiveFailures() >= 1, "迁移失败按 retry 语义累加失败计数");
+  // P2 补充：死信迁移的 persistDead 直接调用失败时，状态接口不得误报成功
+  assert.equal(ob.lastPersistOk(), false, "死信迁移落盘失败时 lastPersistOk=false");
 
   // 修复 storage（dead key 可写）→ 再次 flush（仍是 400）→ 迁移成功：进死信、主队列清空
   deadKeyBroken = false;
   const res2 = await ob.flush();
   assert.equal(res2.sent, 0, "4xx 批次不算 sent（sentCount 只计 ok）");
   assert.equal(ob.pending(), 0, "迁移成功后主队列清空");
+  assert.equal(ob.lastPersistOk(), true, "迁移成功（persist 写主队列成功）后 lastPersistOk 恢复 true");
   assert.equal(ob.deadLetters().length, 1, "迁移成功后进死信");
   assert.equal(ob.deadLetters()[0].batch.cage_id, "BAD");
   // 持久化主队列已不含该批，死信已落盘
