@@ -453,6 +453,149 @@ test("死信持久化：损坏的 .dead key 不影响主队列恢复（保守清
   assert.equal(ob.pending(), 0, "主队列不受影响");
 });
 
+/* 死信迁移顺序修复（死信永久丢失回归）：
+ * 修复前 dead 分支先 shift() 把批次移出主队列再 persist()，persist 内部先写主队列
+ * 成功、后写死信；若死信 key 写入失败（quota），persist 返回 false 但 flush 忽略它
+ * 继续跑 → 内存死信=1、持久化主队列=0、持久化死信=0 → reload 后两边都是 0，批次永久丢失。
+ * 修复：先 peek 构造死信条目并 persistDead()，成功后再 shift + persist 写主队列；
+ *       persistDead 失败则回滚死信、该批留在主队列，按 retry 语义停止本轮 flush。
+ */
+test("死信迁移：dead key 写入失败时批次留在主队列不丢，修复后迁移成功", async () => {
+  const store = {};
+  let deadKeyBroken = false; // 仅在 flush 死信迁移阶段抛错
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => {
+      // 仅 dead key 抛错（模拟 quota 恰好对死信 key 触发）
+      if (deadKeyBroken && k === RC.DEFAULT_STORAGE_KEY + ".dead") {
+        throw new Error("dead key quota");
+      }
+      store[k] = String(v);
+    },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 400, _body: { ok: false, detail: "bad" } }, // 首次 4xx → 触发死信迁移（失败）
+      { status: 400, _body: { ok: false, detail: "bad" } }, // 再次 4xx → 迁移成功
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn, now: () => 1000 });
+  ob.enqueue({ cage_id: "BAD", records: [aRecord(1, 1)] });
+  const beforeBatch = JSON.parse(store[RC.DEFAULT_STORAGE_KEY]).queue[0];
+
+  // flush 触发 400 → 死信迁移；dead key 抛错 → 迁移失败，批次留在主队列
+  deadKeyBroken = true; // 仅在 flush 死信迁移时让 dead key 失败
+  const res = await ob.flush();
+  assert.equal(res.sent, 0, "死信迁移失败不算成功发出");
+  // 内存：批次仍在主队列，死信为空（已回滚）
+  assert.equal(ob.pending(), 1, "内存主队列仍含该批（未 shift）");
+  assert.equal(ob.deadLetters().length, 0, "内存死信已回滚为空");
+  // 持久化：主队列仍含该批（先写死信失败，未走到 shift）；死信 key 因迁移
+  // 写入抛错未更新（仍是 enqueue 时 persistDead 写下的空数组）
+  const pMain = JSON.parse(store[RC.DEFAULT_STORAGE_KEY]);
+  assert.equal(pMain.queue.length, 1, "持久化主队列仍含该批");
+  assert.equal(pMain.queue[0].clientBatchId, beforeBatch.clientBatchId);
+  const pDead = JSON.parse(store[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead.dead.length, 0, "持久化死信为空（迁移写入抛错，未新增）");
+  // flush 按 retry 语义停止本轮（consecutiveFailures 累加）
+  assert.ok(ob.consecutiveFailures() >= 1, "迁移失败按 retry 语义累加失败计数");
+
+  // 修复 storage（dead key 可写）→ 再次 flush（仍是 400）→ 迁移成功：进死信、主队列清空
+  deadKeyBroken = false;
+  const res2 = await ob.flush();
+  assert.equal(res2.sent, 0, "4xx 批次不算 sent（sentCount 只计 ok）");
+  assert.equal(ob.pending(), 0, "迁移成功后主队列清空");
+  assert.equal(ob.deadLetters().length, 1, "迁移成功后进死信");
+  assert.equal(ob.deadLetters()[0].batch.cage_id, "BAD");
+  // 持久化主队列已不含该批，死信已落盘
+  const pMain2 = JSON.parse(store[RC.DEFAULT_STORAGE_KEY]);
+  assert.equal(pMain2.queue.length, 0, "持久化主队列已移除该批");
+  const pDead2 = JSON.parse(store[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead2.dead.length, 1, "持久化死信已落盘");
+  assert.equal(pDead2.dead[0].clientBatchId, beforeBatch.clientBatchId);
+});
+
+test("死信迁移：死信写成功但主队列写失败 → reload 去重（该批只在死信不在队列）", async () => {
+  const store = {};
+  let mainBroken = false; // 仅在 shift 后写主队列时触发
+  let allowMainAfterDead = true; // 控制第二次 persist 是否失败
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => {
+      // 主队列 key 在死信写成功后的「shift + persist」阶段失败（模拟此时 quota 触发）
+      if (k === RC.DEFAULT_STORAGE_KEY && mainBroken && !allowMainAfterDead) {
+        throw new Error("main key quota after dead");
+      }
+      store[k] = String(v);
+    },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 400, _body: { ok: false } }, // 4xx → 死信迁移
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn, now: () => 1000 });
+  ob.enqueue({ cage_id: "BAD", records: [aRecord(1, 1)] });
+  const batchId = JSON.parse(store[RC.DEFAULT_STORAGE_KEY]).queue[0].clientBatchId;
+
+  // flush：死信先落盘成功 → shift + persist 写主队列时失败
+  // 此时持久化状态是「主队列还有该批（写失败未更新，仍是旧值）+ 死信也有该批」
+  // —— flush 内 persist() 吞错，但批次已确认进死信，内存主队列已 shift 为空。
+  mainBroken = true;
+  allowMainAfterDead = false;
+  const res = await ob.flush();
+  assert.equal(res.sent, 0);
+  // 内存：主队列已 shift（迁移逻辑走到 shift），死信有该批
+  assert.equal(ob.pending(), 0, "内存主队列已 shift");
+  assert.equal(ob.deadLetters().length, 1, "内存死信含该批");
+  // 持久化：死信已落盘；主队列因写失败仍是旧值（含该批）—— 重复窗口
+  const pDead = JSON.parse(store[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead.dead.length, 1, "持久化死信含该批");
+  assert.equal(pDead.dead[0].clientBatchId, batchId);
+  const pMain = JSON.parse(store[RC.DEFAULT_STORAGE_KEY]);
+  // 主队列 key 仍是 enqueue 时写的旧值（含该批）—— 重复窗口存在
+  assert.ok(pMain.queue.some((q) => q.clientBatchId === batchId),
+    "持久化主队列仍含该批（写失败未更新，重复窗口存在）");
+
+  // reload：新建 outbox 读同一 storage → restore 去重生效
+  // 该批 clientBatchId 既在死信又在主队列，去重后只保留在死信、不重复出现在队列
+  const ob2 = RC.createOutbox({ storage, fetchFn: makeFakeFetch(), now: () => 2000 });
+  assert.equal(ob2.deadLetters().length, 1, "reload 后死信恢复该批");
+  assert.equal(ob2.deadLetters()[0].clientBatchId, batchId);
+  assert.equal(ob2.pending(), 0, "reload 后主队列去重：该批不再出现（防重复上报）");
+});
+
+test("死信迁移：正常路径（dead key 可写）行为不变——进死信、主队列清空", async () => {
+  // 回归：确认修复未破坏正常死信迁移路径（与既有「死信持久化」用例互补）
+  const store = {};
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 400, _body: { ok: false } },
+      { status: 200, _body: { ok: true } },
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn, now: () => 1000 });
+  ob.enqueue({ cage_id: "BAD", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "OK", records: [aRecord(1, 2)] });
+  const r = await ob.flush();
+  assert.equal(r.sent, 1, "OK 批成功发出");
+  assert.equal(ob.deadLetters().length, 1, "BAD 批进死信");
+  assert.equal(ob.pending(), 0, "主队列清空");
+  // 持久化一致：主队列空、死信 1 条
+  assert.equal(JSON.parse(store[RC.DEFAULT_STORAGE_KEY]).queue.length, 0);
+  assert.equal(JSON.parse(store[RC.DEFAULT_STORAGE_KEY + ".dead"]).dead.length, 1);
+});
+
 /* enqueue 持久化失败抛错：storage 不可写/quota → enqueue 抛错，但批次保留在内存队列
  * （下次 persist 再试，最大化数据保留）。flush 内部的 persist 仍吞错不阻断。 */
 test("enqueue 持久化失败：storage.setItem 抛错 → enqueue 抛错但批次保留在内存队列", () => {

@@ -2413,6 +2413,16 @@
       // 用此兜底让完成页能正确显示"共 N 只"（而非误导性的 0 只）。
       let recordedBeforeEnqueue = 0;
       try { recordedBeforeEnqueue = ctrl ? ctrl.getState().mouseCount : 0; } catch (_) {}
+      // 在 finishBox（会清空 records 并重置 nextOrdinal）之前捕获控制器实际下一序号，
+      // 作为回写的真值。草稿恢复场景下 ctrl.startOrdinal 以草稿为准，可能与 box.nextOrdinal
+      // 不同（box 已被服务器推进、或草稿仍停在旧起点）——直接用 box + count 会跳号。
+      let ctrlNext = null;
+      try {
+        let st = ctrl ? ctrl.getState() : null;
+        if (st && typeof st.nextOrdinal === "number" && isFinite(st.nextOrdinal) && st.nextOrdinal >= 1) {
+          ctrlNext = Math.floor(st.nextOrdinal);
+        }
+      } catch (_) {}
       try {
         if (ctrl) { try { attachRecordPhotos(ctrl._records()); } catch (_) {} }
         let readingsPayload = null;
@@ -2427,16 +2437,23 @@
       }
       // 回写 nextOrdinal：完成页"继续录制下一只"会直接读 state.currentBox.nextOrdinal
       // 作为下一箱的 startOrdinal。若不回写，同会话立即续录会从旧起点重号（服务器虽
-      // 已推进，本地 state 没刷）。仅在 enqueue 成功（enqueueErr 为空且 count>0）时回写：
-      // 控制器以 normalizeStartOrdinal(box) 为 startOrdinal，count 条记录分配的最大
-      // ordinal = startOrdinal + count - 1，故下一只 = startOrdinal + count = normalizeStartOrdinal(box) + count
-      // （草稿恢复批次 count 含恢复记录，控制器草稿 startOrdinal 与 box.nextOrdinal 同源，不变量成立）。
+      // 已推进，本地 state 没刷）。仅在 enqueue 成功（enqueueErr 为空且 count>0）时回写。
+      //
+      // 不变量（已修正）：回写取「控制器实际下一序号与箱子起点的较大者」：
+      //   nextOrdinal = max(normalizeStartOrdinal(box), ctrlNext)
+      // ctrlNext 是 finishBox 前控制器的 startOrdinal + records.length，即本批分配的
+      // 最大 ordinal + 1，是续号真值；草稿恢复时 ctrl.startOrdinal 以草稿为准，可能与
+      // box.nextOrdinal 不同（服务器已推进），此时取较大者避免回退。
+      // 旧公式 box + count 假设 box.nextOrdinal 与 ctrl.startOrdinal 同源，草稿恢复场景
+      // 下会跳号（草稿 startOrdinal < box.nextOrdinal 时回写超过实际下一只）。
+      // ctrlNext 拿不到（ctrl null / state 异常）时退化为 max(box, 1)=box 原值——
+      // 注意此时不能再加 count，否则又跳；若 ctrl 为 null（count=0 边界）本就不进此分支。
       // enqueue 失败时不回写：草稿保留，下次 start() 会以草稿 startOrdinal 恢复续号。
       // 用新对象 + setCurrentBox 同步 sessionStorage（viewRecord 闭包里的 box 仍指旧对象，
       // 但完成页按钮 go("/mode") → viewRecord 会重新读 state.currentBox 拿到新值）。
       if (!enqueueErr && result && typeof result.count === "number" && result.count > 0) {
         setCurrentBox(Object.assign({}, box, {
-          nextOrdinal: normalizeStartOrdinal(box) + result.count,
+          nextOrdinal: Math.max(normalizeStartOrdinal(box), ctrlNext || 1),
         }));
       }
       // 3) 触发立即补传（在线即发；离线由 outbox 退避重试 / online 事件补传）
@@ -2466,6 +2483,17 @@
       const recordsWithPhoto = records.slice();
       attachRecordPhotos(recordsWithPhoto);
 
+      // 捕获控制器实际下一序号（saveRecords 不重置控制器状态，但与云版保持一致
+      // 在保存前取值，避免依赖保存副作用）。草稿恢复场景 ctrl.startOrdinal 以草稿为准，
+      // 可能与 box.nextOrdinal 不同（box 已被服务器推进），直接 box + count 会跳号。
+      let ctrlNext = null;
+      try {
+        let st = ctrl ? ctrl.getState() : null;
+        if (st && typeof st.nextOrdinal === "number" && isFinite(st.nextOrdinal) && st.nextOrdinal >= 1) {
+          ctrlNext = Math.floor(st.nextOrdinal);
+        }
+      } catch (_) {}
+
       let runId = null;
       let saveErr = null;
       const count = recordsWithPhoto.length;
@@ -2487,14 +2515,21 @@
         try { localStorage.removeItem(LocalWeigh._draftKey(box.cageId)); } catch (_) {}
         // 回写 nextOrdinal（与云版 finishBoxFlow 同源逻辑）：完成页"继续录制下一只"
         // 会直接读 state.currentBox.nextOrdinal 作下一箱 startOrdinal。仅在 saveRecords
-        // 成功时回写：控制器以 normalizeStartOrdinal(box) 为 startOrdinal，count 条记录
-        // 分配的最大 ordinal = startOrdinal + count - 1，故下一只 = startOrdinal + count
-        // = normalizeStartOrdinal(box) + count（草稿恢复批次 count 含恢复记录，不变量成立）。
-        // saveErr 时不回写：草稿保留，下次 start() 以草稿 startOrdinal 恢复续号。
+        // 成功时回写。
+        //
+        // 不变量（已修正）：回写取「控制器实际下一序号与箱子起点的较大者」：
+        //   nextOrdinal = max(normalizeStartOrdinal(box), ctrlNext)
+        // ctrlNext 是控制器的 startOrdinal + records.length，即本批分配的最大 ordinal + 1，
+        // 是续号真值；草稿恢复时 ctrl.startOrdinal 以草稿为准，可能与 box.nextOrdinal
+        // 不同（服务器已推进），此时取较大者避免回退。旧公式 box + count 假设两者同源，
+        // 草稿恢复场景下会跳号（草稿 startOrdinal < box.nextOrdinal 时回写超过实际下一只）。
+        // ctrlNext 拿不到（ctrl null / records 空 / state 异常）时退化为 max(box, 1)=box
+        // 原值——此时不能再加 count，否则又跳。saveErr 时不回写：草稿保留，下次 start()
+        // 以草稿 startOrdinal 恢复续号。
         // 用新对象 + setCurrentBox 同步 sessionStorage（完成页 go("/mode") → viewRecord
         // 重新读 state.currentBox 拿到新值；viewRecord 闭包里的 box 仍指旧对象无影响）。
         setCurrentBox(Object.assign({}, box, {
-          nextOrdinal: normalizeStartOrdinal(box) + count,
+          nextOrdinal: Math.max(normalizeStartOrdinal(box), ctrlNext || 1),
         }));
       }
       // 视频证据保存到 IndexedDB（不阻断：失败仅影响证据缺失，不回滚记录保存）。

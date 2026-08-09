@@ -326,6 +326,24 @@
       } catch (_) {
         deadLetter = [];
       }
+      // 去重：过滤掉主队列里 clientBatchId 已出现在死信中的条目。
+      // 重复窗口来源——flush 的 dead 分支先 persistDead() 成功（死信已落盘），
+      // 紧接着 queue.shift() + persist() 写主队列时若失败（quota），持久化状态是
+      // 「主队列还有该批 + 死信也有该批」。此时该批已确认为坏批次，应只保留在
+      // 死信、不重复出现在主队列，避免下轮 flush 又尝试上报（徒劳）且 UI 重复计数。
+      // 该过滤幂等：正常路径下死信与主队列互斥（移出主队列已成功），无条目被滤掉。
+      if (deadLetter.length > 0 && queue.length > 0) {
+        var deadIds = {};
+        for (var di = 0; di < deadLetter.length; di++) {
+          var ditem = deadLetter[di];
+          if (ditem && typeof ditem.clientBatchId === "string" && ditem.clientBatchId) {
+            deadIds[ditem.clientBatchId] = true;
+          }
+        }
+        queue = queue.filter(function (qitem) {
+          return !(qitem && typeof qitem.clientBatchId === "string" && deadIds[qitem.clientBatchId]);
+        });
+      }
     }
 
     function notify() {
@@ -497,8 +515,20 @@
             return step(); // 继续下一批
           }
           if (r.kind === "dead") {
-            // 400/413/422 确定校验错误：进死信，移出队列，不阻塞后续
-            var dead = queue.shift();
+            // 400/413/422 确定校验错误：进死信，移出队列，不阻塞后续。
+            //
+            // 顺序很关键（先写死信、成功后再移出主队列）——保证死信持久化失败时
+            // 批次仍在主队列里（内存 + 已持久化），下轮 flush 会重试迁移，绝不丢。
+            //   旧实现先 shift() 再 persist()：persist 内部先写主队列成功、后写死信；
+            //   若死信 key 写入失败（quota），persist 返回 false 但 flush 忽略它继续跑，
+            //   导致「主队列已不含该批 + 死信没落盘」→ reload 后两边都空，批次永久丢失。
+            //
+            // 先 peek（不 shift）→ 构造 deadEntry → push 到内存死信 → persistDead()：
+            //   失败 → pop() 回滚死信，该批保留在主队列，按 retry 语义停止本轮 flush
+            //          （inFlight=false、consecutiveFailures++、rescheduleRetry()），
+            //          下轮 flush 再试迁移；
+            //   成功 → queue.shift() 移出主队列 → persist() 写主队列 → notify → 继续。
+            var dead = queue[0]; // peek：先不 shift，等死信落盘成功再移出
             var deadEntry = {
               clientBatchId: dead.clientBatchId,
               enqueuedAt: dead.enqueuedAt,
@@ -508,6 +538,17 @@
             };
             if (dead.readings) deadEntry.readings = dead.readings;
             deadLetter.push(deadEntry);
+            if (!persistDead()) {
+              // 死信落盘失败：回滚内存死信，该批留在主队列（内存 + 已持久化），
+              // 按 retry 语义停止本轮 flush，下轮再试迁移。批次绝不丢。
+              deadLetter.pop();
+              inFlight = false;
+              consecutiveFailures += 1;
+              rescheduleRetry();
+              return { sent: sentCount, remaining: queue.length };
+            }
+            // 死信已落盘：安全移出主队列并写主队列持久化。
+            queue.shift();
             persist();
             notify();
             return step(); // 继续下一批（不死信卡死）

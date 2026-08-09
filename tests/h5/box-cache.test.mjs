@@ -233,13 +233,13 @@ test("normalizeStartOrdinal：<1 / NaN / 缺失 → 回退 1（避免从 0/负�
   assert.equal(helpers.normalizeStartOrdinal({ nextOrdinal: "6" }), 6);
 });
 
-test("回写不变量：normalizeStartOrdinal(box) + count = 下一只应分配的序号", () => {
-  // 锁定 finishBoxFlow/finishBoxFlowLocal 回写公式的正确性：
+test("回写不变量（正常场景）：normalizeStartOrdinal(box) + count = 下一只应分配的序号", () => {
+  // 锁定 finishBoxFlow/finishBoxFlowLocal 回写公式在「正常场景」下的正确性
+  // （box.nextOrdinal 与控制器 startOrdinal 同源——无草稿恢复、未发生服务器推进）：
   // 控制器 startOrdinal = normalizeStartOrdinal(box)，count 条记录分配的最大
   // ordinal = startOrdinal + count - 1，故下一只 = startOrdinal + count。
-  // 该公式在云版（enqueue 成功）与本地版（saveRecords 成功）一致；
-  // 草稿恢复批次（count 含恢复记录）同样成立——控制器草稿 startOrdinal 与
-  // box.nextOrdinal 同源。
+  // 修复后的新公式 max(normalizeStartOrdinal(box), ctrlNext) 在此场景下与旧公式等价
+  // （ctrlNext = startOrdinal + count = box + count，取 max 仍是该值）。
   const box = { cageId: "C1", nextOrdinal: 10 };
   const startOrdinal = helpers.normalizeStartOrdinal(box); // 10
   const count = 3;
@@ -250,4 +250,70 @@ test("回写不变量：normalizeStartOrdinal(box) + count = 下一只应分配�
   // 下一箱再用回写后的 box 续号
   const nextBox = Object.assign({}, box, { nextOrdinal });
   assert.equal(helpers.normalizeStartOrdinal(nextBox), 13);
+});
+
+/* 回写公式修复（草稿恢复后续号回写跳号回归）：
+ * 旧公式 nextOrdinal = normalizeStartOrdinal(box) + count 假设 box.nextOrdinal 与
+ * 控制器 startOrdinal 同源。草稿恢复场景下控制器 start() 以草稿里的 startOrdinal 为准，
+ * 与 box.nextOrdinal 可能不同——草稿 [3,4]（startOrdinal=3），内存队列此前已上传成功、
+ * 服务器推进到 5；重新拉箱后 box.nextOrdinal=5，控制器恢复草稿（startOrdinal 仍为 3，
+ * 续录第 5、6 只）后完成，count=4（含草稿 2 条），旧回写 5+4=9 → 实际下一只应为 7，跳号。
+ *
+ * 修复后回写：max(normalizeStartOrdinal(box), ctrlNext)
+ *   ctrlNext = 控制器实际 nextOrdinal（finishBox 前的 startOrdinal + records.length）
+ * 草稿场景取较大者（此处 ctrlNext=7 > box=5），不跳号；正常场景与旧公式等价。
+ */
+test("回写公式（草稿恢复场景）：max(box, ctrlNext) 取控制器实际值，不跳号", () => {
+  // 场景：草稿 startOrdinal=3，含 2 条（ordinals 3,4）；服务器已推进到 5；
+  // 重新拉箱 box.nextOrdinal=5；恢复草后续录第 5、6 只（ctrl 共 4 条记录）。
+  const box = { cageId: "C1", nextOrdinal: 5 }; // box 已被服务器推进到 5
+  const ctrlStartOrdinal = 3; // 控制器以草稿 startOrdinal 为准，未跟随 box
+  const recordsLength = 4;    // 草稿 2 条 + 续录 2 条
+  const ctrlNext = ctrlStartOrdinal + recordsLength; // 7（控制器实际下一序号）
+  // 修复后回写公式
+  const writeback = Math.max(helpers.normalizeStartOrdinal(box), ctrlNext);
+  assert.equal(writeback, 7, "取控制器实际下一序号 7，不跳号");
+  // 旧公式（回归对照）：box + count 会跳到 9
+  const oldWriteback = helpers.normalizeStartOrdinal(box) + recordsLength;
+  assert.equal(oldWriteback, 9, "旧公式会跳号到 9（实际下一只应为 7）");
+  assert.ok(writeback < oldWriteback, "修复后回写 < 旧公式（消除跳号窗口）");
+  // 下一箱再用回写后的 box 续号——下一只 ordinal 从 7 起
+  const nextBox = Object.assign({}, box, { nextOrdinal: writeback });
+  assert.equal(helpers.normalizeStartOrdinal(nextBox), 7);
+});
+
+test("回写公式（草稿 startOrdinal > box.nextOrdinal）：max 取较大者，不回退", () => {
+  // 反向场景：草稿 startOrdinal 比 box 大（box 缓存陈旧/服务器回退），
+  // 取较大者避免回退。ctrlNext=8 > box=5 → 回写 8。
+  const box = { cageId: "C1", nextOrdinal: 5 };
+  const ctrlStartOrdinal = 6;
+  const recordsLength = 2; // ordinals 6,7
+  const ctrlNext = ctrlStartOrdinal + recordsLength; // 8
+  const writeback = Math.max(helpers.normalizeStartOrdinal(box), ctrlNext);
+  assert.equal(writeback, 8, "草稿 startOrdinal 较大时取其续号，不回退到 box");
+});
+
+test("回写公式（ctrlNext 不可用）：退化为 box 原值，不加 count", () => {
+  // 边界：ctrl 为 null / getState 异常 → ctrlNext 拿不到（退化为 1），
+  // max(normalizeStartOrdinal(box), 1) = box 原值。注意此时不能再加 count，
+  // 否则又跳（这正是修复要避免的）。
+  const box = { cageId: "C1", nextOrdinal: 5 };
+  const ctrlNext = null; // 拿不到控制器实际下一序号
+  const writeback = Math.max(helpers.normalizeStartOrdinal(box), ctrlNext || 1);
+  assert.equal(writeback, 5, "ctrlNext 不可用时退化为 box 原值（不加 count，不跳号）");
+  // 对照：若此处误加 count 会跳到 8（错误的旧行为残留）
+  assert.notEqual(writeback, helpers.normalizeStartOrdinal(box) + 3,
+    "ctrlNext 不可用时不应再加 count");
+});
+
+test("回写公式（正常场景与旧公式等价）：max(box, ctrlNext) = box + count", () => {
+  // 正常场景：box.nextOrdinal 与控制器 startOrdinal 同源（box=10, startOrdinal=10）。
+  // ctrlNext = startOrdinal + count = box + count，max 取该值——与旧公式等价。
+  const box = { cageId: "C1", nextOrdinal: 10 };
+  const ctrlStartOrdinal = 10; // 与 box 同源
+  const count = 3;             // ordinals 10,11,12
+  const ctrlNext = ctrlStartOrdinal + count; // 13
+  const writeback = Math.max(helpers.normalizeStartOrdinal(box), ctrlNext);
+  assert.equal(writeback, 13, "正常场景与旧公式 box+count=13 等价");
+  assert.equal(writeback, helpers.normalizeStartOrdinal(box) + count, "等价于旧公式");
 });
