@@ -146,7 +146,7 @@ class MainActivity : Activity(), K797BleScanner.Listener {
              * 符合规范的 WebView 配置后直接用内置 ISRG 根完成链验证，根本不会走到本回调。
              * 本方法是兜底加固：仅当 NSC 被某些容器忽略、错误仍上报时才触发。
              *
-             * 安全策略（三重绑定，缺一不可）：
+             * 安全策略（四重绑定，缺一不可）：
              * - URL 命中受信服务器（isTrustedApiServer）；
              * - TlsPinValidator 后台握手缓存新鲜且结论为「服务器链锚定到内置 ISRG 根」；
              * - **当前报错证书的 leaf SPKI 与缓存的 leaf SPKI 完全一致**（防缓存窗口内
@@ -157,6 +157,9 @@ class MainActivity : Activity(), K797BleScanner.Listener {
              *     才有，bundle.getX509Certificates 返回的也是不可信的渲染用副本），无法
              *     绑定 → 一律 cancel（安全默认）。这些老系统上若 NSC 生效则根本不会走到
              *     这里；若 NSC 被容器忽略，表现就是连不上而非被劫持，符合安全权衡。
+             * - **错误类型必须是 SSL_UNTRUSTED**：本兜底只为兼容「旧容器不信任 ISRG 根」
+             *   这一种情况；同 SPKI 的证书若已过期/尚未生效/域名不匹配（SSL_DATE_INVALID/
+             *   SSL_IDMISMATCH 等）一律 cancel，绝不顺手放行。
              * 合成域（app.miceautomatic.local）走拦截器，永远不产生真实 TLS，不经过本逻辑。
              *
              * 线程约束：onReceivedSslError 在主线程同步返回，绝不能做网络 IO；
@@ -167,10 +170,11 @@ class MainActivity : Activity(), K797BleScanner.Listener {
                 val hostTrusted = url != null && isTrustedApiServer(Uri.parse(url)) &&
                     ::tlsValidator.isInitialized &&
                     tlsValidator.isServerChainTrusted()
-                // 仅当主机可信且当前报错证书 leaf SPKI 与缓存一致时才放行；
-                // SPKI 不一致或无法提取 → 一律 cancel。
+                // 仅当主机可信、错误类型为「不受信根」（本兜底唯一兼容目标）、且当前
+                // 报错证书 leaf SPKI 与缓存一致时才放行；其余一律 cancel。
                 val proceed = hostTrusted &&
                     error != null &&
+                    error.primaryError == SslError.SSL_UNTRUSTED &&
                     currentLeafMatchesPinned(error)
                 if (handler != null && proceed) {
                     handler.proceed()

@@ -44,8 +44,8 @@ android {
         applicationId = "com.pingoodmice.miceautomatic"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.3.2"
+        versionCode = 6
+        versionName = "0.3.3"
 
         // 应用名由各 flavor 覆盖（cloud=「小鼠称重」，local=「小鼠称重·本地版」）。
         resValue("string", "app_name", "小鼠称重")
