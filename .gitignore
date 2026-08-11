@@ -91,3 +91,6 @@ hardware/**/.build/
 hardware/**/.pio/
 *.keystore
 dist/
+
+# 参考 app APK 与解包产物（仅本地逆向分析用，不入库）
+refapp/
