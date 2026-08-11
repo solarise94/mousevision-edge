@@ -66,6 +66,21 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * 从 window.MV_CONFIG 读取打包 app 注入的同步令牌（与 api-client.js
+   * authHeaders 一致）。返回字符串或空串。root 可注入便于测试。
+   * ------------------------------------------------------------------ */
+  function readTokenFromMvConfig(root) {
+    var r = root || (typeof window !== "undefined" ? window : null);
+    try {
+      var cfg = r && r.MV_CONFIG;
+      if (cfg && typeof cfg === "object" && typeof cfg.token === "string") {
+        return cfg.token.trim();
+      }
+    } catch (_) {}
+    return "";
+  }
+
+  /* ------------------------------------------------------------------ *
    * 从页面 meta 读取鉴权 token（与 mobile.js uploadVideo 一致）。
    * 返回字符串或空串。可注入 document 便于测试。
    * ------------------------------------------------------------------ */
@@ -288,6 +303,23 @@
       }
     }
 
+    /* 按 clientBatchId 从主队列精确移除一条（找到并移除返回 true，否则 false）。
+     * 用于 flush 完成一批后的出队：必须按「已捕获 item 的 clientBatchId」精确定位，
+     * 不能无脑 queue.shift()——否则与进行中的 retry 并发时会删错批次：
+     *   step() 捕获 queue[0]=A 并 sendOne(A)（异步在途）期间，用户点另一批 B 的
+     *   「重传」retry(B) 把 B 重排到队首 → 队列变 [B,A]；A 的成功回调若执行
+     *   queue.shift() 删的是 B，随后 step() 又读 queue[0]=A 再发一次 → A 发两次、
+     *   B 从未发送（丢批次）。按 clientBatchId 精确移除即可保证删的正是 A。 */
+    function removeQueueItemById(id) {
+      for (var i = 0; i < queue.length; i++) {
+        if (queue[i] && queue[i].clientBatchId === id) {
+          queue.splice(i, 1);
+          return true;
+        }
+      }
+      return false;
+    }
+
     function restore() {
       if (!storage || typeof storage.getItem !== "function") return;
       try {
@@ -355,7 +387,10 @@
     /* ---------- 取 token ---------- */
     function currentToken() {
       if (tokenOpt !== undefined) return resolveToken(tokenOpt);
-      return readTokenFromDocument(docRef);
+      // 优先级对齐 api-client.js authHeaders：打包 app 注入的 MV_CONFIG.token
+      // 优先，服务器托管 H5 的 <meta> 兜底（此前只读 meta，app 模式 token 断链
+      // 导致上报 401「令牌失效或无权限」）。
+      return readTokenFromMvConfig(null) || readTokenFromDocument(docRef);
     }
 
     /* ---------- 构造 FormData ---------- */
@@ -506,7 +541,9 @@
         var item = queue[0];
         return sendOne(item).then(function (r) {
           if (r.kind === "ok") {
-            queue.shift();
+            // 按已捕获 item 的 clientBatchId 精确移除：并发 retry 重排后 queue[0]
+            // 可能已不是本批，shift() 会误删队首（见 removeQueueItemById 注释）。
+            removeQueueItemById(item.clientBatchId);
             sentCount += 1;
             // 成功发出至少一批 → 视为鉴权已恢复（之前可能是 token 临时失效）
             lastAuthFailed = false;
@@ -523,12 +560,15 @@
             //   若死信 key 写入失败（quota），persist 返回 false 但 flush 忽略它继续跑，
             //   导致「主队列已不含该批 + 死信没落盘」→ reload 后两边都空，批次永久丢失。
             //
-            // 先 peek（不 shift）→ 构造 deadEntry → push 到内存死信 → persistDead()：
+            // 用已捕获的 item（sendOne 入参，即正在发送的那批）构造 deadEntry，
+            // 先 push 到内存死信 → persistDead()：
             //   失败 → pop() 回滚死信，该批保留在主队列，按 retry 语义停止本轮 flush
             //          （inFlight=false、consecutiveFailures++、rescheduleRetry()），
             //          下轮 flush 再试迁移；
-            //   成功 → queue.shift() 移出主队列 → persist() 写主队列 → notify → 继续。
-            var dead = queue[0]; // peek：先不 shift，等死信落盘成功再移出
+            //   成功 → 按 clientBatchId 精确移出主队列 → persist() 写主队列 → notify → 继续。
+            // 注意：必须用 item 而非 queue[0]——并发 retry 重排后 queue[0] 可能已不是
+            //       正在发送的那批（见 removeQueueItemById 注释）。
+            var dead = item; // sendOne 的入参，正是刚判为 dead 的那批
             var deadEntry = {
               clientBatchId: dead.clientBatchId,
               enqueuedAt: dead.enqueuedAt,
@@ -551,8 +591,8 @@
               rescheduleRetry();
               return { sent: sentCount, remaining: queue.length };
             }
-            // 死信已落盘：安全移出主队列并写主队列持久化。
-            queue.shift();
+            // 死信已落盘：按 clientBatchId 精确移出主队列并写主队列持久化。
+            removeQueueItemById(dead.clientBatchId);
             persist();
             notify();
             return step(); // 继续下一批（不死信卡死）
@@ -680,6 +720,150 @@
         return deadLetter.map(function (d) {
           return { clientBatchId: d.clientBatchId, enqueuedAt: d.enqueuedAt, batch: d.batch, failedAt: d.failedAt, reason: d.reason };
         });
+      },
+
+      /* ---------- 草稿箱 / 手动重传 ----------
+       * 以下方法供 H5「草稿箱 / 失败记录手动重传」页面使用，给用户提供对
+       * 待传队列与死信的明细查看 + 手动重传入口。全程遵守防丢契约：
+       *   - 先落盘（persist / persistDead）再移出内存；
+       *   - 任一步落盘失败回滚，绝不丢数据；
+       *   - 不改变现有 flush / enqueue / 死信迁移 的语义。
+       */
+
+      /* 立即重传主队列全部待传：重置退避计数 + 立即 flush。
+       * 返回 flush 的 Promise（与 flush 同形状 {sent, remaining}）。 */
+      retryAll: function () {
+        // 用户主动触发 → 视为全新一轮尝试，清零退避用基础间隔立即重试
+        consecutiveFailures = 0;
+        return flush();
+      },
+
+      /* 把指定批次移到队首并立即重传（优先发该批）。幂等：找不到只调 flush。
+       * 返回 flush 的 Promise。
+       *
+       * 并发保护：若 flush 正在进行（inFlight=true），队首 queue[0] 正是正在发送
+       * 的那批（step 捕获 queue[0] 并 sendOne，期间 retry 不会改它前面）。此时若
+       * 把目标 unshift 到队首，会插到正在发送的批前面 → 并发时序下即便出队已按
+       * clientBatchId 精确移除（不会丢），也会打乱「队首=在途批」的不变量。故
+       * inFlight 时改把目标插到队首之后（index 1），既优先于其它待发批，又不干扰
+       * 正在发送的队首；inFlight=false 时维持原逻辑（移到队首）。 */
+      retry: function (clientBatchId) {
+        if (typeof clientBatchId === "string" && clientBatchId) {
+          for (var i = 0; i < queue.length; i++) {
+            if (queue[i] && queue[i].clientBatchId === clientBatchId) {
+              if (i > 0) {
+                // 从当前位置移出；插入位置取决于是否有 in-flight 队首要保护。
+                var item = queue.splice(i, 1)[0];
+                // inFlight 时 queue[0] 是正在发送的批，插到 index 1（其后）；
+                // 否则无在途批，移到队首（index 0）。
+                var insertAt = inFlight ? 1 : 0;
+                queue.splice(insertAt, 0, item);
+                persist();
+                notify();
+              }
+              break; // clientBatchId 唯一，找到即止
+            }
+          }
+        }
+        // 重置退避：用户主动重试该批，用基础间隔
+        consecutiveFailures = 0;
+        return flush();
+      },
+
+      /* 把指定死信移回主队列重新走正常 flush 路径（手动重发）。
+       * 防丢顺序：先 queue.push + persist 成功，再从死信移除 + persistDead；
+       * 任一步失败回滚，绝不丢。成功后 notify，并触发一次 flush（若已 start）。
+       * 返回 boolean：true=成功移回；false=找不到该死信或落盘失败（幂等）。 */
+      requeueDead: function (clientBatchId) {
+        if (typeof clientBatchId !== "string" || !clientBatchId) return false;
+        var idx = -1;
+        for (var i = 0; i < deadLetter.length; i++) {
+          if (deadLetter[i] && deadLetter[i].clientBatchId === clientBatchId) {
+            idx = i;
+            break;
+          }
+        }
+        if (idx < 0) return false; // 找不到该死信 → 幂等返回 false
+        var dead = deadLetter[idx];
+        // 构造回主队列的 item：保留 clientBatchId/enqueuedAt/batch/readings，
+        // 去掉 failedAt/reason（这些是死信专有字段，回主队列后不再有意义）。
+        var item = {
+          clientBatchId: dead.clientBatchId,
+          enqueuedAt: dead.enqueuedAt,
+          batch: dead.batch
+        };
+        if (dead.readings) item.readings = dead.readings;
+        // 第一步：先 push 到主队列并 persist 落盘。失败则回滚内存（绝不丢）。
+        queue.push(item);
+        if (!persist()) {
+          // 主队列落盘失败：回滚 push，死信保持不变（仍在内存 + 已落盘）
+          queue.pop();
+          return false;
+        }
+        // 第二步：主队列已落盘 → 安全从死信移除并 persistDead 落盘。
+        // persistDead 失败也不回滚主队列（主队列已成功落盘，该批现在双写：
+        // 主队列有 + 死信有；restore 的去重逻辑会按死信优先过滤主队列重复——
+        // 但此处死信内存已移除只是持久化未更新，为避免 reload 后死信「复活」
+        // 造成重复，persistDead 失败时把死信条目放回内存，让下次 persist 再试）。
+        deadLetter.splice(idx, 1);
+        if (!persistDead()) {
+          // 死信落盘失败：把条目放回内存死信（保持内存与「上次成功落盘的死信」
+          // 一致），主队列保留该批（已落盘）。下轮 persistDead 再试。
+          // 此时主队列与死信内存中都有该 clientBatchId —— restore 去重会按死信
+          // 优先过滤主队列，避免重复上报；但死信持久化未更新，reload 后死信
+          // 仍是旧值（含该条），主队列持久化已更新（含该批）→ restore 去重生效，
+          // 该批只出现在死信不重复上报。即最坏情况下该批退回死信，绝不丢。
+          deadLetter.splice(idx, 0, dead);
+          return false;
+        }
+        notify();
+        // 已 start 则立即触发一次 flush（让用户看到重传动作）
+        if (started) flush();
+        return true;
+      },
+
+      /* 从死信删除指定条并落盘。找不到幂等返回 false。
+       * 防丢：先快照被删条目（含原位 idx），splice 后若 persistDead() 返回 false，
+       * 把条目按原位 splice 回内存（回滚）并返回 false——避免「内存已删、持久化
+       * 副本仍在」导致重启后记录复活。成功才 notify + 返回 true。 */
+      removeDead: function (clientBatchId) {
+        if (typeof clientBatchId !== "string" || !clientBatchId) return false;
+        var idx = -1;
+        for (var i = 0; i < deadLetter.length; i++) {
+          if (deadLetter[i] && deadLetter[i].clientBatchId === clientBatchId) {
+            idx = i;
+            break;
+          }
+        }
+        if (idx < 0) return false;
+        var snapshotEntry = deadLetter[idx];
+        var snapshotIdx = idx;
+        deadLetter.splice(idx, 1);
+        if (!persistDead()) {
+          // 落盘失败：把条目放回原位，内存与「上次成功落盘的死信」保持一致。
+          deadLetter.splice(snapshotIdx, 0, snapshotEntry);
+          return false;
+        }
+        notify();
+        return true;
+      },
+
+      /* 清空死信并落盘。返回 boolean：true=成功；false=落盘失败已回滚内存。
+       * 已空时维持现状（persistDead 一次并返回其结果，不 notify）。 */
+      clearDead: function () {
+        if (deadLetter.length === 0) {
+          // 已空也走一次 persistDead 保证存储一致（写空数组），返回其结果，不 notify（无变化）
+          return persistDead();
+        }
+        // 先快照整个死信数组；清空后若 persistDead 失败则恢复内存（回滚）。
+        var snapshot = deadLetter;
+        deadLetter = [];
+        if (!persistDead()) {
+          deadLetter = snapshot; // 回滚内存
+          return false;
+        }
+        notify();
+        return true;
       },
 
       // 当前计算的下次重试间隔（测试用）

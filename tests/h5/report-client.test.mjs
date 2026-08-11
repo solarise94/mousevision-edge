@@ -759,6 +759,53 @@ test("token: 缺省且无 document / 无 meta → 不带 token 头（不抛错�
   assert.equal(fetchFn.calls[0].init.headers["X-MouseVision-Token"], undefined);
 });
 
+test("token: MV_CONFIG.token 优先于 meta（app 模式断链修复）", async () => {
+  // app 打包模式：config.js 注入 window.MV_CONFIG.token，页面 meta 是另一个值。
+  // 上报必须带 MV_CONFIG.token（对齐 api-client.js authHeaders 优先级）。
+  const prevCfg = globalThis.window && globalThis.window.MV_CONFIG;
+  globalThis.window = globalThis.window || {};
+  globalThis.window.MV_CONFIG = { token: "  from-mv-config  " };
+  try {
+    const storage = makeStorage();
+    const fetchFn = makeFakeFetch();
+    const fakeDoc = {
+      querySelector: (sel) => (sel === 'meta[name="mousevision-api-token"]'
+        ? { content: "from-meta" }
+        : null),
+    };
+    const ob = RC.createOutbox({ storage, fetchFn, document: fakeDoc });
+    ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+    await ob.flush();
+    // MV_CONFIG.token 优先，且 trim 两端空格
+    assert.equal(fetchFn.calls[0].init.headers["X-MouseVision-Token"], "from-mv-config");
+  } finally {
+    if (prevCfg === undefined) delete globalThis.window.MV_CONFIG;
+    else globalThis.window.MV_CONFIG = prevCfg;
+  }
+});
+
+test("token: 无 MV_CONFIG 时回退到 meta（服务器托管 H5 不受影响）", async () => {
+  const prevCfg = globalThis.window && globalThis.window.MV_CONFIG;
+  globalThis.window = globalThis.window || {};
+  delete globalThis.window.MV_CONFIG;
+  try {
+    const storage = makeStorage();
+    const fetchFn = makeFakeFetch();
+    const fakeDoc = {
+      querySelector: (sel) => (sel === 'meta[name="mousevision-api-token"]'
+        ? { content: "from-meta" }
+        : null),
+    };
+    const ob = RC.createOutbox({ storage, fetchFn, document: fakeDoc });
+    ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+    await ob.flush();
+    assert.equal(fetchFn.calls[0].init.headers["X-MouseVision-Token"], "from-meta");
+  } finally {
+    if (prevCfg === undefined) delete globalThis.window.MV_CONFIG;
+    else globalThis.window.MV_CONFIG = prevCfg;
+  }
+});
+
 /* ================================================================== *
  * 6. 'online' 事件触发自动 flush
  * ================================================================== */
@@ -1309,4 +1356,568 @@ test("photos: 持久化往返 —— photo 随 records 存 localStorage，reload
   // records JSON 里 photo 仍在
   const recs = JSON.parse(fd.get("records"));
   assert.equal(recs[0].photo, rec.photo, "reload 后 records JSON 里的 photo 不丢");
+});
+
+/* ================================================================== *
+ * 9. 草稿箱 / 失败记录手动重传：retryAll / retry / requeueDead /
+ *    removeDead / clearDead
+ * ================================================================== */
+
+test("retryAll: 重传主队列全部待传（重置退避计数后 flush 全发出）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "C2", records: [aRecord(1, 2)] });
+  ob.enqueue({ cage_id: "C3", records: [aRecord(1, 3)] });
+  assert.equal(ob.pending(), 3);
+
+  // 先制造一次失败让 consecutiveFailures 累加（验证 retryAll 会重置）
+  const storage2 = makeStorage();
+  const fetchFail = makeFakeFetch({ defaultResponse: () => ({ status: 503, _body: { ok: false } }) });
+  const ob2 = RC.createOutbox({ storage: storage2, fetchFn: fetchFail });
+  ob2.enqueue({ cage_id: "X", records: [aRecord(1, 9)] });
+  await ob2.flush();
+  assert.equal(ob2.consecutiveFailures(), 1, "前置：一次失败让计数=1");
+
+  // retryAll 应重置计数并立即 flush
+  const res = await ob.retryAll();
+  assert.equal(res.sent, 3, "三批全部发出");
+  assert.equal(res.remaining, 0);
+  assert.equal(ob.pending(), 0);
+  assert.equal(fetchFn.calls.length, 3, "fetch 被调 3 次");
+});
+
+test("retryAll: 重置退避计数（consecutiveFailures → 0）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch({ defaultResponse: () => ({ status: 503, _body: { ok: false } }) });
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+  await ob.flush();
+  assert.equal(ob.consecutiveFailures(), 1, "前置：失败一次计数=1");
+  await ob.retryAll();
+  // retryAll 内部先重置 consecutiveFailures=0 再 flush；flush 仍 503 失败会再 +1
+  // 但重点是重置动作发生（用可成功 fetch 验证重置后 nextInterval 回到 base）
+  const storage2 = makeStorage();
+  const fetchOk = makeFakeFetch();
+  const ob2 = RC.createOutbox({ storage: storage2, fetchFn: fetchOk });
+  ob2.enqueue({ cage_id: "C1", records: [aRecord(1, 1)] });
+  await ob2.retryAll();
+  assert.equal(ob2.consecutiveFailures(), 0, "retryAll 后成功 → 计数 0");
+  assert.equal(ob2.nextInterval(), RC.DEFAULT_BASE_INTERVAL_MS, "重置后间隔=base");
+});
+
+test("retry(id): 把指定批移到队首优先传（enqueue A,B → retry(B) → 首次 flush 先发 B）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const idA = ob.enqueue({ cage_id: "A", records: [aRecord(1, 1)] });
+  const idB = ob.enqueue({ cage_id: "B", records: [aRecord(1, 2)] });
+  // 入队顺序：A 在前 B 在后
+  assert.equal(ob.list()[0].clientBatchId, idA);
+  assert.equal(ob.list()[1].clientBatchId, idB);
+
+  // retry(B)：把 B 移到队首并 flush → 第一次 fetch 应发 B
+  const res = await ob.retry(idB);
+  assert.equal(res.sent, 2, "两批都成功发出");
+  assert.equal(fetchFn.calls.length, 2);
+  // 第一次 fetch 发的应是 B（被移到队首）
+  const firstFd = fetchFn.calls[0].init.body;
+  assert.equal(firstFd.get("cage_id"), "B", "retry(B) 后首次 flush 先发 B");
+  const secondFd = fetchFn.calls[1].init.body;
+  assert.equal(secondFd.get("cage_id"), "A", "再发 A");
+});
+
+test("retry(id): 找不到该 clientBatchId → 幂等只调 flush（不抛错）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "A", records: [aRecord(1, 1)] });
+  // 不存在的 id
+  const res = await ob.retry("nonexistent-id");
+  assert.equal(res.sent, 1, "仍正常 flush 发出已有的批");
+  assert.equal(ob.pending(), 0);
+});
+
+test("retry(id): 队首已是该批时（i===0）不 splice，仍 flush", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const idA = ob.enqueue({ cage_id: "A", records: [aRecord(1, 1)] });
+  const res = await ob.retry(idA);
+  assert.equal(res.sent, 1);
+  assert.equal(ob.pending(), 0);
+});
+
+test("requeueDead(id): 死信移回主队列且双写持久化（主队列 key + 死信 key 都更新）", async () => {
+  const storage = makeStorage();
+  // 先造一条 422 进死信
+  const fetchFn = makeFakeFetch({
+    responses: [{ status: 422, _body: { ok: false, detail: "bad" } }],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "BAD", records: [aRecord(1, 1)] });
+  await ob.flush();
+  assert.equal(ob.deadLetters().length, 1, "前置：422 进死信");
+  assert.equal(ob.pending(), 0, "主队列已清空");
+  const dlId = ob.deadLetters()[0].clientBatchId;
+
+  // 调 requeueDead(id)：死信 → 主队列
+  const ok = ob.requeueDead(dlId);
+  assert.equal(ok, true, "requeueDead 返回 true");
+  assert.equal(ob.deadLetters().length, 0, "死信已移除该条");
+  assert.equal(ob.pending(), 1, "主队列恢复 1 条");
+  // clientBatchId 保留
+  assert.equal(ob.list()[0].clientBatchId, dlId, "移回主队列后 clientBatchId 保留");
+  // 死信条目字段（failedAt/reason）不应出现在主队列 item 上
+  assert.equal(ob.list()[0].failedAt, undefined, "主队列 item 不含 failedAt");
+  assert.equal(ob.list()[0].reason, undefined, "主队列 item 不含 reason");
+
+  // 双写持久化验证：读 storage._dump()
+  const dump = storage._dump();
+  const pMain = JSON.parse(dump[RC.DEFAULT_STORAGE_KEY]);
+  const pDead = JSON.parse(dump[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pMain.queue.length, 1, "持久化主队列含该批");
+  assert.equal(pMain.queue[0].clientBatchId, dlId);
+  assert.equal(pDead.dead.length, 0, "持久化死信已移除该条");
+});
+
+test("requeueDead(id): 找不到该死信 → 幂等返回 false", () => {
+  const storage = makeStorage();
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  const ok = ob.requeueDead("nonexistent");
+  assert.equal(ok, false, "找不到 → 幂等 false");
+  assert.equal(ob.pending(), 0);
+  assert.equal(ob.deadLetters().length, 0);
+});
+
+test("requeueDead(id): 主队列 persist 失败时回滚（死信不变，绝不丢）", () => {
+  const store = {};
+  let mainBroken = true; // 主队列 key 写入失败（模拟 quota）
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => {
+      if (k === RC.DEFAULT_STORAGE_KEY && mainBroken) throw new Error("main quota");
+      store[k] = String(v);
+    },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  // 手动往死信塞一条（绕过 flush），便于隔离测试 requeueDead 的回滚
+  // 通过先正常 enqueue + flush 422 进死信（死信 key 可写）
+  // —— 但这里 mainBroken=true 会让 enqueue 也失败。改为先写入死信 raw。
+  store[RC.DEFAULT_STORAGE_KEY] = JSON.stringify({ v: 1, queue: [] });
+  store[RC.DEFAULT_STORAGE_KEY + ".dead"] = JSON.stringify({
+    v: 1,
+    dead: [{
+      clientBatchId: "dead-1",
+      enqueuedAt: 1000,
+      batch: { cage_id: "D", records: [{ record_id: "r1", ordinal: 1, weight_g: 1 }] },
+      failedAt: 2000,
+      reason: "4xx",
+    }],
+  });
+  // 新建 outbox 读这条死信
+  const ob2 = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  assert.equal(ob2.deadLetters().length, 1);
+  assert.equal(ob2.pending(), 0);
+
+  // requeueDead：push 主队列 → persist 失败（main key 抛错）→ 回滚 pop
+  const ok = ob2.requeueDead("dead-1");
+  assert.equal(ok, false, "主队列 persist 失败 → 返回 false");
+  assert.equal(ob2.pending(), 0, "回滚：主队列仍空");
+  assert.equal(ob2.deadLetters().length, 1, "死信不变（绝不丢）");
+  assert.equal(ob2.deadLetters()[0].clientBatchId, "dead-1");
+});
+
+test("端到端：422 进死信 → requeueDead → 服务器改回 200 → flush → 成功出队", async () => {
+  const storage = makeStorage();
+  // 第一次 flush 返回 422（进死信），之后返回 200
+  const fetchFn = makeFakeFetch({
+    responses: [{ status: 422, _body: { ok: false } }],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "BAD", records: [aRecord(1, 1)] });
+  await ob.flush();
+  assert.equal(ob.deadLetters().length, 1);
+  assert.equal(ob.pending(), 0);
+  const dlId = ob.deadLetters()[0].clientBatchId;
+
+  // 用户在草稿箱点「重试」：移回主队列
+  ob.requeueDead(dlId);
+  assert.equal(ob.deadLetters().length, 0);
+  assert.equal(ob.pending(), 1);
+
+  // flush（服务器已改回 200）→ 成功出队
+  const res = await ob.flush();
+  assert.equal(res.sent, 1, "成功发出");
+  assert.equal(res.remaining, 0);
+  assert.equal(ob.pending(), 0, "主队列归 0");
+  assert.equal(ob.deadLetters().length, 0, "死信空");
+});
+
+test("removeDead(id): 删除死信并落盘（storage .dead key 中该条消失）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 400, _body: { ok: false } },
+      { status: 422, _body: { ok: false } },
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "D1", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "D2", records: [aRecord(1, 2)] });
+  await ob.flush();
+  assert.equal(ob.deadLetters().length, 2, "两条都进死信");
+  const [dl1, dl2] = ob.deadLetters();
+
+  // 删除第一条
+  const ok = ob.removeDead(dl1.clientBatchId);
+  assert.equal(ok, true);
+  assert.equal(ob.deadLetters().length, 1, "剩 1 条");
+  assert.equal(ob.deadLetters()[0].clientBatchId, dl2.clientBatchId, "剩下的是 D2");
+
+  // storage 死信 key 已落盘更新
+  const pDead = JSON.parse(storage._dump()[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead.dead.length, 1);
+  assert.equal(pDead.dead[0].clientBatchId, dl2.clientBatchId);
+
+  // 再删第二条
+  ob.removeDead(dl2.clientBatchId);
+  assert.equal(ob.deadLetters().length, 0);
+  const pDead2 = JSON.parse(storage._dump()[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead2.dead.length, 0, "死信 key 已空");
+});
+
+test("removeDead(id): 找不到 → 幂等返回 false", () => {
+  const storage = makeStorage();
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  assert.equal(ob.removeDead("nonexistent"), false);
+});
+
+test("clearDead(): 清空死信并落盘", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 400, _body: { ok: false } },
+      { status: 422, _body: { ok: false } },
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "D1", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "D2", records: [aRecord(1, 2)] });
+  await ob.flush();
+  assert.equal(ob.deadLetters().length, 2);
+
+  ob.clearDead();
+  assert.equal(ob.deadLetters().length, 0, "内存死信已清空");
+  // 落盘：死信 key 写空数组
+  const pDead = JSON.parse(storage._dump()[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead.dead.length, 0, "持久化死信已清空");
+  // 主队列不受影响
+  const pMain = JSON.parse(storage._dump()[RC.DEFAULT_STORAGE_KEY]);
+  assert.equal(pMain.queue.length, 0, "主队列不受 clearDead 影响");
+});
+
+test("clearDead(): 死信已空时也写空数组（保证存储一致），不抛错", () => {
+  const storage = makeStorage();
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  ob.clearDead(); // 死信本就空
+  assert.equal(ob.deadLetters().length, 0);
+  const pDead = JSON.parse(storage._dump()[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead.dead.length, 0, "死信 key 仍是空数组");
+});
+
+test("草稿箱 API 不破坏现有防丢契约：新增 API 后死信迁移顺序不变", async () => {
+  // 回归：新增 API 不应改变 flush 内死信迁移的「先 peek + persistDead 成功再 shift」顺序
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch({
+    responses: [
+      { status: 400, _body: { ok: false } }, // 第一批进死信
+      { status: 200, _body: { ok: true } },  // 第二批成功
+    ],
+    defaultResponse: () => ({ status: 200, _body: { ok: true } }),
+  });
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "BAD", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "OK", records: [aRecord(1, 2)] });
+  // 正常 flush（不 reorder）：BAD 得 400 进死信、OK 得 200 成功
+  await ob.flush();
+  assert.equal(ob.pending(), 0);
+  assert.equal(ob.deadLetters().length, 1, "BAD 进死信");
+  assert.equal(ob.deadLetters()[0].batch.cage_id, "BAD");
+  // 持久化双写一致
+  assert.equal(JSON.parse(storage._dump()[RC.DEFAULT_STORAGE_KEY]).queue.length, 0);
+  assert.equal(JSON.parse(storage._dump()[RC.DEFAULT_STORAGE_KEY + ".dead"]).dead.length, 1);
+});
+
+/* ================================================================== *
+ * 10. P1 并发回归：单条重传 retry 与进行中的 flush 并发不丢批次
+ *
+ * 复现时序：flush 的 step() 捕获 queue[0]=A 并 sendOne(A)（返回一个受控的
+ * pending Promise，可手动 resolve）。在 A 的 Promise 尚未 resolve 时调用
+ * retry(B) 把 B 重排。旧实现 retry(B) 把 B unshift 到队首 → [B,A]；A 成功回调
+ * queue.shift() 删掉 B，step() 又读 queue[0]=A 再发 → 发了 A、A，B 从未发送。
+ *
+ * 修复：flush 出队按 clientBatchId 精确移除（删的正是 A）+ retry 在 inFlight 时
+ * 把目标插到队首之后（index 1）保护在途队首。双保险：即便 retry 挪了位置，
+ * 精确移除也不会删错。
+ * ================================================================== */
+
+/* 受控 fetch：每次调用返回一个 { resolve } 控制的 Promise，便于精确卡住某批
+ * 在途时调用 retry，再手动放行，复现并发时序。calls 记录每次 endpoint/init。 */
+function makeControllableFetch() {
+  const calls = [];
+  const controllers = []; // 每次调用对应一个 { resolve, response }
+  const fn = (endpoint, init) => {
+    calls.push({ endpoint, init });
+    return new Promise((resolve) => {
+      controllers.push({ resolve });
+    });
+  };
+  fn.calls = calls;
+  // 放行第 idx 次调用（从 0 起）并指定其响应（默认 200 ok）。
+  fn.release = (idx, response) => {
+    const c = controllers[idx];
+    if (!c) throw new Error(`controllable fetch: no call #${idx}`);
+    c.resolve(response || { status: 200, _body: { ok: true } });
+  };
+  return fn;
+}
+
+test("P1 并发：flush 发送 A 在途时 retry(B) → A、B 各发一次，B 不丢（不出现 A、A）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeControllableFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const idA = ob.enqueue({ cage_id: "A", records: [aRecord(1, 1)] });
+  const idB = ob.enqueue({ cage_id: "B", records: [aRecord(1, 2)] });
+  assert.equal(ob.pending(), 2);
+
+  // 启动 flush：step() 捕获 queue[0]=A 并调用 fetchFn（第 0 次），Promise 挂起。
+  const flushP = ob.flush();
+  await new Promise((r) => setTimeout(r, 0)); // 让 step() 真正发出对 A 的 fetch（第 0 次）
+  assert.equal(fetchFn.calls.length, 1, "A 的 fetch 已发出（在途）");
+  assert.equal(fetchFn.calls[0].init.body.get("cage_id"), "A");
+
+  // A 在途期间，用户对 B 点「重传」：retry(B) 重排（B 到 index 1）并 flush（inFlight 时 no-op）。
+  const retryFlushP = ob.retry(idB);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(fetchFn.calls.length, 1, "A 在途时 retry(B) 不应触发额外 fetch");
+  // A、B 仍在队列（B 未被错删；A 在途未出队）
+  assert.deepEqual(
+    ob.list().map((it) => it.batch.cage_id),
+    ["A", "B"],
+    "retry(B) 后队列 [A,B]（B 在 in-flight A 之后）",
+  );
+
+  // 放行 A 的在途响应 → A 成功出队（按 clientBatchId 精确移除，删的正是 A）。
+  fetchFn.release(0);
+  await new Promise((r) => setTimeout(r, 0)); // 让 step 循环发出对 B 的 fetch
+  assert.equal(fetchFn.calls.length, 2, "A 成功后应继续发 B");
+  assert.equal(fetchFn.calls[1].init.body.get("cage_id"), "B", "第二批发的正是 B（不是 A 再来一次）");
+
+  // 放行 B → B 成功出队 → 队列空 → flushP settle
+  fetchFn.release(1);
+  const r1 = await flushP;
+  await retryFlushP.catch(() => {}); // inFlight 时的 no-op flush，仅取 settle
+
+  // 最终：A、B 各发一次，队列清空，无重复、无丢失
+  assert.deepEqual(
+    fetchFn.calls.map((c) => c.init.body.get("cage_id")),
+    ["A", "B"],
+    "发送顺序为 A、B 各一次（B 不丢、A 不重发）",
+  );
+  assert.equal(ob.pending(), 0, "队列清空");
+  assert.equal(r1.sent, 2, "flush 经 step 循环发出 A、B 两批");
+  assert.equal(r1.remaining, 0);
+});
+
+test("P1 并发：队列 A,C,B 且 A 在途时 retry(B) → B 插到 A 之后（index1）优先于 C", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeControllableFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "A", records: [aRecord(1, 1)] });
+  ob.enqueue({ cage_id: "C", records: [aRecord(1, 3)] });
+  const idB = ob.enqueue({ cage_id: "B", records: [aRecord(1, 2)] });
+
+  const flushP = ob.flush();
+  await new Promise((r) => setTimeout(r, 0)); // 让 A 的 fetch 发出（#0）
+  assert.equal(fetchFn.calls.length, 1);
+
+  // A 在途时 retry(B)：B 从 index 2 移到 index 1（A 之后、C 之前）→ [A,B,C]
+  const retryFlushP = ob.retry(idB);
+  assert.deepEqual(
+    ob.list().map((it) => it.batch.cage_id),
+    ["A", "B", "C"],
+    "inFlight 时 retry(B) 把 B 插到 A 之后（保护在途队首）",
+  );
+
+  // 顺序放行 A→B→C，验证发送顺序与重排一致
+  fetchFn.release(0); // A 完成
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(fetchFn.calls[1].init.body.get("cage_id"), "B", "A 之后先发 B");
+  fetchFn.release(1); // B 完成
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(fetchFn.calls[2].init.body.get("cage_id"), "C", "B 之后再发 C");
+  fetchFn.release(2); // C 完成
+  await flushP;
+  await retryFlushP.catch(() => {});
+
+  assert.deepEqual(
+    fetchFn.calls.map((c) => c.init.body.get("cage_id")),
+    ["A", "B", "C"],
+    "发送顺序 A→B→C，B 优先于 C",
+  );
+  assert.equal(ob.pending(), 0);
+});
+
+test("P1 并发：flush 不在进行时 retry(B) 维持原逻辑（移到队首）", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  ob.enqueue({ cage_id: "A", records: [aRecord(1, 1)] });
+  const idB = ob.enqueue({ cage_id: "B", records: [aRecord(1, 2)] });
+  // 无在途 flush（inFlight=false）：retry(B) 应回到「移到队首」原逻辑
+  const res = await ob.retry(idB);
+  assert.equal(res.sent, 2);
+  assert.equal(fetchFn.calls[0].init.body.get("cage_id"), "B", "非 inFlight 时 retry(B) 移到队首，先发 B");
+  assert.equal(fetchFn.calls[1].init.body.get("cage_id"), "A");
+});
+
+test("P1 并发：flush 发送 A 在途时 retry(A)（目标即队首）不挪动、不报错", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeControllableFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const idA = ob.enqueue({ cage_id: "A", records: [aRecord(1, 1)] });
+  const flushP = ob.flush();
+  await new Promise((r) => setTimeout(r, 0)); // 让 A 的 fetch 发出（#0）
+  // A 在途时 retry(A)：i===0 不 splice，仅 flush（inFlight → no-op）
+  const retryFlushP = ob.retry(idA);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(fetchFn.calls.length, 1, "retry(队首) 不重复触发 fetch");
+  // 放行 A → flush 完成
+  fetchFn.release(0);
+  const r = await flushP;
+  await retryFlushP.catch(() => {});
+  assert.deepEqual(
+    fetchFn.calls.map((c) => c.init.body.get("cage_id")),
+    ["A"],
+    "retry(队首) 后仅发 A 一次",
+  );
+  assert.equal(ob.pending(), 0);
+  assert.equal(r.sent, 1);
+});
+
+/* ================================================================== *
+ * 11. P2-a 回归：removeDead / clearDead 落盘失败回滚，绝不丢
+ * ================================================================== */
+
+test("removeDead(id): persistDead 失败时回滚内存（条目放回原位）并返回 false", () => {
+  const store = {};
+  let deadKeyBroken = false; // 仅 dead key 写入失败
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => {
+      if (deadKeyBroken && k === RC.DEFAULT_STORAGE_KEY + ".dead") {
+        throw new Error("dead key quota");
+      }
+      store[k] = String(v);
+    },
+    removeItem: (k) => { delete store[k]; },
+  };
+  // 先用可写 storage 正常 enqueue（写主队列 + 空死信），再手动塞一条死信到内存+落盘。
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  // 直接构造死信持久化 + 内存：绕过 flush，便于隔离 removeDead 的回滚。
+  store[RC.DEFAULT_STORAGE_KEY] = JSON.stringify({ v: 1, queue: [] });
+  store[RC.DEFAULT_STORAGE_KEY + ".dead"] = JSON.stringify({
+    v: 1,
+    dead: [
+      { clientBatchId: "d-1", enqueuedAt: 1, batch: { cage_id: "D1", records: [aRecord(1, 1)] }, failedAt: 2, reason: "4xx" },
+      { clientBatchId: "d-2", enqueuedAt: 1, batch: { cage_id: "D2", records: [aRecord(1, 2)] }, failedAt: 2, reason: "4xx" },
+    ],
+  });
+  const ob2 = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  assert.equal(ob2.deadLetters().length, 2, "前置：两条死信");
+
+  // 让 dead key 写失败 → removeDead("d-1") 应回滚内存（d-1 放回原位 index 0）并返回 false
+  deadKeyBroken = true;
+  const ok = ob2.removeDead("d-1");
+  assert.equal(ok, false, "落盘失败 → 返回 false");
+  assert.equal(ob2.deadLetters().length, 2, "内存死信回滚：仍是 2 条");
+  // 回滚后顺序不变（d-1 在原位 index 0，d-2 在 index 1）
+  assert.equal(ob2.deadLetters()[0].clientBatchId, "d-1", "d-1 放回原位");
+  assert.equal(ob2.deadLetters()[1].clientBatchId, "d-2");
+
+  // 持久化死信未变（写入抛错，仍是 2 条）
+  const pDead = JSON.parse(store[RC.DEFAULT_STORAGE_KEY + ".dead"]);
+  assert.equal(pDead.dead.length, 2, "持久化死信未变（写失败已回滚）");
+
+  // 恢复 storage → removeDead 成功
+  deadKeyBroken = false;
+  const ok2 = ob2.removeDead("d-1");
+  assert.equal(ok2, true, "恢复后删除成功 → true");
+  assert.equal(ob2.deadLetters().length, 1);
+  assert.equal(ob2.deadLetters()[0].clientBatchId, "d-2");
+});
+
+test("clearDead(): persistDead 失败时回滚内存（恢复整个死信数组）并返回 false", () => {
+  const store = {};
+  let deadKeyBroken = false;
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => {
+      if (deadKeyBroken && k === RC.DEFAULT_STORAGE_KEY + ".dead") {
+        throw new Error("dead key quota");
+      }
+      store[k] = String(v);
+    },
+    removeItem: (k) => { delete store[k]; },
+  };
+  store[RC.DEFAULT_STORAGE_KEY] = JSON.stringify({ v: 1, queue: [] });
+  store[RC.DEFAULT_STORAGE_KEY + ".dead"] = JSON.stringify({
+    v: 1,
+    dead: [
+      { clientBatchId: "d-1", enqueuedAt: 1, batch: { cage_id: "D1", records: [aRecord(1, 1)] }, failedAt: 2, reason: "4xx" },
+    ],
+  });
+  const ob = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  assert.equal(ob.deadLetters().length, 1, "前置：1 条死信");
+
+  // dead key 写失败 → clearDead 应回滚内存并返回 false
+  deadKeyBroken = true;
+  const ret = ob.clearDead();
+  assert.equal(ret, false, "落盘失败 → 返回 false");
+  assert.equal(ob.deadLetters().length, 1, "内存死信回滚：仍是 1 条");
+  assert.equal(ob.deadLetters()[0].clientBatchId, "d-1", "回滚后条目完整");
+  // 持久化未变
+  assert.equal(JSON.parse(store[RC.DEFAULT_STORAGE_KEY + ".dead"]).dead.length, 1);
+
+  // 恢复 → clearDead 成功
+  deadKeyBroken = false;
+  const ret2 = ob.clearDead();
+  assert.equal(ret2, true, "恢复后清空成功 → true");
+  assert.equal(ob.deadLetters().length, 0);
+  assert.equal(JSON.parse(store[RC.DEFAULT_STORAGE_KEY + ".dead"]).dead.length, 0);
+});
+
+test("clearDead(): 死信已空时返回 persistDead 结果（boolean）", () => {
+  // 正常 storage → 返回 true
+  const ob1 = RC.createOutbox({ storage: makeStorage(), fetchFn: makeFakeFetch() });
+  assert.equal(ob1.clearDead(), true, "已空 + 可写 → true");
+  // dead key 写失败 → 返回 false
+  const store = {};
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => {
+      if (k === RC.DEFAULT_STORAGE_KEY + ".dead") throw new Error("quota");
+      store[k] = String(v);
+    },
+    removeItem: (k) => { delete store[k]; },
+  };
+  const ob2 = RC.createOutbox({ storage, fetchFn: makeFakeFetch() });
+  assert.equal(ob2.clearDead(), false, "已空但 dead key 写失败 → false");
 });

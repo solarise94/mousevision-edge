@@ -114,6 +114,16 @@
     // 独立 app（打包进 APK）跨源时上报接口必须前置 MV_CONFIG.apiBase；
     // 服务器托管 H5 无 MV_CONFIG → apiUrl() 原样返回，等价现状（同源）。
     endpoint: apiUrl("/api/records/report"),
+    // 队列变化（enqueue / flush 成功 / 死信迁移）时刷新当前页，让草稿箱/设置页
+    // 的待传/失败计数实时更新。回调写成惰性（调用时才读当前路由）—— reportOutbox
+    // 在此处创建时 route()/render() 尚未定义（IIFE 内顺序），不能在闭包形成期引用。
+    onChange: function () {
+      try {
+        // 仅在用户正停留在会展示这些计数的页面时刷新，避免无谓重渲染
+        const rel = location.pathname.slice(BASE.length) || "/";
+        if (rel === "/outbox" || rel === "/settings") render();
+      } catch (_) {}
+    },
   });
   reportOutbox.start();
 
@@ -155,6 +165,13 @@
           try { return (window.MV_CONFIG && window.MV_CONFIG.shareToken) || ""; }
           catch (_) { return ""; }
         })(),
+        // 与 reportOutbox 同样的惰性 onChange：队列变化时刷新草稿箱/设置页计数。
+        onChange: function () {
+          try {
+            const rel = location.pathname.slice(BASE.length) || "/";
+            if (rel === "/outbox" || rel === "/settings") render();
+          } catch (_) {}
+        },
       })
     : null;
   if (shareOutbox) shareOutbox.start();
@@ -978,11 +995,12 @@
     const connectCard = renderScaleConnectCard();
     content.appendChild(connectCard);
 
-    // 操作分组列表（开始录制 ›、箱子管理 ›）
+    // 操作分组列表（开始录制 ›、草稿箱 ›、箱子管理 ›）
     content.appendChild(h("div", { class: "group-title" }, "操作"));
     const opGroup = h("div", { class: "group" }, [
       // 开始录制：未连接天平时点击会 toast 并停留（三种模式都需要天平）
       groupNavRow("开始录制", null, () => startRecording(), "home-start-rec"),
+      groupNavRow("草稿箱", outboxEntrySub(), () => go("/outbox"), "home-outbox"),
       groupNavRow("箱子管理", null, () => go("/manage")),
     ]);
     content.appendChild(opGroup);
@@ -1040,6 +1058,14 @@
       main,
       h("span", { class: "group-chevron" }, "›"),
     ]);
+  }
+
+  // 草稿箱入口副标题：待传 + 失败计数（两者都为 0 时返回 null → 副标题留空）
+  function outboxEntrySub() {
+    const pending = (typeof reportOutbox.pending === "function") ? reportOutbox.pending() : 0;
+    const dead = (typeof reportOutbox.deadLetters === "function") ? reportOutbox.deadLetters().length : 0;
+    if (pending === 0 && dead === 0) return null;
+    return `待传 ${pending} · 失败 ${dead}`;
   }
 
   // 天平连接卡片渲染 + 状态→DOM 更新器（返回一个订阅函数）
@@ -1180,7 +1206,11 @@
     content.appendChild(h("div", { class: "page-title" }, "记录方式"));
     content.appendChild(h("div", { class: "page-subtitle" }, `本次录制：箱 ${box.cageId}`));
 
-    const connected = scaleConn.state === "connected";
+    // connected 不能一次性快照：完成本箱后全局天平通道自动重连，有约 1s 的
+    // "connecting" 窗口（读数到达才转 connected）。此刻进入本页会把"未连接"提示
+    // 和卡片禁用态定格，即便随后天平连上也不会恢复（页面不重渲染），点任何卡都
+    // 误弹"请先在首页连接天平"。改为实时读 scaleConn.state + 订阅状态变更重渲染。
+    const isConnected = () => scaleConn.state === "connected";
     const modes = [
       { id: "post_match", label: "后匹配", desc: "连续录像，自动记录每只，事后审核", requireScale: true, icon: "▶" },
       { id: "announce", label: "即时报数", desc: "每只暂停确认重量，语音报数", requireScale: true, icon: "♪" },
@@ -1189,6 +1219,7 @@
     let selectedMode = currentRecordMode();
     const cardsWrap = h("div", { class: "mode-cards" });
     function renderCards() {
+      const connected = isConnected();
       cardsWrap.innerHTML = "";
       modes.forEach((m) => {
         const disabled = m.requireScale && !connected;
@@ -1196,7 +1227,8 @@
         const card = h("button", {
           class: "mode-card" + (disabled ? " disabled" : "") + (selected ? " selected" : ""),
           onClick: () => {
-            if (disabled) { toast("请先在首页连接天平"); return; }
+            // 点击时再实时判一次：即便卡片禁用态还没来得及刷新也不误判。
+            if (m.requireScale && !isConnected()) { toast("请先在首页连接天平"); return; }
             selectedMode = m.id;
             renderCards();
           },
@@ -1213,20 +1245,30 @@
     }
     renderCards();
     content.appendChild(cardsWrap);
-    if (!connected) {
-      content.appendChild(h("div", { class: "group-footer mode-footer-note" },
-        "天平未连接：请先在首页连接天平。"));
-    }
+    // 未连接提示常驻 DOM、按状态切换显隐（连接恢复后自动消失）。
+    const note = h("div", { class: "group-footer mode-footer-note" },
+      "天平未连接：请先在首页连接天平。");
+    content.appendChild(note);
+    function refreshNote() { note.style.display = isConnected() ? "none" : ""; }
+    refreshNote();
     // 底部固定主按钮
     const startBtn = h("button", { class: "btn btn-p", onClick: () => {
       const m = modes.filter((x) => x.id === selectedMode)[0];
-      if (m && m.requireScale && !connected) { toast("请先在首页连接天平"); return; }
+      if (m && m.requireScale && !isConnected()) { toast("请先在首页连接天平"); return; }
       sessionStorage.setItem("mv.recordMode", selectedMode);
       go("/record");
     } }, "开始录制");
     screen.appendChild(content);
     screen.appendChild(h("div", { class: "dock dock-fixed" }, [startBtn]));
     mount(screen);
+
+    // 订阅全局天平状态：重连完成（connected）或断开时刷新卡片禁用态与提示显隐。
+    const updater = () => { renderCards(); refreshNote(); };
+    scaleConn._subs.push(updater);
+    return () => {
+      const i = scaleConn._subs.indexOf(updater);
+      if (i >= 0) scaleConn._subs.splice(i, 1);
+    };
   }
   function currentRecordMode() {
     return sessionStorage.getItem("mv.recordMode") || "announce";
@@ -3487,6 +3529,9 @@
     // 数据同步状态：outbox 待同步条数（本地累积、联网自动补传）+ 服务器地址。
     // 打包 app 显示 MV_CONFIG.apiBase；服务器托管 H5 无 MV_CONFIG → 同源。
     const pendingSync = (typeof reportOutbox.pending === "function") ? reportOutbox.pending() : 0;
+    // 死信条数（服务器拒收的失败记录），用于草稿箱入口徽标。
+    const deadSyncCount = (typeof reportOutbox.deadLetters === "function")
+      ? reportOutbox.deadLetters().length : 0;
     let serverText = "同源";
     try {
       if (window.MV_CONFIG && typeof window.MV_CONFIG === "object" && window.MV_CONFIG.apiBase) {
@@ -3585,6 +3630,14 @@
                 h("span", { class: "k" }, "服务器"),
                 h("span", { class: "v" }, serverText),
               ]),
+              // 草稿箱入口：展示待传 + 失败总条数徽标，点击进草稿箱页查看明细/手动重传
+              groupNavRow(
+                "草稿箱 / 失败记录",
+                pendingSync + deadSyncCount > 0
+                  ? `待传 ${pendingSync} · 失败 ${deadSyncCount}`
+                  : "没有待上传或失败的记录",
+                () => go("/outbox")
+              ),
               DEV_MODE
                 ? h("div", { class: "li-sub", style: "margin-top:8px" },
                   "DEV 模式：本次会话采集天平读数时间序列，随记录上报")
@@ -3602,6 +3655,158 @@
     mount(screen);
   }
 
+  /* ================================================================== *
+   * 视图：草稿箱 / 失败记录手动重传
+   * 展示待上传（主队列）与失败（死信）明细，支持逐条重传 / 重试 / 删除，
+   * 以及「立即重传全部」。onChange（reportOutbox）会在队列变化时刷新本页。
+   * ================================================================== */
+  async function viewOutbox() {
+    const screen = h("div", { class: "screen" });
+    screen.appendChild(appbar("草稿箱", { back: "/settings" }));
+
+    // 当前快照（render 时重读）
+    let authFailed = false;
+    try {
+      if (typeof reportOutbox.lastAuthFailed === "function") {
+        authFailed = !!reportOutbox.lastAuthFailed();
+      }
+    } catch (_) {}
+    const pendingList = (typeof reportOutbox.list === "function") ? reportOutbox.list() : [];
+    const deadList = (typeof reportOutbox.deadLetters === "function") ? reportOutbox.deadLetters() : [];
+
+    // 顶部操作卡片：立即重传全部 + 鉴权失败提示
+    const topCard = h("div", { class: "card" }, [
+      h("button", {
+        class: "btn primary",
+        disabled: pendingList.length === 0 ? "" : null,
+        onClick: () => {
+          if (typeof reportOutbox.retryAll !== "function") return;
+          toast("已开始重传");
+          Promise.resolve(reportOutbox.retryAll()).then(() => render()).catch(function () {});
+        },
+      }, pendingList.length > 0 ? `立即重传全部（${pendingList.length} 批）` : "没有待上传记录"),
+    ]);
+    if (authFailed) {
+      topCard.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
+        "令牌失效或无权限，请检查令牌"));
+    }
+
+    // 待上传区
+    const pendingCard = h("div", { class: "card" }, [
+      h("div", { class: "li-sub" }, `待上传（${pendingList.length}）`),
+    ]);
+    if (pendingList.length === 0) {
+      pendingCard.appendChild(h("div", { class: "empty" }, "没有待上传记录"));
+    } else {
+      pendingList.forEach(function (item) {
+        pendingCard.appendChild(outboxPendingRow(item));
+      });
+    }
+
+    // 失败区（死信）
+    const deadCard = h("div", { class: "card" }, [
+      h("div", { class: "li-sub" }, `上传失败（${deadList.length}）`),
+    ]);
+    if (deadList.length === 0) {
+      deadCard.appendChild(h("div", { class: "empty" }, "没有失败记录"));
+    } else {
+      deadList.forEach(function (item) {
+        deadCard.appendChild(outboxDeadRow(item));
+      });
+    }
+
+    // 两区都空时给一个明确空态
+    const emptyHint = (pendingList.length === 0 && deadList.length === 0)
+      ? h("div", { class: "empty" }, "没有待上传或失败的记录")
+      : null;
+
+    screen.appendChild(h("div", { class: "content" }, [topCard, pendingCard, deadCard, emptyHint]));
+    mount(screen);
+  }
+
+  /* 草稿箱：待上传批次行。标题=箱号+条数；副标题=入队时间+首条克数摘要；
+   * 右侧=「待传」徽标 + 「重传」按钮（优先发该批）。 */
+  function outboxPendingRow(item) {
+    const batch = (item && item.batch) || {};
+    const recs = Array.isArray(batch.records) ? batch.records : [];
+    const cageId = batch.cage_id != null ? String(batch.cage_id) : "（未知箱号）";
+    const enqStr = item && item.enqueuedAt
+      ? new Date(item.enqueuedAt).toLocaleString()
+      : "";
+    const firstG = recs.length > 0 && recs[0] && typeof recs[0].weight_g === "number"
+      ? `${Number(recs[0].weight_g).toFixed(2)} g`
+      : null;
+    const subParts = [];
+    if (enqStr) subParts.push(enqStr);
+    if (firstG) subParts.push(`首条 ${firstG}`);
+    const main = h("div", { class: "li-main" }, [
+      h("div", { class: "li-title" }, `${cageId} · ${recs.length} 条`),
+      subParts.length > 0 ? h("div", { class: "li-sub" }, subParts.join(" · ")) : null,
+    ]);
+    const retryBtn = h("button", { class: "pill pill-gray" }, "重传");
+    retryBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (typeof reportOutbox.retry !== "function" || !item || !item.clientBatchId) return;
+      toast("已开始重传该批");
+      Promise.resolve(reportOutbox.retry(item.clientBatchId))
+        .then(function () { render(); })
+        .catch(function () {});
+    });
+    return h("div", { class: "list-item" }, [
+      main,
+      h("div", { style: "display:flex;align-items:center;gap:8px;flex-shrink:0" }, [
+        h("span", { class: "badge queued" }, "待传"),
+        retryBtn,
+      ]),
+    ]);
+  }
+
+  /* 草稿箱：失败（死信）行。标题=箱号+条数；副标题=原因+失败时间；
+   * 右侧=「失败」徽标 + 「重试」（移回主队列）+「删除」按钮。 */
+  function outboxDeadRow(item) {
+    const batch = (item && item.batch) || {};
+    const recs = Array.isArray(batch.records) ? batch.records : [];
+    const cageId = batch.cage_id != null ? String(batch.cage_id) : "（未知箱号）";
+    const reason = (item && item.reason) ? String(item.reason) : "失败";
+    const failedStr = item && item.failedAt
+      ? new Date(item.failedAt).toLocaleString()
+      : "";
+    const subParts = [reason];
+    if (failedStr) subParts.push(failedStr);
+    const main = h("div", { class: "li-main" }, [
+      h("div", { class: "li-title" }, `${cageId} · ${recs.length} 条`),
+      h("div", { class: "li-sub" }, subParts.join(" · ")),
+    ]);
+    const requeueBtn = h("button", { class: "pill pill-gray" }, "重试");
+    requeueBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (typeof reportOutbox.requeueDead !== "function" || !item || !item.clientBatchId) return;
+      const ok = reportOutbox.requeueDead(item.clientBatchId);
+      if (ok) toast("已移回待上传，将立即重传");
+      else toast("操作失败，请稍后重试");
+      render();
+    });
+    const removeBtn = h("button", { class: "pill pill-red" }, "删除");
+    removeBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (typeof reportOutbox.removeDead !== "function" || !item || !item.clientBatchId) return;
+      if (!confirm("确定删除这条上传失败的记录吗？删除后不可恢复。")) return;
+      // removeDead 落盘失败会回滚内存并返回 false：据此提示，避免「内存已删、
+      // 持久化副本仍在、重启后复活」却被误报「已删除」。
+      const ok = reportOutbox.removeDead(item.clientBatchId);
+      toast(ok ? "已删除" : "删除失败，请重试");
+      render();
+    });
+    return h("div", { class: "list-item" }, [
+      main,
+      h("div", { style: "display:flex;align-items:center;gap:8px;flex-shrink:0" }, [
+        h("span", { class: "badge failed" }, "失败"),
+        requeueBtn,
+        removeBtn,
+      ]),
+    ]);
+  }
+
   /* ------------------------------------------------------------------ *
    * 路由注册
    * ------------------------------------------------------------------ */
@@ -3615,6 +3820,7 @@
   route("/manage", viewManage);
   route("/manage/new", viewBoxNew);
   route("/settings", viewSettings);
+  route("/outbox", viewOutbox);
 
   // 测试钩子：暴露 edition 判定与 api 构建工厂，供 tests/h5 提取注入验证。
   try {

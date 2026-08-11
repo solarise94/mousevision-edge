@@ -718,13 +718,15 @@ html.camera-mode.record-light body { background: var(--bg); }
 }
 .rt-confirm-guide[hidden] { display: none; }
 
-/* 确认/重测按钮：确认更突出（primary 填满、加宽、min-height 48），重测为次级。 */
+/* 确认/重测按钮：两个等宽（各占一半）。两者都必须 width:0 压掉 .btn 基类的
+ * width:100%——否则 flex-basis:0 之外任何 auto/100% 基准都会让一方吃掉整行
+ * 把另一方挤塌（前几轮"确认塌成边角/一大一小"的根因）。flex:1 1 0 等分剩余空间。 */
 .rt-actions {
   display: flex; gap: 12px; justify-content: center;
   min-height: 48px; align-items: stretch; width: 100%;
 }
 .rt-btn-retry {
-  flex: 0 0 auto; min-width: 96px; min-height: 48px;
+  flex: 1 1 0; width: 0; min-width: 0; min-height: 48px;
   padding: 12px 18px; font-size: 17px; font-weight: 600;
   border-radius: 14px; border: 1px solid var(--sep);
   background: rgba(255, 255, 255, 0.92); backdrop-filter: blur(12px);
@@ -734,7 +736,7 @@ html.camera-mode.record-light body { background: var(--bg); }
 }
 .rt-btn-retry:active { opacity: 0.7; transform: scale(0.98); }
 .rt-btn-accept {
-  flex: 1 1 auto; min-height: 52px;
+  flex: 1 1 0; width: 0; min-width: 0; min-height: 52px;
   padding: 12px 20px; font-size: 18px; font-weight: 600;
   border-radius: 14px; border: none;
   background: var(--mint); color: #fff; cursor: pointer;
