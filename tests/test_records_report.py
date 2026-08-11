@@ -386,6 +386,39 @@ def test_reported_records_visible_via_list_mice(client):
 
 
 # --------------------------------------------------------------------------- #
+# 10. 上报记录在箱详情（GET /api/boxes/{cage}/records）可见。
+# Bug：persist_report_records 只写 registry 磁盘 + upload_queue，从不写 job_store；
+# 而箱详情此前只遍历 job_store.list_by_cage → 上报记录对不上 job → items 为空
+# （"本箱还没有记录"）。修复：api_box_records 追加扫描 registry 补出有 run 但无 job
+# 的上报记录。
+# --------------------------------------------------------------------------- #
+
+
+def test_report_records_visible_in_box_records(client):
+    c, app_mod = client
+    cage = "C57-023"
+    # 上报 3 条不同 ordinal 的记录（含 record_id）
+    res = _post(c, _records_payload(3), _cage=cage)
+    assert res.status_code == 201, res.text
+
+    # 上报路径确实不写 job_store（与视频分析路径区分），确认没有对应 job。
+    assert app_mod.job_store.list_by_cage(cage) == []
+
+    box_res = c.get(f"/api/boxes/{cage}/records", headers=_headers())
+    assert box_res.status_code == 200, box_res.text
+    items = box_res.json()["items"]
+    # 修复前为 0 条；修复后应能列出全部 3 条 completed 上报记录。
+    assert len(items) == 3
+    completed = [i for i in items if i.get("status") == "completed" and i.get("record_id")]
+    assert len(completed) == 3
+    rids = sorted(i["record_id"] for i in completed)
+    assert rids == ["rec-001", "rec-002", "rec-003"]
+    # 排序按 ordinal 升序（合成 item 的 actual_ordinal 来自 mouse，能正常排序）。
+    ordinals = [int(i["actual_ordinal"]) for i in items]
+    assert ordinals == sorted(ordinals)
+
+
+# --------------------------------------------------------------------------- #
 # Extra: same-batch duplicate record_id is deduped within the request.
 # --------------------------------------------------------------------------- #
 

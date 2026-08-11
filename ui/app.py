@@ -1441,6 +1441,36 @@ def api_box_records(cage_id: str) -> dict[str, Any]:
                     placeholder["warning"] = "analysis_failed"
             items.append(placeholder)
 
+    # 补齐上报路径（POST /api/records/report）只写 registry 磁盘、不写 job_store
+    # 导致的箱详情缺记录：上报记录在箱列表计数（_box_stats 扫 registry）可见，
+    # 但详情此前只遍历 job_store.list_by_cage → 永远为空。这里追加扫描 registry，
+    # 补出「有 run 但无对应 job」的上报记录。不动 video 分析路径与 job_store 写入方。
+    job_run_ids = {str(j["run_id"]) for j in jobs if j.get("run_id")}
+    for run in registry.list_runs():
+        if (run.get("cage_id") or "-") != cage_id:
+            continue
+        # 已有 job 的 run 由上方 jobs 遍历产出，避免与 video 分析路径的 job 重复列。
+        if str(run["run_id"]) in job_run_ids:
+            continue
+        mice = registry.list_mice(run_id=str(run["run_id"]))
+        if not mice:
+            continue
+        mice_sorted = sorted(mice, key=lambda m: int(m.get("ordinal") or 0))
+        for mouse in mice_sorted:
+            rid = mouse.get("record_id")
+            if rid and records_meta.effective_status(str(rid)) == "deleted":
+                continue
+            # 无 job 的上报 run：构造内存合成 job 占位（不写入 job_store），
+            # 复用 _item_from_record 产出与 job 关联记录一致的 item。
+            synth_job = {
+                "job_id": f"run-{run['run_id']}",
+                "requested_ordinal": mouse.get("actual_ordinal", mouse.get("ordinal")),
+                "created_at": run.get("started_at"),
+                "status": "completed",
+                "run_id": run["run_id"],
+            }
+            items.append(_item_from_record(synth_job, mouse))
+
     def sort_key(item: dict[str, Any]) -> tuple[int, int]:
         ordinal = item.get("actual_ordinal") or item.get("requested_ordinal") or 0
         completed_first = 0 if item["status"] == "completed" else 1
