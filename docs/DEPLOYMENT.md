@@ -108,6 +108,25 @@ podman logs -f mousevision-edge
 systemctl --user restart mousevision.service
 ```
 
+**镜像标签坑（2026-08 踩过）**：Quadlet `~/.config/containers/systemd/mousevision.container`
+的 `Image=` 指向 **`mousevision-edge:deploy`**，不是 `dev`！`podman build -t
+mousevision-edge:dev` 只会更新 dev 标签，重启后服务仍用旧的 deploy 镜像（表现为
+"代码 rsync/拉了新，但容器里还是旧代码"）。正确流程：
+
+```bash
+podman build --no-cache -t mousevision-edge:dev -f Containerfile .
+podman tag localhost/mousevision-edge:dev localhost/mousevision-edge:deploy
+systemctl --user stop mousevision.service && podman rm -f mousevision-edge
+systemctl --user start mousevision.service
+# 验证容器真的用了新代码：
+podman exec mousevision-edge grep -c "<新代码标志>" /app/ui/app.py
+```
+
+另外：VM 直连 GitHub 443 常被墙（git fetch 超时），ghproxy 网页通但 git smart-http
+也被断。可靠做法是从能推 GitHub 的机器（如 Mac）`rsync` 源码过去（排除 `.git/`、
+`Containerfile`、`refapp/`、`output/`、`*/build/`），Containerfile 保留 VM 本地
+aliyun pip 源改动。
+
 ## 更新部署
 
 ```bash
