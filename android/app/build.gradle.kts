@@ -202,3 +202,10 @@ listOf("cloud", "local").forEach { flavor ->
 tasks.named("preBuild") {
     dependsOn("syncH5Assets")
 }
+
+dependencies {
+    // org.json 的 JVM 实现：Android SDK stub 无法在普通 JVM 单测中执行，
+    // 用官方 org.json 实现让 ScaleProfileRegistry.parseProfiles 在 testDebugUnitTest 中可跑。
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20231013")
+}

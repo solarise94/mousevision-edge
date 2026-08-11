@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "k797",
+      "displayName": "K797 蓝牙天平",
+      "manufacturerId": 0,
+      "signature": "CAE803000000CA0210",
+      "signatureOffset": 0,
+      "signatureMask": "FFFFFF000000FFFFFF",
+      "minPayloadBytes": 18,
+      "identityOffset": 3,
+      "identityLength": 3,
+      "weightOffset": 9,
+      "weightLittleEndian": true,
+      "weightDivisor": 10.0,
+      "maxGrams": 6553.5,
+      "deviceNameFilter": null
+    }
+  ]
+}

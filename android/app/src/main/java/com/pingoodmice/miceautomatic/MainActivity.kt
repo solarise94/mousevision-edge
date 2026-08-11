@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.Log
 import android.view.WindowManager
 import android.net.http.SslError
 import android.webkit.PermissionRequest
@@ -41,6 +42,7 @@ import java.security.MessageDigest
  */
 class MainActivity : Activity(), K797BleScanner.Listener {
     companion object {
+        private const val TAG = "MainActivity"
         private const val BLE_PERMISSION_REQUEST = 797
         private const val CAMERA_PERMISSION_REQUEST = 798
         private const val TRUSTED_HOST = "weight.pingoodmice.top"
@@ -79,7 +81,13 @@ class MainActivity : Activity(), K797BleScanner.Listener {
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        scanner = K797BleScanner(this, this)
+        // 加载设备签名表（assets/scale_profiles.json）。失败时 profiles 为空、
+        // scanner.start 会进入 error 状态（"未加载到设备配置"），不启动 BLE 扫描。
+        val loadResult = ScaleProfileRegistry.load(this)
+        if (loadResult.error != null) {
+            Log.e(TAG, "设备配置加载失败: ${loadResult.error}")
+        }
+        scanner = K797BleScanner(context = this, listener = this, profiles = loadResult.profiles)
         // TLS 校验器：内置 ISRG 根做证书 pinning，替代旧版对 SslError 全放行。
         // onCreate 预热一次后台握手，使缓存尽快进入可信窗口。
         tlsValidator = TlsPinValidator(this, TRUSTED_HOST, TRUSTED_PORT)

@@ -3,7 +3,6 @@ package com.pingoodmice.miceautomatic
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -17,17 +16,22 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * K797BleScanner.kt
  *
- * 真实 BLE 扫描读数源（Android），针对不可连接的 K797 广播秤。
+ * 真实 BLE 扫描读数源（Android），针对不可连接的电子秤广播。
+ *
+ * **配置驱动**：设备识别/解析规则不再硬编码，由构造期注入的 [profiles]（来自
+ * assets/scale_profiles.json，经 [ScaleProfileRegistry] 解码）决定。每条广播按 profiles
+ * 顺序找**首个命中**的 profile 进入发现表与重量解析（详见 [processScanResult]）。
  *
  * 与 HarmonyOS 侧 `BleK797Source.ets` / `ScaleSource.ets` / `ScaleStatus.ets` /
- * `ScaleReading.ets` / `K797AdvertisementParser.ets` 逐条对齐（见各方法注释）。
+ * `ScaleReading.ets` 逐条对齐（见各方法注释）。协议常量（签名/偏移/换算）全部移至
+ * ScaleProfile，本类不再持有任何设备特定常量。
  *
  * 关键契约（必须逐字一致）：
  * - 仅扫描广播，绝不调用 GATT connect，绝不要求配对；
- * - K797 用 ADV_NONCONN_IND 广播，只能被动扫描，必须 SCAN_MODE_LOW_LATENCY 持续监听；
- * - 身份 = Local Name "K797" + Manufacturer ID 0x0000 + 9 字节前缀；
+ * - 广播秤用 ADV_NONCONN_IND，只能被动扫描，必须 SCAN_MODE_LOW_LATENCY 持续监听；
+ * - 身份 = 命中的 profile（含签名/manufacturer id）+ 可选 Local Name 过滤；
  * - 真实 BLE 地址是随机私有地址，**不进读数**（读数 address 固定 "diagnostic-only"），
- *   地址仅作发现表的 deviceId；
+ *   地址仅作发现表的 deviceId；稳定的跨重启身份用 deviceKey（含序列号）；
  * - sequence 进程内单调递增，每条派发的读数 +1（H5 靠它去重）；start **不清零**，
  *   仅进程重启时归零（有意偏离 ScaleSourceBase.start 的对齐规则，见下方"有意差异点"）；
  * - stable 派生：连续相同 raw ≥3（raw 一变计数重置为 1）；
@@ -49,10 +53,14 @@ import java.util.concurrent.ConcurrentHashMap
  *   stop、onResume→start 后序号从 0 重计，H5 会拒绝所有低序号读数，自动判稳长期失效。
  *   鸿蒙侧 start 清零，Android 侧因前后台切换频繁改为不清零，系有意偏离
  *   ScaleSourceBase.start 的对齐规则。
+ *
+ * @param profiles 设备签名表（由 MainActivity 从 assets 加载注入）。为空表示配置加载
+ *   失败，[start] 将不启动扫描并直接 transition 到 error。
  */
 class K797BleScanner(
     context: Context,
     private val listener: Listener,
+    private val profiles: List<ScaleProfile>,
 ) {
     /** 宿主回调：派发读数 / 状态 / 设备发现表 JSON（均为契约 JSON 字符串）。 */
     interface Listener {
@@ -64,25 +72,13 @@ class K797BleScanner(
     companion object {
         private const val TAG = "MiceAutomaticScale"
 
-        // 已确认的 K797 协议常量（与 K797AdvertisementParser.ets 逐字一致）。
-        private const val DEVICE_NAME = "K797"
-        private const val MANUFACTURER_ID = 0x0000
-        private const val MIN_PAYLOAD_BYTES = 18
-        private const val MAX_GRAMS = 6553.5
-        private val PREFIX = byteArrayOf(
-            0xCA.toByte(), 0xE8.toByte(), 0x03, 0x28,
-            0x08, 0x95.toByte(), 0xCA.toByte(), 0x02, 0x10,
-        )
-        // deviceKey 规则：k797:<manufacturerId 4位小写hex>:<9字节前缀小写hex连续>
-        private val DEVICE_KEY = buildDeviceKey(MANUFACTURER_ID, PREFIX)
-
         /** 把 epoch 毫秒格式化为 ISO8601 UTC（Z 后缀）。Android Instant.toString 已是
          *  ISO-8601 UTC（如 2026-08-03T12:34:56.789Z），满足 receivedAt 契约。
-         *  放 companion 以便 ParsedReading 内部类调用。 */
+         *  放 companion 以便读数 JSON 构造调用。 */
         private fun toIsoUtc(epochMs: Long): String = Instant.ofEpochMilli(epochMs).toString()
 
         /** 把克数格式化为协议 JSON：整数带一位小数（如 250.0），非整数最多一位。
-         *  放 companion 以便 ParsedReading 内部类调用。 */
+         *  放 companion 以便读数 JSON 构造调用。 */
         private fun formatGrams(value: Double): String {
             val rounded = Math.round(value * 10) / 10.0
             return if (rounded == rounded.toInt().toDouble()) {
@@ -102,18 +98,6 @@ class K797BleScanner(
         private const val LEGACY_FALLBACK_DELAY_MS = 4_000L
         // 发现表过期清理周期。
         private const val EXPIRE_SWEEP_MS = 3_000L
-
-        /**
-         * 构造设备主键：k797:<manufacturerIdHex 4位小写>:<prefixHex 小写连续>。
-         * 例：k797:0000:cae803280895ca0210
-         */
-        private fun buildDeviceKey(manufacturerId: Int, prefix: ByteArray): String {
-            val idHex = manufacturerId.toString(16).lowercase().padStart(4, '0')
-            val prefixHex = prefix.joinToString("") {
-                (it.toInt() and 0xFF).toString(16).lowercase().padStart(2, '0')
-            }
-            return "k797:$idHex:$prefixHex"
-        }
     }
 
     private val appContext = context.applicationContext
@@ -158,6 +142,10 @@ class K797BleScanner(
     private data class DiscoveredDevice(
         val deviceId: String,
         val name: String,
+        /** 该设备命中的 profile 显示名（写入状态/读数 JSON 的 device 字段）。 */
+        val displayName: String,
+        /** 该设备命中的 profile 算出的稳定身份（写入读数 JSON 的 deviceKey 字段）。 */
+        val deviceKey: String,
         val rssi: Int,
         /** 最新解析的克数；无法解析时为 null。 */
         val grams: Double?,
@@ -177,8 +165,16 @@ class K797BleScanner(
      *   内部有 `r.sequence <= lastSequence` 去重，若每次 start 清零，onPause→stop、
      *   onResume→start 后序号从 0 重计，H5 会拒绝所有低序号读数，自动判稳长期失效。
      *   stable 派生状态（lastRaw / consecutiveSameRaw）仍随 start 重置：它们与序号
-     *   无关，重置只是让"连续相同"计数从新会话重新累计，不影响已派发读数的去重。 */
+     *   无关，重置只是让"连续相同"计数从新会话重新累计，不影响已派发读数的去重。
+     *
+     * 配置缺失保护：profiles 为空（assets 加载失败）时不启动扫描，立即 transition
+     * 到 error，message="未加载到设备配置"。 */
     fun start() {
+        // 配置缺失：不启动 BLE 扫描，立即报错（H5 可据此提示用户检查打包/更新）。
+        if (profiles.isEmpty()) {
+            transition("error", "未加载到设备配置", force = true)
+            return
+        }
         if (started) return
         started = true
         // sequenceCounter 不清零（见方法注释：进程内单调，防 stop/start 后序号倒退）；
@@ -191,7 +187,7 @@ class K797BleScanner(
         devicesApiTouched = false
         legacyFallbackDone = false
         devices.clear()
-        transition("scanning", "正在扫描 K797 广播", force = true)
+        transition("scanning", "正在扫描电子秤广播", force = true)
         onStart()
     }
 
@@ -230,7 +226,8 @@ class K797BleScanner(
         notifyDevicesChanged()
         val dev = devices[deviceId]
         if (dev != null) {
-            transition("scanning", "已选择 ${dev.name}，等待读数", force = true)
+            // name 为空（设备未广播 Local Name）时回退 displayName，避免提示空白设备名。
+            transition("scanning", "已选择 ${dev.name.ifBlank { dev.displayName }}，等待读数", force = true)
         } else {
             transition("scanning", "已选择设备，等待出现", force = true)
         }
@@ -268,20 +265,17 @@ class K797BleScanner(
             return
         }
 
-        // 带过滤扫描：name=K797 + manufacturerId=0x0000 + 前缀匹配（前缀作为
-        // manufacturerData 的子集匹配，mask 全 1）。onScanResult 内仍二次校验名称/前缀。
-        val filter = ScanFilter.Builder()
-            .setDeviceName(DEVICE_NAME)
-            .setManufacturerData(MANUFACTURER_ID, PREFIX, ByteArray(PREFIX.size) { 0xFF.toByte() })
-            .build()
-        // K797 不可连接广播设备，无 GATT/notify 通道，必须持续被动监听。
+        // 无过滤扫描：设备识别全部交给 profiles 配置（签名/manufacturer id 可能多型号）。
+        // ScanFilter 无法表达"签名带 mask"且多 profile 组合，索性全收、在回调内逐条匹配，
+        // 未命中任何 profile 的广播不进发现表（保持发现表只显示可识别设备）。
+        // 不可连接广播设备，无 GATT/notify 通道，必须持续被动监听。
         // LOW_LATENCY 用最高占空比，毫秒级广播延迟最低；现场插电连续称量，实时性优先。
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
         try {
-            scanner.startScan(listOf(filter), settings, callback)
+            scanner.startScan(emptyList(), settings, callback)
             scanning = true
             // 安排旧版兜底 + 周期清理过期设备。
             scheduleLegacyFallback()
@@ -325,32 +319,70 @@ class K797BleScanner(
     }
 
     /**
-     * 处理单条扫描结果：强类型读取字段，喂解析器、派发读数。
-     * 无论是否已选定设备，都先解析并更新发现表；仅当选定设备匹配时才派发读数。
+     * 处理单条扫描结果：按 profiles 配置顺序找首个命中的 profile，喂解析器、派发读数。
+     *
+     * 流程：
+     * 1. 按 profiles 顺序，对每个 profile 取其 manufacturerId 对应的 payload，
+     *    用 [ScaleProfileRegistry.matches] 判断是否命中；首个命中即采用（firstNotNullOfOrNull）。
+     * 2. 未命中任何 profile → 直接 return，**不进发现表**（发现表只收可识别设备）。
+     * 3. 命中：用该 profile 的 [ScaleProfileRegistry.parseAdvertisement] 解析重量，
+     *    [ScaleProfileRegistry.buildDeviceKey] 算稳定身份，更新发现表；
+     *    仅当选定设备匹配时才派发读数（与原逻辑一致）。
+     *
+     * deviceId 继续用 BLE 地址（r.device?.address）；deviceKey 用 profile 配的序列号字段，
+     * 跨重启稳定（BLE 随机地址会轮换，不能直接当身份）。
      */
     private fun processScanResult(r: ScanResult) {
         val record = r.scanRecord ?: return
-        val localName = record.deviceName ?: ""
         // 设备主键（发现表用）：BLE 地址。不可连接广播的地址是随机私有地址，
-        // 但同一次扫描会话内足以区分多台 K797；用作 deviceId 即可，绝不进读数。
+        // 但同一次扫描会话内足以区分多台秤；用作 deviceId 即可，绝不进读数。
         val deviceId = r.device?.address ?: return
         val rssi = r.rssi
-
-        // 提取 K797 的 Manufacturer Data（key=MANUFACTURER_ID，value 不含 ID 自身）。
-        val payload = record.getManufacturerSpecificData(MANUFACTURER_ID)
         val receivedEpochMs = System.currentTimeMillis()
         val receivedMonoMs = SystemClock.elapsedRealtime()
 
-        val result = parse(localName, MANUFACTURER_ID, payload, rssi, receivedEpochMs)
+        // 按 profiles 配置顺序找首个命中：返回 (profile, payload)。
+        val hit = profiles.firstNotNullOfOrNull { profile ->
+            val payload = record.getManufacturerSpecificData(profile.manufacturerId)
+                ?: return@firstNotNullOfOrNull null
+            if (ScaleProfileRegistry.matches(
+                    profile,
+                    profile.manufacturerId,
+                    payload,
+                    record.deviceName,
+                )
+            ) {
+                profile to payload
+            } else {
+                null
+            }
+        }
+        // 未命中任何 profile：保持发现表只显示可识别设备，直接丢弃。
+        if (hit == null) return
+        val (profile, payload) = hit
+
+        // 命中后解析重量；buildDeviceKey 用 payload 内的序列号字段（稳定身份）。
+        val result = ScaleProfileRegistry.parseAdvertisement(profile, payload, rssi, receivedEpochMs)
+        val deviceKey = ScaleProfileRegistry.buildDeviceKey(profile, payload, deviceId)
+        val displayName = profile.displayName
+        val localName = record.deviceName ?: ""
 
         // 始终更新发现表（无论是否选定设备，无论解析是否成功）。
         val grams = result?.grams
-        val tableChanged = updateDevice(deviceId, localName, rssi, grams, receivedEpochMs)
+        val tableChanged = updateDevice(
+            deviceId = deviceId,
+            name = localName,
+            displayName = displayName,
+            deviceKey = deviceKey,
+            rssi = rssi,
+            grams = grams,
+            receivedEpochMs = receivedEpochMs,
+        )
 
         // 选定设备过滤：仅匹配的包才走 handleParseResult（派发读数 + 转 active）。
         val selected = selectedDeviceId
         if (selected != null && selected == deviceId && result != null) {
-            handleParseResult(result, receivedEpochMs, receivedMonoMs)
+            handleParseResult(result, displayName, deviceKey, receivedEpochMs, receivedMonoMs)
         } else if (selected == null) {
             // 纯发现模式：不派发读数，状态停留 scanning，message 随发现数更新。
             maintainDiscoveryMessage(tableChanged)
@@ -366,9 +398,14 @@ class K797BleScanner(
     /**
      * 处理解析成功结果：派生 stable、分配 sequence、推送读数与 active 状态，
      * 并重排 stale 检查（对齐 ScaleSourceBase.handleParseResult）。
+     *
+     * @param displayName 写入读数 JSON 的 device 字段（命中 profile 的 displayName）。
+     * @param deviceKey 写入读数 JSON 的 deviceKey 字段（profile 算出的稳定身份）。
      */
     private fun handleParseResult(
         reading: ParsedReading,
+        displayName: String,
+        deviceKey: String,
         receivedAtEpochMs: Long,
         receivedAtMonotonicMs: Long,
     ) {
@@ -378,8 +415,8 @@ class K797BleScanner(
         val seq = sequenceCounter
         lastReadingAtMonotonicMs = receivedAtMonotonicMs
         lastReadingAtEpochMs = receivedAtEpochMs
-        dispatchReading(reading, stable, seq)
-        transition("active", "已收到 K797 广播")
+        dispatchReading(reading, displayName, deviceKey, stable, seq)
+        transition("active", "已收到电子秤广播")
         scheduleStaleCheck()
     }
 
@@ -403,13 +440,23 @@ class K797BleScanner(
     private fun updateDevice(
         deviceId: String,
         name: String,
+        displayName: String,
+        deviceKey: String,
         rssi: Int,
         grams: Double?,
-        nowEpochMs: Long,
+        receivedEpochMs: Long,
     ): Boolean {
         val prev = devices[deviceId]
         if (prev == null) {
-            devices[deviceId] = DiscoveredDevice(deviceId, name, rssi, grams, nowEpochMs)
+            devices[deviceId] = DiscoveredDevice(
+                deviceId = deviceId,
+                name = name,
+                displayName = displayName,
+                deviceKey = deviceKey,
+                rssi = rssi,
+                grams = grams,
+                lastSeenAtEpochMs = receivedEpochMs,
+            )
             return true
         }
         val rssiChanged = Math.abs(prev.rssi - rssi) >= 5
@@ -417,7 +464,15 @@ class K797BleScanner(
         // name 空串时保留旧值；grams 解析失败则保留旧值（契约要求保留旧值或 null）。
         val newName = if (name.isNotEmpty()) name else prev.name
         val newGrams = grams ?: prev.grams
-        devices[deviceId] = DiscoveredDevice(deviceId, newName, rssi, newGrams, nowEpochMs)
+        devices[deviceId] = DiscoveredDevice(
+            deviceId = deviceId,
+            name = newName,
+            displayName = displayName,
+            deviceKey = deviceKey,
+            rssi = rssi,
+            grams = newGrams,
+            lastSeenAtEpochMs = receivedEpochMs,
+        )
         return rssiChanged || gramsChanged
     }
 
@@ -468,7 +523,8 @@ class K797BleScanner(
             scheduleLegacyFallback()
             return
         }
-        // 选 rssi 最强（数值最大）的设备。
+        // 选 rssi 最强（数值最大）的设备。发现表本身只收命中 profile 的设备，
+        // 所以兜底天然不会绕过配置表。
         var best: DiscoveredDevice? = null
         devices.values.forEach { d ->
             if (best == null || d.rssi > best!!.rssi) best = d
@@ -482,7 +538,8 @@ class K797BleScanner(
         // 直接选定（不走 markDevicesApiTouched，否则自相矛盾）。
         selectedDeviceId = target.deviceId
         notifyDevicesChanged()
-        transition("scanning", "已选择 ${target.name}，等待读数", force = true)
+        // name 为空时回退 displayName，避免提示空白设备名（与 selectScaleDevice 一致）。
+        transition("scanning", "已选择 ${target.name.ifBlank { target.displayName }}，等待读数", force = true)
     }
 
     // ============================================================
@@ -548,7 +605,7 @@ class K797BleScanner(
         val elapsed = SystemClock.elapsedRealtime() - lastMono
         if (elapsed >= STALE_THRESHOLD_MS) {
             // stale 绝不产生 0g 读数：这里只切状态，不派发任何读数。
-            transition("stale", "超过 15 秒未收到合法 K797 广播")
+            transition("stale", "超过 15 秒未收到合法电子秤广播")
         } else {
             // 还没到阈值，继续等待剩余时间。
             val remain = STALE_THRESHOLD_MS - elapsed
@@ -590,8 +647,14 @@ class K797BleScanner(
     }
 
     /** 派发一条读数 JSON（对齐 ScaleReading.toJson 字段顺序与格式）。 */
-    private fun dispatchReading(reading: ParsedReading, stable: Boolean, sequence: Int) {
-        listener.onScaleReading(reading.toJson(stable, sequence))
+    private fun dispatchReading(
+        reading: ParsedReading,
+        displayName: String,
+        deviceKey: String,
+        stable: Boolean,
+        sequence: Int,
+    ) {
+        listener.onScaleReading(readingToJson(reading, displayName, deviceKey, stable, sequence))
     }
 
     // ============================================================
@@ -602,8 +665,15 @@ class K797BleScanner(
     private fun buildStatusJson(): String {
         val last = lastReadingAtEpochMs
         val sel = selectedDeviceId
+        val device = if (devices.isEmpty()) {
+            // 发现表为空（未识别到任何秤）时 device 用通用占位，避免误显示某型号。
+            "天平"
+        } else {
+            // 取发现表中任意一台的 displayName（同型号场景下一致；多型号混合时取排序首项）。
+            devices[devices.keys.min()]?.displayName ?: "天平"
+        }
         val sb = StringBuilder("{")
-        sb.append("\"device\":\"").append(DEVICE_NAME).append('"')
+        sb.append("\"device\":\"").append(escapeJson(device)).append('"')
         sb.append(",\"state\":\"").append(escapeJson(state)).append('"')
         sb.append(",\"message\":\"").append(escapeJson(message)).append('"')
         sb.append(",\"lastReadingAtEpochMs\":").append(if (last == null) "null" else last.toString())
@@ -624,8 +694,12 @@ class K797BleScanner(
             val d = devices[id] ?: continue
             if (!first) sb.append(',')
             first = false
+            // name 回退到 displayName：deviceNameFilter=null（如内置 k797）时，部分设备
+            // 广播不带 Local Name → record.deviceName 为空串，原样发给 H5 会让选择页把
+            // 空设备名当标题显示（空白）。这里用 displayName 兜底，保证标题非空。
+            val name = d.name.ifBlank { d.displayName }
             sb.append("{\"deviceId\":\"").append(escapeJson(d.deviceId)).append('"')
-            sb.append(",\"name\":\"").append(escapeJson(d.name)).append('"')
+            sb.append(",\"name\":\"").append(escapeJson(name)).append('"')
             sb.append(",\"rssi\":").append(d.rssi)
             sb.append(",\"grams\":").append(if (d.grams == null) "null" else formatGrams(d.grams))
             sb.append(",\"lastSeenAtEpochMs\":").append(d.lastSeenAtEpochMs)
@@ -638,84 +712,46 @@ class K797BleScanner(
     }
 
     // ============================================================
-    // 解析器（对齐 K797AdvertisementParser.parse）
+    // 读数 JSON 构造（对齐 ScaleReading.toJson 字段顺序与格式）
     // ============================================================
-
-    /** 解析成功的中间结果（不含 stable/sequence，由 base 分配）。 */
-    private class ParsedReading(
-        val grams: Double,
-        val raw: Int,
-        val rssi: Int,
-        val receivedAtEpochMs: Long,
-        val payloadHex: String,
-    ) {
-        /** 序列化为读数 JSON（字段顺序与 ScaleReading.toJson 逐字一致）。 */
-        fun toJson(stable: Boolean, sequence: Int): String {
-            val sb = StringBuilder("{")
-            sb.append("\"schemaVersion\":1")
-            sb.append(",\"device\":\"").append(DEVICE_NAME).append('"')
-            sb.append(",\"deviceKey\":\"").append(DEVICE_KEY).append('"')
-            sb.append(",\"grams\":").append(formatGrams(grams))
-            sb.append(",\"raw\":").append(raw)
-            sb.append(",\"rssi\":").append(rssi)
-            sb.append(",\"receivedAt\":\"").append(toIsoUtc(receivedAtEpochMs)).append('"')
-            sb.append(",\"receivedAtEpochMs\":").append(receivedAtEpochMs)
-            sb.append(",\"sequence\":").append(sequence)
-            sb.append(",\"stable\":").append(stable)
-            // stableSource：stable=true 时为 "derived_repeat"，否则 null。
-            sb.append(",\"stableSource\":").append(if (stable) "\"derived_repeat\"" else "null")
-            sb.append(",\"source\":\"ble\"")
-            sb.append(",\"address\":\"diagnostic-only\"")
-            sb.append(",\"payloadHex\":\"").append(payloadHex).append('"')
-            sb.append('}')
-            return sb.toString()
-        }
-    }
 
     /**
-     * 纯函数解析入口（对齐 K797AdvertisementParser.parse）。命中任一拒绝条件返回 null。
+     * 把解析结果组装成读数 JSON（字段顺序与 ScaleReading.toJson 逐字一致）。
+     *
+     * device/deviceKey 由命中 profile 决定（不再用硬编码常量）；其余字段
+     * （grams/raw/rssi/receivedAt/sequence/stable/source/address/payloadHex）保持原格式，
+     * H5 靠 sequence 去重。
      */
-    private fun parse(
-        localName: String,
-        manufacturerId: Int,
-        payload: ByteArray?,
-        rssi: Int,
-        receivedAtEpochMs: Long,
-    ): ParsedReading? {
-        // 1. Local Name
-        if (localName != DEVICE_NAME) return null
-        // 2. Manufacturer ID（Android getManufacturerSpecificData 已按键取值，此处恒等）
-        if (manufacturerId != MANUFACTURER_ID) return null
-        // 3. 长度
-        if (payload == null || payload.size < MIN_PAYLOAD_BYTES) return null
-        // 4. 前 9 字节前缀（常量时间比较，不提前短路）
-        var prefixMatch = 0
-        for (i in PREFIX.indices) {
-            prefixMatch = prefixMatch or ((payload[i].toInt() xor PREFIX[i].toInt()))
-        }
-        if (prefixMatch != 0) return null
-        // 5. 重量（小端）
-        val raw = (payload[9].toInt() and 0xFF) or ((payload[10].toInt() and 0xFF) shl 8)
-        val grams = raw / 10.0
-        if (grams < 0 || grams > MAX_GRAMS || !grams.isFinite()) return null
-        // 6. 组装
-        val payloadHex = toHexSpaces(payload)
-        return ParsedReading(grams, raw, rssi, receivedAtEpochMs, payloadHex)
-    }
-
-    // ============================================================
-    // 工具函数（对齐 K797AdvertisementParser.toHexSpaces / toIsoUtc / formatNumber）
-    // ============================================================
-
-    /** 把 payload 转成空格分隔大写十六进制，例：CA E8 03 ... */
-    private fun toHexSpaces(bytes: ByteArray): String {
-        val sb = StringBuilder(bytes.size * 3)
-        for (i in bytes.indices) {
-            if (i > 0) sb.append(' ')
-            sb.append("%02X".format(bytes[i].toInt() and 0xFF))
-        }
+    private fun readingToJson(
+        reading: ParsedReading,
+        displayName: String,
+        deviceKey: String,
+        stable: Boolean,
+        sequence: Int,
+    ): String {
+        val sb = StringBuilder("{")
+        sb.append("\"schemaVersion\":1")
+        sb.append(",\"device\":\"").append(escapeJson(displayName)).append('"')
+        sb.append(",\"deviceKey\":\"").append(escapeJson(deviceKey)).append('"')
+        sb.append(",\"grams\":").append(formatGrams(reading.grams))
+        sb.append(",\"raw\":").append(reading.raw)
+        sb.append(",\"rssi\":").append(reading.rssi)
+        sb.append(",\"receivedAt\":\"").append(toIsoUtc(reading.receivedAtEpochMs)).append('"')
+        sb.append(",\"receivedAtEpochMs\":").append(reading.receivedAtEpochMs)
+        sb.append(",\"sequence\":").append(sequence)
+        sb.append(",\"stable\":").append(stable)
+        // stableSource：stable=true 时为 "derived_repeat"，否则 null。
+        sb.append(",\"stableSource\":").append(if (stable) "\"derived_repeat\"" else "null")
+        sb.append(",\"source\":\"ble\"")
+        sb.append(",\"address\":\"diagnostic-only\"")
+        sb.append(",\"payloadHex\":\"").append(escapeJson(reading.payloadHex)).append('"')
+        sb.append('}')
         return sb.toString()
     }
+
+    // ============================================================
+    // 工具函数（对齐 ScaleStatus.ets 的 escapeJson 风格）
+    // ============================================================
 
     /** 极简 JSON 字符串转义（与 ScaleStatus.ets 的 escapeJson 风格一致）。 */
     private fun escapeJson(value: String): String {
