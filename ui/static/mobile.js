@@ -2727,13 +2727,38 @@
    *   - renderReportUploading：展示"上报中"（含已记录只数 + 待补传批数）
    *   - updateReportUploadingDone：flush 完成后展示"已上报 N 只 / 待补传 M 批"
    * ================================================================== */
+
+  /* 弱网下的鉴权失败文案缩放：report-client 会把中间层（nginx/frp）在连接异常时
+   * 回的 401/403 归类为 "auth" → lastAuthFailed=true，容易被误读为"令牌失效"。
+   * 这里用 navigator.onLine 区分场景：明确离线时按"网络问题"提示，不吓用户；在线
+   * 才保留"服务器拒绝（令牌/权限）"文案。注意 token 校验逻辑仍在 report-client 严格
+   * 把关，本函数只影响 UI 措辞，不弱化任何安全判定。 */
+  function scaleAuthFailureHint() {
+    let lastAuthFailed = false;
+    try {
+      if (typeof reportOutbox.lastAuthFailed === "function") {
+        lastAuthFailed = !!reportOutbox.lastAuthFailed();
+      }
+    } catch (_) {}
+    if (!lastAuthFailed) {
+      return { show: false };
+    }
+    // 防御式读取：仅在明确为离线（onLine === false）时按网络问题提示；
+    // 其它情况（true 或 navigator.onLine 不可用/恒 true）当在线处理，保留 auth 兜底。
+    const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+    if (offline) {
+      return { show: true, kind: "network", text: "网络未连接，记录已保留，联网后自动补传" };
+    }
+    return { show: true, kind: "auth", text: "上报被服务器拒绝（令牌/权限），记录已保留，可稍后在草稿箱重试" };
+  }
+
   function reportDoneCard(box, recordedCount, sent, remaining, enqueueErr, failInfo) {
     failInfo = failInfo || {};
     const deadCount = typeof failInfo.deadCount === "number" ? failInfo.deadCount : 0;
-    const authFailed = !!failInfo.authFailed;
+    const hint = scaleAuthFailureHint();
     const hasPending = remaining > 0;
-    // 服务器拒收（死信）或鉴权失败 → 明确的失败提示，不能误显示"已上报"
-    const hasServerFailure = deadCount > 0 || authFailed;
+    // 服务器拒收（死信）或鉴权/网络失败 → 明确的失败提示，不能误显示"已上报"
+    const hasServerFailure = deadCount > 0 || hint.show;
     const titleText = enqueueErr
       ? "本地记录已保存（入队失败）"
       : (hasServerFailure
@@ -2760,9 +2785,8 @@
       card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
         `${deadCount} 条上传失败（服务器拒绝），记录已保留在本机，请检查数据/网络后重试`));
     }
-    if (authFailed) {
-      card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
-        "上报失败：令牌失效或无权限，请检查令牌后重试（记录已保留）"));
+    if (hint.show) {
+      card.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" }, hint.text));
     }
     if (hasPending && !hasServerFailure) {
       card.appendChild(h("p", { class: "li-sub" },
@@ -3665,12 +3689,7 @@
     screen.appendChild(appbar("草稿箱", { back: "/settings" }));
 
     // 当前快照（render 时重读）
-    let authFailed = false;
-    try {
-      if (typeof reportOutbox.lastAuthFailed === "function") {
-        authFailed = !!reportOutbox.lastAuthFailed();
-      }
-    } catch (_) {}
+    const hint = scaleAuthFailureHint();
     const pendingList = (typeof reportOutbox.list === "function") ? reportOutbox.list() : [];
     const deadList = (typeof reportOutbox.deadLetters === "function") ? reportOutbox.deadLetters() : [];
 
@@ -3686,9 +3705,8 @@
         },
       }, pendingList.length > 0 ? `立即重传全部（${pendingList.length} 批）` : "没有待上传记录"),
     ]);
-    if (authFailed) {
-      topCard.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" },
-        "令牌失效或无权限，请检查令牌"));
+    if (hint.show) {
+      topCard.appendChild(h("p", { class: "li-sub", style: "color:var(--red)" }, hint.text));
     }
 
     // 待上传区
