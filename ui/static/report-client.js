@@ -393,6 +393,24 @@
       return readTokenFromMvConfig(null) || readTokenFromDocument(docRef);
     }
 
+    /* records JSON 用于上报文本 part 时剔除 photo（base64 dataURL）。
+     * 照片只走独立 photos 文件字段（见 buildFormData 下方循环），不能进 records
+     * 文本 part——否则 base64 照片会让 records 超 Starlette 1MiB 文本 part 上限 → 400。
+     * 不 mutate 原对象：浅拷贝每条 record 并跳过 photo 键，保留持久化批次的 photo
+     * 供幂等重传 / 独立 part 重发。 */
+    function recordsWithoutPhotos(records) {
+      return (records || []).map(function (r) {
+        if (!r || typeof r !== "object") return r;
+        var copy = {};
+        for (var k in r) {
+          if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
+          if (k === "photo") continue;
+          copy[k] = r[k];
+        }
+        return copy;
+      });
+    }
+
     /* ---------- 构造 FormData ---------- */
     function buildFormData(item) {
       // FormData 在浏览器/node18+ 全局可用；测试通过假 fetchFn 验证字段，
@@ -407,8 +425,10 @@
       if (b.project_id != null) fd.append("project_id", String(b.project_id));
       if (b.device_id != null) fd.append("device_id", String(b.device_id));
       if (b.weight_source != null) fd.append("weight_source", String(b.weight_source));
-      // records：JSON 字符串数组（photo 字段随 records JSON 保留，幂等重传时仍在）
-      fd.append("records", JSON.stringify(b.records || []));
+      // records：JSON 字符串数组，剔除 photo（照片只走下方独立 photos 文件字段，
+      // 不进 records 文本 part——避免 base64 照片撑爆 1MiB 文本 part 上限）。
+      // photos 循环仍从完整 b.records 读 photo，幂等重传/独立 part 重发不丢照片。
+      fd.append("records", JSON.stringify(recordsWithoutPhotos(b.records || [])));
       // 确认瞬间照片：records 里带 photo(dataURL) 的，每条追加一个文件字段 photos，
       // filename <record_id>.jpg（record_id 已按 [A-Za-z0-9_-] 过滤防注入）。
       // 服务端按 filename stem → record_id 建映射；dataURL 转 Blob 用二进制安全 atob。
@@ -574,9 +594,17 @@
               enqueuedAt: dead.enqueuedAt,
               batch: dead.batch,
               failedAt: now(),
-              reason: "4xx"
+              // 保留服务端具体错误，避免 UI 只显示笼统"4xx/服务器拒绝"。
+              // formdata 构造异常归 formdata-error，其余 4xx 仍标 "4xx"。
+              reason: (r && r.reason === "formdata-error") ? "formdata-error" : "4xx"
             };
             if (dead.readings) deadEntry.readings = dead.readings;
+            var resObj = (r && r.res) || null;
+            var httpStatus = (resObj && typeof resObj.status === "number") ? resObj.status : 0;
+            if (httpStatus) deadEntry.httpStatus = httpStatus;
+            if (r && r.body && typeof r.body === "object" && r.body.detail != null) {
+              deadEntry.serverDetail = String(r.body.detail);
+            }
             deadLetter.push(deadEntry);
             if (!persistDead()) {
               // 死信落盘失败：回滚内存死信，该批留在主队列（内存 + 已持久化），
@@ -718,7 +746,10 @@
 
       deadLetters: function () {
         return deadLetter.map(function (d) {
-          return { clientBatchId: d.clientBatchId, enqueuedAt: d.enqueuedAt, batch: d.batch, failedAt: d.failedAt, reason: d.reason };
+          var entry = { clientBatchId: d.clientBatchId, enqueuedAt: d.enqueuedAt, batch: d.batch, failedAt: d.failedAt, reason: d.reason };
+          if (d.httpStatus) entry.httpStatus = d.httpStatus;
+          if (d.serverDetail) entry.serverDetail = d.serverDetail;
+          return entry;
         });
       },
 

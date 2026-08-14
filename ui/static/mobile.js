@@ -747,6 +747,7 @@
   const CLIENT_VERSION = "2026.07.14-canvas";
   const CANVAS_W = 720;
   const CANVAS_H = 1280;
+  const PHOTO_MAX_EDGE = 1280;
 
   function supportsLiveCanvasCapture() {
     const canvas = document.createElement("canvas");
@@ -2194,9 +2195,15 @@
       try {
         if (!video || typeof video.videoWidth !== "number" || video.videoWidth === 0) return null;
         if (video.readyState < 2) return null;
-        const w = video.videoWidth;
-        const h = video.videoHeight;
-        if (!w || !h) return null;
+        const sw = video.videoWidth;
+        const sh = video.videoHeight;
+        if (!sw || !sh) return null;
+        // 等比缩放到最长边 ≤ PHOTO_MAX_EDGE（只缩不放）：降低 base64 体积，避免
+        // 多张全分辨率照片撑爆 localStorage outbox（~5MiB 配额）+ 减小上传压力。
+        const longest = Math.max(sw, sh);
+        const scale = longest > PHOTO_MAX_EDGE ? (PHOTO_MAX_EDGE / longest) : 1;
+        const w = Math.round(sw * scale);
+        const h = Math.round(sh * scale);
         const c = document.createElement("canvas");
         c.width = w;
         c.height = h;
@@ -3785,7 +3792,11 @@
     const batch = (item && item.batch) || {};
     const recs = Array.isArray(batch.records) ? batch.records : [];
     const cageId = batch.cage_id != null ? String(batch.cage_id) : "（未知箱号）";
-    const reason = (item && item.reason) ? String(item.reason) : "失败";
+    // 优先展示服务端具体错误（HTTP 状态 + detail），旧死信无新字段时回退到 reason。
+    const reasonParts = [];
+    if (item && item.httpStatus) reasonParts.push("HTTP " + item.httpStatus);
+    if (item && item.serverDetail) reasonParts.push(String(item.serverDetail));
+    const reason = reasonParts.length ? reasonParts.join(" · ") : ((item && item.reason) ? String(item.reason) : "失败");
     const failedStr = item && item.failedAt
       ? new Date(item.failedAt).toLocaleString()
       : "";

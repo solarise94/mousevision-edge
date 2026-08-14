@@ -1285,9 +1285,41 @@ test("photos: 带 photo 的 record → FormData 有 photos 文件字段且 filen
   assert.notEqual(photoField, null, "photos 文件字段应被 append");
   // FormData.get 返回的 File 带 name → filename = <record_id>.jpg
   assert.equal(photoField.name, rec.record_id + ".jpg");
-  // records JSON 本体里的 photo 字段保留（幂等重传时仍在）
+  // records 文本 part 已剔除 photo（照片只走独立 photos 文件字段，见上）；
+  // 其余字段保留。幂等重传时照片仍从持久化批次重发为独立 part，不丢。
   const recs = JSON.parse(fd.get("records"));
-  assert.equal(recs[0].photo, rec.photo);
+  assert.equal("photo" in recs[0], false, "records JSON 不应含 photo");
+  assert.equal(recs[0].record_id, rec.record_id, "其余字段保留");
+});
+
+test("回归：22 张照片 → records 文本 part 剔除 photo 且 < 1MiB，照片仍各自独立 part", async () => {
+  const storage = makeStorage();
+  const fetchFn = makeFakeFetch();
+  const ob = RC.createOutbox({ storage, fetchFn });
+  const photo = aPhotoDataUrl();
+  const records = [];
+  for (let i = 1; i <= 22; i++) {
+    const rec = RC.buildRecord({ ordinal: i, weight_g: 20 + i });
+    rec.photo = photo;
+    records.push(rec);
+  }
+  ob.enqueue({ cage_id: "BIG", records });
+  await ob.flush();
+
+  assert.equal(fetchFn.calls.length, 1);
+  const fd = fetchFn.calls[0].init.body;
+  const recordsJson = fd.get("records");
+  const recs = JSON.parse(recordsJson);
+  assert.equal(recs.length, 22);
+  recs.forEach((r, i) => {
+    assert.equal("photo" in r, false, `record #${i} 不应含 photo`);
+    assert.equal(r.ordinal, i + 1, "其余字段保留");
+    assert.ok(r.record_id, "record_id 保留");
+  });
+  // 关键回归：records 文本 part 体积远低于 Starlette 1MiB 文本 part 上限
+  assert.ok(recordsJson.length < 1024 * 1024, "records JSON 应 < 1MiB（实际 " + recordsJson.length + "）");
+  // 照片仍作为独立 UploadFile part（服务端按 part 流式接收，不受文本 part 1MiB 限制）
+  assert.equal(fd.getAll("photos").length, 22, "22 张照片各自一个 photos 文件字段");
 });
 
 test("photos: record_id 特殊字符 → filename 已按 [A-Za-z0-9_-] 过滤防注入", async () => {
@@ -1353,9 +1385,9 @@ test("photos: 持久化往返 —— photo 随 records 存 localStorage，reload
   const fd = fetchFn.calls[0].init.body;
   assert.notEqual(fd.get("photos"), null, "reload 后补传仍带 photos 文件字段");
   assert.equal(fd.get("photos").name, rec.record_id + ".jpg");
-  // records JSON 里 photo 仍在
+  // reload 后 wire records 文本 part 仍剔除 photo（照片走独立 part）；localStorage 批次里 photo 仍在（上方断言）。
   const recs = JSON.parse(fd.get("records"));
-  assert.equal(recs[0].photo, rec.photo, "reload 后 records JSON 里的 photo 不丢");
+  assert.equal("photo" in recs[0], false, "reload 后 records JSON 仍不含 photo");
 });
 
 /* ================================================================== *
