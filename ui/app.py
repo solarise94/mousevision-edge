@@ -764,6 +764,29 @@ async def lifespan(_: FastAPI):
         job_manager.stop()
 
 
+# ---- Defense-in-depth: 抬高 multipart 文本 part 上限 ----
+# Starlette 0.52 默认 max_part_size=1MiB 仅约束文本 part（records 字段是 Form 文本 part）；
+# UploadFile 走 SpooledTemporaryFile 流式接收、不受此限（照片另有 _PHOTO_MAX_BYTES 守护）。
+# 客户端已剔除 records 里的 photo（不再膨胀），这里把默认提到 8MiB 防将来任何文本 part
+# 意外超大再次撞限（历史上 records 携带 base64 照片达 1.3MiB 触发 400）。
+# 注：0.52 已移除 request_class 钩子（request 硬编码实例化），故 monkeypatch Request.form
+# 改默认；仅改默认，保留 per-call 显式 max_part_size 覆盖能力。
+import starlette.requests as _starlette_requests
+
+_MV_MAX_FORM_PART_SIZE = int(os.getenv("MOUSEVISION_MAX_FORM_PART_MB", "8")) * 1024 * 1024
+
+if not getattr(_starlette_requests.Request.form, "_mv_raised_limit", False):
+    _orig_request_form = _starlette_requests.Request.form
+
+    def _mv_request_form(self, *, max_files=1000, max_fields=1000,
+                         max_part_size=_MV_MAX_FORM_PART_SIZE):
+        return _orig_request_form(self, max_files=max_files, max_fields=max_fields,
+                                  max_part_size=max_part_size)
+
+    _mv_request_form._mv_raised_limit = True
+    _starlette_requests.Request.form = _mv_request_form
+
+
 app = FastAPI(title="MouseVision Edge UI", lifespan=lifespan)
 
 # CORS for the packaged Android app: H5 lives on the synthetic origin

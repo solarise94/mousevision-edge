@@ -822,3 +822,60 @@ def test_report_duplicate_records_does_not_advance_next_ordinal(client):
     box = app_mod.box_registry.get(cage)
     assert box is not None
     assert box["next_ordinal"] == next_after_first
+
+
+# --------------------------------------------------------------------------- #
+# Defense-in-depth: app monkeypatch 抬高 multipart 文本 part 默认上限。
+# --------------------------------------------------------------------------- #
+
+
+def test_records_text_part_over_1mib_accepted(client):
+    """Defense-in-depth：app monkeypatch 把 multipart 文本 part 默认上限从
+    Starlette 1MiB 抬到 8MiB。一条 >1MiB 的 records 文本 part 应被接受（200），
+    而非 400 'Part exceeded maximum size of 1024KB'。"""
+    import inspect
+
+    import starlette.requests as req_mod
+
+    c, app_mod = client
+
+    # 1) 签名内省：Request.form 默认 max_part_size 应 > Starlette 1MiB
+    default_mps = inspect.signature(req_mod.Request.form).parameters[
+        "max_part_size"
+    ].default
+    assert default_mps > 1024 * 1024, (
+        f"monkeypatch 未生效：Request.form 默认 max_part_size={default_mps}"
+    )
+
+    # 2) 端到端：构造 >1MiB 的 records 文本 part，POST 应 200（非 400 part-exceeded）。
+    #    _validate_records 忽略未知/额外字段（只挑它认的字段进 normalized dict），
+    #    所以用单条 record + 大 filler 字段即可凑 >1MiB，且能通过校验、不写多余 mouse 目录。
+    target_bytes = 1024 * 1024 + 64 * 1024  # ~1.06MiB
+    import json as _json
+
+    records = [
+        {
+            "ordinal": 1,
+            "weight_g": 20.0,
+            "record_id": "rec-big",
+            "note": "X" * target_bytes,  # 撑大文本 part 体积
+        }
+    ]
+    s = _json.dumps(records)
+    assert len(s) > 1024 * 1024, f"records 文本 part 体积 {len(s)} 未超 1MiB，测试无效"
+
+    resp = c.post(
+        "/api/records/report",
+        headers=_headers(),
+        data={
+            "cage_id": "BIG-PART",
+            "project_id": "default",
+            "device_id": "phone-01",
+            "records": s,
+        },
+    )
+    assert resp.status_code in (200, 201), (
+        f">1MiB records 文本 part 应被接受，实际 {resp.status_code}: {resp.text}"
+    )
+    # 不应出现 Starlette 的 part-exceeded 文案
+    assert "Part exceeded maximum size" not in resp.text
