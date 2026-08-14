@@ -1,97 +1,83 @@
-# MouseVision Edge
+# MiceAutomatic · 小鼠称重
 
-利用视觉代替数据线，实现实验动物称重自动记录的边缘设备。
+手机 App + **K797 蓝牙天平**，自动记录实验小鼠体重：每只小鼠放上秤盘，App 通过蓝牙实时读取重量、录像留证并抓拍确认瞬间照片，完成一箱后汇总保存 / 上报。
 
-本仓库当前阶段：**Mac 核心算法 PoC**（视频回放验证状态机 + 模板读数 + 曲线回溯 + JSON 输出）。Android CameraX 接入见 [`android/README.md`](android/README.md)。
+> 本仓库早期为视觉称重 PoC（MouseVision Edge：LCD OCR + 曲线回溯）。**当前产品判定已全部切换为 K797 蓝牙天平读数**，视觉管线代码保留在 `mousevision/`（服务端视频抽帧、历史分析工具仍使用）。
 
-## 快速开始
+## 方案与架构
 
-> **参考视频不在仓库内**：`RefVideo/` 下的 mp4 因体积较大被 `.gitignore` 排除。clone 后需手动将参考视频放入 `RefVideo/`（端到端 PoC 与 `tests/test_template_reader.py` 依赖它）。目录结构保留，视频文件需自备。
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-
-# ROI 预览（确认 LCD 框）
-python -m tools.extract_roi_preview \
-  --video RefVideo/9494224d488d6e735c0f108cc5562a2d.mp4 \
-  --config configs/scale_refvideo.yaml \
-  --out output/roi_preview
-
-# 端到端 PoC
-python -m tools.run_poc \
-  --video RefVideo/9494224d488d6e735c0f108cc5562a2d.mp4 \
-  --config configs/scale_refvideo.yaml \
-  --box-id C57-023 \
-  --out output/
-
-pytest
-
-# 本地检查 UI（浏览器预览状态机 / 读数 / 曲线）
-python -m ui.app
-# 智能入口：http://127.0.0.1:8766/  （录制 / 管理 分流）
-# 电脑端管理后台：http://127.0.0.1:8766/pc  （默认 admin / admin123）
-# 手机录像/上传：http://127.0.0.1:8766/mobile
-# 算法检查台（旧版）：http://127.0.0.1:8766/legacy
+```
+K797 天平 ──蓝牙广播(无配对)──▶ Android App（WebView 壳 + 原生 BLE 扫描）
+                                    │  H5 录制界面：读数判定 · 录像 · 抓拍 · 断网不丢
+                                    ├─ 内测云版：outbox 离线队列 ──▶ POST /api/records/report
+                                    └─ 公众离线版：数据存本机，导出 CSV / JSON
+                                                        │
+                          服务端 FastAPI（ui/）── 箱子管理 · 记录汇总 · PC 管理后台 /pc
 ```
 
-## Web 端入口与分工
+- **称重判定**：三种记录方式——即时报数（稳定锁定 + 语音报数 + 人工确认）、后匹配（连续自动记录、事后审核）、手动（人眼判定点按录入）。每确认一只即落盘，中断可恢复。
+- **天平接入**：只监听广播、不做 GATT 连接与配对；支持的型号由 `android/app/src/main/assets/scale_profiles.json` 配置驱动（签名/字节序/量程），新增型号无需改代码。
+- **离线优先**：称重过程无需联网；记录先入本机队列，联网后自动补传，服务端按 `record_id` 幂等去重。
+- **证据链**：每次确认抓拍照片（最长边 ≤1280px）+ 整箱录像；上传失败进死信，保留服务端具体错误，可手动重传。
+
+## 下载与使用（公众离线版）
+
+- 下载：[GitHub Releases](https://github.com/solarise94/mousevision-edge/releases)（`miceautomatic-local-v0.3.4.apk`，Android 8.0+，数据仅存本机）
+- 使用说明：[docs/USER_GUIDE.md](docs/USER_GUIDE.md)——用什么秤、怎么连接、怎么称重、怎么导出
+- 内测云版（数据直传服务器）不在 Release 分发，仅实验室内部渠道。
+
+## Web 端入口（服务端）
 
 | 入口 | 路径 | 用途 |
 |------|------|------|
-| 智能入口 | `/` | 按「录制 / 管理」分流；支持 `?intent=record\|manage` 与 `?to=mobile\|pc\|manage` |
-| 电脑管理后台 | `/pc` | 数据总览、核对、发布、导出、箱子/小鼠、用户、日志、设置 |
-| 手机录制 | `/mobile` | 现场扫码、录像、上传、排队分析 |
-| 手机管理 | `/mobile/manage` | 手机上查看箱子与记录 |
-| 算法检查台 | `/legacy` | 旧版桌面回放/复核 UI |
+| 手机 H5 | `/mobile` | 称重录制（与打包 App 同一份 H5） |
+| 电脑管理后台 | `/pc` | 数据总览、核对、导出、箱子/用户/日志管理 |
+| 手机上报 API | `/api/records/report` | 称重记录汇聚（multipart：records + photos + video） |
+| 公众共享 API | `/api/records/share` | 离线版「共享数据以改善应用」匿名上传通道 |
 
-管理后台首次启动会自动创建 `admin` 账号：
+管理后台首次启动自动创建 `admin` 账号：设 `MOUSEVISION_ADMIN_PASSWORD` 则用该密码，否则生成一次性随机密码打印到日志；首次登录强制改密。浏览器直接访问 `/mobile` 使用相机需要 HTTPS（打包 App 不受影响）。
 
-- 若设置了 `MOUSEVISION_ADMIN_PASSWORD`，使用该密码；
-- 否则生成一次性随机密码并打印到服务日志。
+## 开发
 
-两种情况均强制首次登录修改密码（`must_change_password`）；改密完成前，除 `/api/me`、`/api/me/password`、`/api/logout` 外的管理 API 会返回 403。
+```bash
+# 服务端（Python 3.12）
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+pytest                                # 服务端测试（部分历史视觉测试依赖自备的 RefVideo/ 视频）
+python -m ui.app                      # 起服务：http://127.0.0.1:8766/
 
-共享 `MOUSEVISION_API_TOKEN` **仅用于手机/旧版检查台写接口**，不会注入到 `/` 或 `/pc`，也**不会**映射为管理员会话。
+# H5（零依赖，node 测试）
+node --test tests/h5/
 
-## Web 录像与后台分析
+# Android（JDK17 + 本地 SDK，见 android/README.md）
+JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
+ANDROID_HOME=$PWD/android-sdk \
+.toolchain/gradle-8.11.1/bin/gradle -p android :app:assembleLocalRelease --no-daemon
+# flavor：cloud（内测）/ local（公众离线版）；H5 资产由 syncH5Assets 构建期自动打包
 
-项目现已包含一个手机优先的 Web 基本框架：浏览器后置相机通过 Canvas 录像（取景框所见即上传像素），上传后生成独立 `job_id`，后端单 worker 串行调用现有 OCR/曲线分析管线，并返回批次报告。后端仍兼容历史 `system` 视频上传，但当前手机录制页不再提供系统相机回退入口。
+# 部署（VM · podman/quadlet）
+# 见 docs/DEPLOYMENT.md（镜像 :deploy 标签、--no-cache、rsync 备选等坑位记录）
+```
 
-- 手机入口：`/mobile`
-- 任务 API：`/api/jobs`
-- 健康检查：`/api/health`
-- Podman 与 HTTPS 说明：[docs/WEB_APP_FRAMEWORK.md](docs/WEB_APP_FRAMEWORK.md)
+## 文档索引
 
-浏览器直接调用手机摄像头需要 HTTPS；普通内网 HTTP 地址无法使用当前网页录制页时，应改用 HTTPS 或支持网页相机的浏览器。
+- [使用说明（离线版）](docs/USER_GUIDE.md) — 面向用户：设备要求、连接天平、称重流程、数据导出
+- [部署](docs/DEPLOYMENT.md) — VM 部署链路与已踩坑记录
+- [移动端设计](docs/MOBILE_WEB_APP_DESIGN.md) / [PC 管理端](docs/PC_ADMIN_PLATFORM.md)
+- [K797 BLE 接入方案](docs/HARMONYOS_K797_BLE_INTEGRATION_PLAN.md) — 协议细节（广播格式、重量字节）
+- 历史视觉方案：[LCD OCR 服务](docs/LCD_OCR_SERVICE.md)、[算法评审](docs/REVIEW_ALGORITHM_ROBUSTNESS.md) 等
 
-## 架构要点
-
-- 业务围绕**状态机**（EMPTY → ENTER → WEIGHING → LEAVE → ANALYZE），Camera/Video 只是 `FrameSource`
-- CLI / UI 共用 `SessionDriver`（逐帧喂帧、保存回调）
-- **批次边界**：每次扫码/整段运行创建独立 `run_<stamp>_<id>/`，箱号 `cage_id` 在批次内固定，鼠只用 `ordinal`
-- 默认读数：`TemplateReader`（7 段 LCD 模板匹配）
-- 可选独立 OCR 服务：`services/lcd_ocr`（RapidOCR + OpenVINO / Iris Xe），经 `HttpOcrReader` 调用；**须先过 0001 验收门禁再切** `weight_reader: http_ocr`（见 [`docs/LCD_OCR_SERVICE.md`](docs/LCD_OCR_SERVICE.md)）
-- LCD / 鼠只检测阈值在 `configs/*.yaml`（支持 `lcd_detect.mode: fixed` + `weight_roi`）
-- 最终体重：完整曲线回溯找平台中位数，不是“稳定 X 秒”
-- 箱号：PoC 由 CLI/UI 注入；可选 `pyzbar` 读帧内二维码；Android 阶段接 ML Kit / ZXing
-- 上传队列：本地 SQLite（`UploadQueue`）按 `record_id` 幂等入队，WiFi 同步为后续阶段
-- UI：历史卡片默认「只读复核」；「重新分析并保存」才开新批次
-
-## 输出格式
+## 输出格式（上报记录）
 
 ```json
 {
-  "box_id": "C57-023",
   "cage_id": "C57-023",
   "ordinal": 1,
+  "weight_g": 21.4,
   "run_id": "…",
   "record_id": "…",
-  "weight": 16.15,
-  "confidence": 0.97,
-  "timestamp": "2026-07-10T10:30:21",
-  "device": "scale01",
+  "recorded_at": "2026-08-14T10:30:21",
+  "weight_source": "ble_k797",
   "photo": "photo.jpg"
 }
 ```
