@@ -11,7 +11,7 @@ https://weight.pingoodmice.top:16206/
 - 管理端（桌面）：`https://weight.pingoodmice.top:16206/`
 - 手机端：`https://weight.pingoodmice.top:16206/mobile`
 - 健康检查：`https://weight.pingoodmice.top:16206/api/health`
-- API Token：`REDACTED`（写端点需 `X-MouseVision-Token` 头）
+- API Token：**不写入本文件**（2026-08-14 已轮换）。真值在 VM `~/.config/containers/systemd/mousevision.container` 的 `MOUSEVISION_API_TOKEN=`，写端点需 `X-MouseVision-Token` 头
 
 ## 完整转发链路（三层）
 
@@ -49,7 +49,7 @@ uvicorn app（python -m ui.app）
 - 主机：`vm-host`（Ubuntu 26.04, 16C/14G）
 - LAN SSH：`ssh vm-lan`（LAN_VM_IP，有时不可达）
 - FRP SSH：`ssh vm-user`（经 frp，稳定可达）
-- sudo 密码：`REDACTED`
+- sudo 密码：**不写入本文件**（2026-08-14 已轮换，存本地密码管理器）
 
 ## 目录结构
 
