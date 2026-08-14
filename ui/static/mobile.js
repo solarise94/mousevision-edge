@@ -744,7 +744,7 @@
    * 相机助手 — Canvas 720×1280 所见即所得 (design §6.2/§6.3)
    * 中心裁切算法与 mousevision/capture_geom.py 对齐。
    * ------------------------------------------------------------------ */
-  const CLIENT_VERSION = "2026.07.14-canvas";
+  const CLIENT_VERSION = "2026.08.14-photo-part";
   const CANVAS_W = 720;
   const CANVAS_H = 1280;
   const PHOTO_MAX_EDGE = 1280;
