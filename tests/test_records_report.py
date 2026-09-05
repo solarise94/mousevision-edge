@@ -18,6 +18,14 @@ from fastapi.testclient import TestClient
 _TOKEN = "report-secret"
 
 
+def _tstores(app_mod):
+    """B3：业务 store 不再有模块级单例 —— 共享令牌通道等价于 legacy-default
+    租户的 store 集（从 tenant_factory 按租户解析）。"""
+    from ui.control_store import LEGACY_TENANT_ID
+
+    return app_mod.tenant_factory.stores(LEGACY_TENANT_ID)
+
+
 def _write_synthetic_video(
     path: Path, *, n_frames: int = 24, fps: float = 10.0, size=(64, 48)
 ) -> Path:
@@ -50,6 +58,13 @@ def client(tmp_path: Path, monkeypatch):
 
 def _headers(token: str = _TOKEN) -> dict[str, str]:
     return {"X-MouseVision-Token": token}
+
+
+def _legacy_out(app_mod) -> Path:
+    """B3：共享令牌只映射 legacy-default 租户 —— 落盘根在 tenants/<uuid>/。"""
+    from ui.control_store import LEGACY_TENANT_ID
+
+    return Path(app_mod.DEFAULT_OUTPUT) / "tenants" / LEGACY_TENANT_ID
 
 
 def _records_payload(n: int = 3, *, with_id: bool = True) -> list[dict]:
@@ -141,7 +156,7 @@ def test_report_no_video_creates_run_and_records(client):
     assert body["photos_extracted"] == 0  # no video -> placeholders
     assert body["skipped"] == []
 
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     assert run_dir.is_dir()
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["record_count"] == 3
@@ -207,14 +222,14 @@ def test_duplicate_record_ids_does_not_create_extra_run(client, tmp_path):
     first = _post(c, payload)
     assert first.status_code == 201
 
-    runs_before = app_mod.registry.list_runs()
+    runs_before = _tstores(app_mod).registry.list_runs()
     assert len(runs_before) == 1
 
     second = _post(c, payload)
     assert second.status_code == 200
     assert second.json()["count"] == 0
 
-    runs_after = app_mod.registry.list_runs()
+    runs_after = _tstores(app_mod).registry.list_runs()
     assert len(runs_after) == 1  # still exactly one run
 
 
@@ -309,7 +324,7 @@ def test_report_with_video_extracts_real_frame(client, tmp_path):
     body = res.json()
     assert body["photos_extracted"] == 1
 
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     photo = run_dir / "mouse_001" / "photo.jpg"
     assert photo.is_file()
     img = cv2.imread(str(photo))
@@ -335,7 +350,7 @@ def test_report_with_video_no_clip_uses_midpoint(client, tmp_path):
     assert res.status_code == 201, res.text
     body = res.json()
     assert body["photos_extracted"] == 1
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     img = cv2.imread(str(run_dir / "mouse_001" / "photo.jpg"))
     assert img is not None
     assert img.shape[:2] == (36, 48)  # decoded from the source video
@@ -351,16 +366,19 @@ def test_reported_records_visible_via_collect_records(client):
     res = _post(c, _records_payload(2))
     assert res.status_code == 201
 
-    runs = app_mod.registry.list_runs()
+    runs = _tstores(app_mod).registry.list_runs()
     assert any(r["mode"] == "device_report" for r in runs)
     device_run = next(r for r in runs if r["mode"] == "device_report")
 
     from ui.records_api import collect_records
 
+    from ui.control_store import LEGACY_TENANT_ID as _LTID
+
+    tstores = app_mod.tenant_factory.stores(_LTID)
     records = collect_records(
-        app_mod.registry,
-        app_mod.records_meta,
-        Path(app_mod.DEFAULT_OUTPUT),
+        tstores.registry,
+        tstores.records_meta,
+        _legacy_out(app_mod),
         cage_id="C57-023",
     )
     rids = {r["record_id"] for r in records}
@@ -379,7 +397,7 @@ def test_reported_records_visible_via_list_mice(client):
     assert res.status_code == 201
     run_id = res.json()["run_id"]
 
-    mice = app_mod.registry.list_mice(run_id=run_id)
+    mice = _tstores(app_mod).registry.list_mice(run_id=run_id)
     assert len(mice) == 2
     ordinals = sorted(int(m["ordinal"]) for m in mice)
     assert ordinals == [1, 2]
@@ -402,7 +420,7 @@ def test_report_records_visible_in_box_records(client):
     assert res.status_code == 201, res.text
 
     # 上报路径确实不写 job_store（与视频分析路径区分），确认没有对应 job。
-    assert app_mod.job_store.list_by_cage(cage) == []
+    assert _tstores(app_mod).job_store.list_by_cage(cage) == []
 
     box_res = c.get(f"/api/boxes/{cage}/records", headers=_headers())
     assert box_res.status_code == 200, box_res.text
@@ -457,7 +475,7 @@ def test_optional_fields_persisted(client):
     ]
     res = _post(c, payload)
     assert res.status_code == 201, res.text
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / res.json()["run_dir"]
+    run_dir = _legacy_out(app_mod) / res.json()["run_dir"]
     rec = json.loads((run_dir / "mouse_001" / "record.json").read_text("utf-8"))
     assert rec["weight_raw"] == [21.4, 21.6]
     assert rec["clip_start_ms"] == 1000.0
@@ -502,7 +520,7 @@ def test_report_with_valid_readings_persisted(client):
     body = res.json()
     assert body["readings_saved"] is True
 
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     readings_file = run_dir / "readings.json"
     assert readings_file.is_file(), "readings.json 应落盘到 run_dir"
     saved = json.loads(readings_file.read_text(encoding="utf-8"))
@@ -533,7 +551,7 @@ def test_report_with_invalid_readings_json_skipped_not_fatal(client):
     assert body["readings_saved"] is False
     assert body["count"] == 1, "记录本身仍正常落盘"
 
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     assert not (run_dir / "readings.json").exists(), "非法 readings 不应落盘"
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert "readings_file" not in manifest
@@ -550,7 +568,7 @@ def test_report_invalid_readings_shape_skipped(client):
     assert res.status_code == 201, res.text
     body = res.json()
     assert body["readings_saved"] is False
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     assert not (run_dir / "readings.json").exists()
 
 
@@ -561,7 +579,7 @@ def test_report_all_duplicates_with_readings_drains_and_no_run(client):
     assert first.status_code == 201
     assert first.json()["readings_saved"] is True
 
-    runs_before = app_mod.registry.list_runs()
+    runs_before = _tstores(app_mod).registry.list_runs()
     assert len(runs_before) == 1
 
     # 全部重复上报（带 readings）→ 不建 run，readings 被丢弃
@@ -574,7 +592,7 @@ def test_report_all_duplicates_with_readings_drains_and_no_run(client):
     assert sorted(body["skipped"]) == sorted(first.json()["record_ids"])
 
     # 仍只有一个 run（readings 未产生新 run）
-    runs_after = app_mod.registry.list_runs()
+    runs_after = _tstores(app_mod).registry.list_runs()
     assert len(runs_after) == 1
 
 
@@ -585,7 +603,7 @@ def test_report_without_readings_has_no_readings_field(client):
     assert res.status_code == 201, res.text
     body = res.json()
     assert body["readings_saved"] is False
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     assert not (run_dir / "readings.json").exists()
 
 
@@ -608,7 +626,7 @@ def test_report_with_uploaded_photos_uses_device_capture(client):
     assert body["photos_uploaded"] == 1
     assert body["photos_extracted"] == 0  # 无视频、无上传 → 只有 1 条被采用，另 1 条占位
 
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
 
     # 有上传照片的记录：photo.jpg 字节 == 上传内容（非占位）
     p1 = run_dir / "mouse_001" / "photo.jpg"
@@ -650,7 +668,7 @@ def test_report_partial_photos_mixed_paths(client, tmp_path):
     assert body["photos_uploaded"] == 1  # mix-a 上传采用
     assert body["photos_extracted"] == 2  # mix-b(抽帧) + mix-c(抽帧)
 
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
 
     # mix-a：上传内容
     pa = run_dir / "mouse_001" / "photo.jpg"
@@ -675,7 +693,7 @@ def test_report_uploaded_png_photo_accepted(client):
     assert res.status_code == 201, res.text
     body = res.json()
     assert body["photos_uploaded"] == 1
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     p = run_dir / "mouse_001" / "photo.jpg"
     assert p.read_bytes() == png
     assert json.loads((run_dir / "mouse_001" / "record.json").read_text("utf-8"))["photo_source"] == "device_capture"
@@ -690,7 +708,7 @@ def test_report_invalid_photo_bytes_falls_back(client):
     body = res.json()
     assert body["photos_uploaded"] == 0
     assert body["photos_extracted"] == 0
-    run_dir = Path(app_mod.DEFAULT_OUTPUT) / body["run_dir"]
+    run_dir = _legacy_out(app_mod) / body["run_dir"]
     p = run_dir / "mouse_001" / "photo.jpg"
     assert p.is_file()
     img = cv2.imread(str(p))
@@ -705,7 +723,7 @@ def test_report_all_duplicates_with_photos_no_new_run(client):
     photo = _jpeg_bytes()
     first = _post(c, payload, photos=[("rec-001", photo)])
     assert first.status_code == 201
-    runs_before = app_mod.registry.list_runs()
+    runs_before = _tstores(app_mod).registry.list_runs()
     assert len(runs_before) == 1
 
     second = _post(c, payload, photos=[("rec-001", photo)])
@@ -715,7 +733,7 @@ def test_report_all_duplicates_with_photos_no_new_run(client):
     assert body["photos_uploaded"] == 0
     assert sorted(body["skipped"]) == ["rec-001"]
 
-    assert len(app_mod.registry.list_runs()) == 1
+    assert len(_tstores(app_mod).registry.list_runs()) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -732,7 +750,7 @@ def test_report_advances_box_next_ordinal(client):
     """
     c, app_mod = client
     cage = "C57-ADV-01"
-    app_mod.box_registry.create(cage_id=cage)
+    _tstores(app_mod).box_registry.create(cage_id=cage)
 
     payload = [
         {"record_id": "adv-3", "ordinal": 3, "weight_g": 21.0},
@@ -741,7 +759,7 @@ def test_report_advances_box_next_ordinal(client):
     res = _post(c, payload, _cage=cage)
     assert res.status_code == 201, res.text
 
-    box = app_mod.box_registry.get(cage)
+    box = _tstores(app_mod).box_registry.get(cage)
     assert box is not None
     assert box["next_ordinal"] == 5, "next_ordinal 应推进至本次最大 ordinal + 1"
 
@@ -750,7 +768,7 @@ def test_report_advances_next_ordinal_is_monotonic(client):
     """next_ordinal 推进是单调的：再上报更小 ordinal 不应回退 next_ordinal。"""
     c, app_mod = client
     cage = "C57-ADV-02"
-    app_mod.box_registry.create(cage_id=cage)
+    _tstores(app_mod).box_registry.create(cage_id=cage)
 
     # 第一次推进：上报 ordinal 3 → advance(at_least=4) → next_ordinal=4。
     _post(
@@ -758,7 +776,7 @@ def test_report_advances_next_ordinal_is_monotonic(client):
         [{"record_id": "mono-3", "ordinal": 3, "weight_g": 21.0}],
         _cage=cage,
     )
-    box = app_mod.box_registry.get(cage)
+    box = _tstores(app_mod).box_registry.get(cage)
     assert box is not None
     assert box["next_ordinal"] == 4
     # 第二次上报更小 ordinal（2）→ advance(at_least=3) → max(4,3)=4 不回退。
@@ -767,7 +785,7 @@ def test_report_advances_next_ordinal_is_monotonic(client):
         [{"record_id": "mono-2", "ordinal": 2, "weight_g": 20.0}],
         _cage=cage,
     )
-    box = app_mod.box_registry.get(cage)
+    box = _tstores(app_mod).box_registry.get(cage)
     assert box is not None
     assert box["next_ordinal"] == 4
 
@@ -780,7 +798,7 @@ def test_report_auto_creates_box_and_advances_next_ordinal(client):
     """
     c, app_mod = client
     cage = "BALB-AUTO-01"
-    assert app_mod.box_registry.get(cage) is None  # precondition: 箱子不存在
+    assert _tstores(app_mod).box_registry.get(cage) is None  # precondition: 箱子不存在
 
     payload = [
         {"record_id": "auto-3", "ordinal": 3, "weight_g": 21.0},
@@ -789,7 +807,7 @@ def test_report_auto_creates_box_and_advances_next_ordinal(client):
     res = _post(c, payload, _cage=cage)
     assert res.status_code == 201, res.text
 
-    box = app_mod.box_registry.get(cage)
+    box = _tstores(app_mod).box_registry.get(cage)
     assert box is not None, "应自动建箱"
     assert box["next_ordinal"] == 5
     assert box["mouse_no_start"] == 1  # 建箱默认值不被覆盖
@@ -802,7 +820,7 @@ def test_report_duplicate_records_does_not_advance_next_ordinal(client):
     """
     c, app_mod = client
     cage = "C57-ADV-03"
-    app_mod.box_registry.create(cage_id=cage)
+    _tstores(app_mod).box_registry.create(cage_id=cage)
 
     payload = [
         {"record_id": "dup-3", "ordinal": 3, "weight_g": 21.0},
@@ -810,7 +828,7 @@ def test_report_duplicate_records_does_not_advance_next_ordinal(client):
     ]
     first = _post(c, payload, _cage=cage)
     assert first.status_code == 201
-    box = app_mod.box_registry.get(cage)
+    box = _tstores(app_mod).box_registry.get(cage)
     assert box is not None
     next_after_first = box["next_ordinal"]
     assert next_after_first == 5
@@ -819,7 +837,7 @@ def test_report_duplicate_records_does_not_advance_next_ordinal(client):
     second = _post(c, payload, _cage=cage)
     assert second.status_code == 200
     assert second.json()["count"] == 0
-    box = app_mod.box_registry.get(cage)
+    box = _tstores(app_mod).box_registry.get(cage)
     assert box is not None
     assert box["next_ordinal"] == next_after_first
 

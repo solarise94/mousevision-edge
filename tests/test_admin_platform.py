@@ -35,10 +35,18 @@ def _login(c) -> None:
     )
     assert changed.status_code == 200
     assert changed.json()["user"]["must_change_password"] is False
+    # B3：业务 API 走会话激活的租户上下文。seed admin 兼任 legacy-default
+    # tenant_admin；激活后业务读写等价旧行为（数据落在租户目录）。
+    from ui.control_store import LEGACY_TENANT_ID as _LTID
+
+    activated = c.post("/api/control/session/tenant", json={"tenant_id": _LTID})
+    assert activated.status_code == 200, activated.text
 
 
 def _seed_record(app_mod, record_id: str = "rec-test-001") -> None:
-    output = Path(app_mod.DEFAULT_OUTPUT)
+    from ui.control_store import LEGACY_TENANT_ID
+
+    output = Path(app_mod.DEFAULT_OUTPUT) / "tenants" / LEGACY_TENANT_ID
     run_dir = output / "run_20250712_test"
     mouse_dir = run_dir / "mouse_001"
     mouse_dir.mkdir(parents=True, exist_ok=True)
@@ -115,15 +123,20 @@ def test_shared_token_does_not_become_admin(client, monkeypatch):
         me = fresh.get("/api/me", headers={"X-MouseVision-Token": "edge-secret"})
         assert me.status_code == 200
         assert me.json()["authenticated"] is False
-        # Token must not unlock PC write APIs.
+        # Token must not unlock PC write APIs. B3：共享令牌映射 legacy-default，
+        # 对不存在记录的删除按统一 404（§6.1；review 2 精度钉死：实际行为 404），
+        # 仍非管理员语义。
         denied = fresh.delete(
             "/api/records/whatever",
             headers={"X-MouseVision-Token": "edge-secret"},
         )
-        assert denied.status_code == 401
+        assert denied.status_code == 404
 
 
 def test_pc_html_does_not_inject_api_token(client, monkeypatch):
+    """B5（合同 §6.1/§15-B5，有意变更）：全部 HTML 页面均不再注入共享 token
+    meta——旧断言为「/pc 与 / 不注入、/mobile 注入」。云版 H5 改经设备凭证
+    获得身份；/mobile HTML 本身仍公开可访问（§6.1）。"""
     c, app_mod = client
     monkeypatch.setenv("MOUSEVISION_API_TOKEN", "edge-secret")
     import importlib
@@ -136,7 +149,11 @@ def test_pc_html_does_not_inject_api_token(client, monkeypatch):
         entry = fresh.get("/")
         assert "mousevision-api-token" not in entry.text
         mobile = fresh.get("/mobile")
-        assert 'name="mousevision-api-token" content="edge-secret"' in mobile.text
+        assert mobile.status_code == 200, "（§6.1）/mobile HTML 仍公开可访问"
+        assert "mousevision-api-token" not in mobile.text
+        legacy = fresh.get("/legacy")
+        assert legacy.status_code == 200
+        assert "mousevision-api-token" not in legacy.text
 
 
 def test_must_change_password_blocks_admin_apis(client):
@@ -169,8 +186,11 @@ def test_soft_delete_record(client):
     ids = [item.get("record_id") for item in box_list.json()["items"]]
     assert "rec-del-1" not in ids
 
-    # File still on disk
-    mouse_dirs = list(Path(app_mod.DEFAULT_OUTPUT).glob("run_*/mouse_*/record.json"))
+    # File still on disk（B3：租户目录内）
+    from ui.control_store import LEGACY_TENANT_ID as _LTID
+
+    tenant_out = Path(app_mod.DEFAULT_OUTPUT) / "tenants" / _LTID
+    mouse_dirs = list(tenant_out.glob("run_*/mouse_*/record.json"))
     assert mouse_dirs
 
     restored = c.post("/api/records/rec-del-1/restore")
@@ -225,6 +245,12 @@ def test_session_can_create_box_when_token_configured(client, monkeypatch):
             "/api/me/password",
             json={"current_password": "test-admin", "new_password": "test-admin-ok"},
         ).status_code == 200
+        # B3：激活 legacy-default 租户后，会话才有业务写上下文。
+        from ui.control_store import LEGACY_TENANT_ID as _LTID
+
+        assert fresh.post(
+            "/api/control/session/tenant", json={"tenant_id": _LTID}
+        ).status_code == 200
 
         created = fresh.post(
             "/api/boxes",
@@ -275,50 +301,24 @@ def test_require_token_or_operator_accepts_session(tmp_path, monkeypatch):
 
 
 def test_reset_requires_admin_session(client, monkeypatch):
-    """Reset must reject machine token and require admin session."""
+    """B3（合同 §2.5/§6.3）：全局清盘 /api/reset 已删除 —— 任何主体一律 403
+    墓碑；租户级 reset 走 POST /api/tenants/{id}/reset（见租户隔离契约测试）。
+    （行为按合同有意变更：旧断言为 admin 会话可 200 清全盘。）"""
     c, app_mod = client
     monkeypatch.setenv("MOUSEVISION_API_TOKEN", "edge-secret")
     import importlib
 
     importlib.reload(app_mod)
     with TestClient(app_mod.app) as fresh:
-        # Machine token cannot wipe data.
+        # 机器令牌/匿名/操作员/管理员——全部 403，不得再触发全盘删除。
         by_token = fresh.post(
             "/api/reset", headers={"X-MouseVision-Token": "edge-secret"}
         )
-        assert by_token.status_code == 401
+        assert by_token.status_code == 403
+        assert fresh.post("/api/reset").status_code == 403
 
-        # Unauthenticated cannot wipe data.
-        assert fresh.post("/api/reset").status_code == 401
-
-        # Create an operator and confirm they cannot reset.
         _login(fresh)
-        op = fresh.post(
-            "/api/users",
-            json={
-                "username": "op1",
-                "password": "operator-ok",
-                "role": "operator",
-            },
-        )
-        assert op.status_code == 201
-        fresh.post("/api/logout")
-
-        op_client = TestClient(app_mod.app)
-        assert op_client.post(
-            "/api/login", json={"username": "op1", "password": "operator-ok"}
-        ).status_code == 200
-        denied = op_client.post("/api/reset")
-        assert denied.status_code == 403
-
-        # Admin session can reset.
-        admin = TestClient(app_mod.app)
-        assert admin.post(
-            "/api/login", json={"username": "admin", "password": "test-admin-ok"}
-        ).status_code == 200
-        ok = admin.post("/api/reset")
-        assert ok.status_code == 200
-        assert ok.json()["ok"] is True
+        assert fresh.post("/api/reset").status_code == 403
 
 
 def test_password_change_revokes_old_sessions(client):

@@ -20,6 +20,14 @@ _SHARE_TOKEN = "share-secret"
 _API_TOKEN = "lab-secret"
 
 
+def _tstores(app_mod):
+    """B3：业务 store 不再有模块级单例 —— 共享令牌通道等价于 legacy-default
+    租户的 store 集（从 tenant_factory 按租户解析）。"""
+    from ui.control_store import LEGACY_TENANT_ID
+
+    return app_mod.tenant_factory.stores(LEGACY_TENANT_ID)
+
+
 @pytest.fixture()
 def make_client(tmp_path: Path, monkeypatch):
     """Factory: returns a configured TestClient + app_mod.
@@ -143,10 +151,10 @@ def test_share_run_not_in_registry(make_client):
     with TestClient(app_mod.app) as c:
         res = _post_share(c, _records_payload(1))
         assert res.status_code == 201, res.text
-        runs = app_mod.registry.list_runs()
+        runs = _tstores(app_mod).registry.list_runs()
         assert runs == [], "共享数据不得进入实验室 registry"
-        assert app_mod.upload_queue is not None
-        assert app_mod.records_meta is not None
+        assert _tstores(app_mod).upload_queue is not None
+        assert _tstores(app_mod).records_meta is not None
 
 
 def test_share_does_not_pollute_lab_run_dirs(make_client):
@@ -359,8 +367,8 @@ def test_share_does_not_touch_boxes_table(make_client):
     with TestClient(app_mod.app) as c:
         # 预先建一个箱子，记录其 next_ordinal。
         cage = "SHARE-BOX-01"
-        app_mod.box_registry.create(cage_id=cage)
-        before = app_mod.box_registry.get(cage)
+        _tstores(app_mod).box_registry.create(cage_id=cage)
+        before = _tstores(app_mod).box_registry.get(cage)
         assert before is not None
         next_before = before["next_ordinal"]
 
@@ -373,6 +381,6 @@ def test_share_does_not_touch_boxes_table(make_client):
         assert res.status_code == 201, res.text
 
         # boxes 表的 next_ordinal 未变（共享不应推进箱子编号）。
-        after = app_mod.box_registry.get(cage)
+        after = _tstores(app_mod).box_registry.get(cage)
         assert after is not None
         assert after["next_ordinal"] == next_before

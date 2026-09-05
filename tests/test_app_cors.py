@@ -58,6 +58,7 @@ def test_preflight_rejects_unknown_origin(app_client):
 
 
 def test_normal_request_unaffected_without_origin(app_client):
+    # B4：业务读不再匿名（§6.1）→ 401；本测试关注的是 CORS 头不被附带。
     res = app_client.get("/api/boxes")
-    assert res.status_code == 200
+    assert res.status_code == 401
     assert "access-control-allow-origin" not in res.headers

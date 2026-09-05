@@ -11,6 +11,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+def _tstores(app_mod):
+    """B3：业务 store 不再有模块级单例 —— 共享令牌通道等价于 legacy-default
+    租户的 store 集（从 tenant_factory 按租户解析）。"""
+    from ui.control_store import LEGACY_TENANT_ID
+
+    return app_mod.tenant_factory.stores(LEGACY_TENANT_ID)
+
+
 def _make_suspect_run(tmp_path: Path, run_id: str = "run-test-001") -> Path:
     """Create a run dir with one format_suspect Held record."""
     run_dir = tmp_path / "output" / f"run_20260716_{run_id[:8]}"
@@ -65,6 +73,12 @@ def _login(c: TestClient) -> None:
         json={"current_password": "test-admin", "new_password": "test-admin-ok"},
     )
     assert changed.status_code == 200
+    # B3：业务 API 走会话激活的租户上下文 —— seed admin 兼任 legacy-default
+    # tenant_admin，激活后等价旧行为（读写 legacy-default 数据）。
+    from ui.control_store import LEGACY_TENANT_ID as _LTID
+
+    activated = c.post("/api/control/session/tenant", json={"tenant_id": _LTID})
+    assert activated.status_code == 200, activated.text
 
 
 @pytest.fixture()
@@ -368,7 +382,7 @@ class TestFindRunDirById:
         c, app_mod = app_client
         run_id = "abc-123-456"
         # Directory name uses timestamp + shortid prefix, not full run_id.
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / "run_20260716_abc-123-"
+        run_dir = _tstores(app_mod).output_root / "run_20260716_abc-123-"
         run_dir.mkdir(parents=True)
         (run_dir / "manifest.json").write_text(
             json.dumps({"run_id": run_id, "cage_id": "C57-023"}),
@@ -376,11 +390,11 @@ class TestFindRunDirById:
         )
         assert "abc-123-456" not in run_dir.name
 
-        found = app_mod._find_run_dir_by_id(run_id)
+        found = app_mod._find_run_dir_by_id(run_id, _tstores(app_mod))
         assert found is not None
         assert found.resolve() == run_dir.resolve()
 
-        assert app_mod._find_run_dir_by_id("no-such-run") is None
+        assert app_mod._find_run_dir_by_id("no-such-run", _tstores(app_mod)) is None
 
 
 class TestReleaseRejectAPI:
@@ -392,7 +406,7 @@ class TestReleaseRejectAPI:
         _login(c)
 
         run_id = "run-api-rel-001"
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / f"run_20260716_{run_id[:8]}"
+        run_dir = _tstores(app_mod).output_root / f"run_20260716_{run_id[:8]}"
         run_dir.mkdir(parents=True)
         (run_dir / "manifest.json").write_text(
             json.dumps({"run_id": run_id, "cage_id": "C57-023", "status": "completed"}),
@@ -412,11 +426,11 @@ class TestReleaseRejectAPI:
         rec_path.write_text(json.dumps(rec), encoding="utf-8")
         (mouse_dir / "photo.jpg").write_bytes(b"x")
 
-        app_mod.upload_queue.enqueue(
+        _tstores(app_mod).upload_queue.enqueue(
             {"record_id": "rec-api-1", "cage_id": "C57-023"},
             record_path=rec_path,
         )
-        assert len(app_mod.upload_queue.list_pending()) == 0
+        assert len(_tstores(app_mod).upload_queue.list_pending()) == 0
 
         resp = c.post(f"/api/runs/{run_id}/release-suspect")
         assert resp.status_code == 200, resp.text
@@ -432,7 +446,7 @@ class TestReleaseRejectAPI:
         raw = json.loads(rec_path.read_text(encoding="utf-8"))
         assert raw.get("format_suspect") is False
 
-        assert len(app_mod.upload_queue.list_pending()) == 1
+        assert len(_tstores(app_mod).upload_queue.list_pending()) == 1
 
         # Simulate restart reconciliation.
         from mousevision.jobs import AnalysisJobManager, JobStore
@@ -440,15 +454,15 @@ class TestReleaseRejectAPI:
         store = JobStore(tmp_path / "jobs-restart.db")
         manager = AnalysisJobManager(
             store,
-            output_root=app_mod.DEFAULT_OUTPUT,
+            output_root=_tstores(app_mod).output_root,
             config_path=tmp_path / "config.yaml",
             templates_dir=tmp_path / "templates",
             analysis_fn=lambda _: {},
-            upload_queue=app_mod.upload_queue,
+            upload_queue=_tstores(app_mod).upload_queue,
         )
         manager._reconcile_held()
-        assert len(app_mod.upload_queue.list_pending()) == 1
-        assert app_mod.upload_queue.counts().get("Held", 0) == 0
+        assert len(_tstores(app_mod).upload_queue.list_pending()) == 1
+        assert _tstores(app_mod).upload_queue.counts().get("Held", 0) == 0
 
     def test_reject_suspect_deletes_dir_and_queue(self, app_client, tmp_path):
         """POST /reject-suspect removes queue row, metadata, and verifies rmtree."""
@@ -456,7 +470,7 @@ class TestReleaseRejectAPI:
         _login(c)
 
         run_id = "run-api-rej-001"
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / f"run_20260716_{run_id[:8]}"
+        run_dir = _tstores(app_mod).output_root / f"run_20260716_{run_id[:8]}"
         run_dir.mkdir(parents=True)
         (run_dir / "manifest.json").write_text(
             json.dumps({"run_id": run_id, "cage_id": "C57-023"}),
@@ -474,7 +488,7 @@ class TestReleaseRejectAPI:
         }), encoding="utf-8")
         (mouse_dir / "photo.jpg").write_bytes(b"x")
 
-        app_mod.upload_queue.enqueue(
+        _tstores(app_mod).upload_queue.enqueue(
             {"record_id": "rec-rej-1", "cage_id": "C57-023"},
             record_path=rec_path,
         )
@@ -485,8 +499,8 @@ class TestReleaseRejectAPI:
         assert body["ok"] is True
         assert body["deleted"] == 1
         assert not mouse_dir.exists()
-        assert app_mod.upload_queue.counts().get("Held", 0) == 0
-        assert len(app_mod.upload_queue.list_pending()) == 0
+        assert _tstores(app_mod).upload_queue.counts().get("Held", 0) == 0
+        assert len(_tstores(app_mod).upload_queue.list_pending()) == 0
 
     def test_reject_suspect_reports_rmtree_failure(self, app_client, tmp_path):
         """If rmtree fails, API returns 500 AND restores disk + queue consistency."""
@@ -494,7 +508,7 @@ class TestReleaseRejectAPI:
         _login(c)
 
         run_id = "run-api-rej-fail"
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / f"run_20260716_{run_id[:8]}"
+        run_dir = _tstores(app_mod).output_root / f"run_20260716_{run_id[:8]}"
         run_dir.mkdir(parents=True)
         (run_dir / "manifest.json").write_text(
             json.dumps({"run_id": run_id, "cage_id": "C57-023"}),
@@ -511,12 +525,12 @@ class TestReleaseRejectAPI:
             "format_suspect": True,
         }), encoding="utf-8")
 
-        app_mod.upload_queue.enqueue(
+        _tstores(app_mod).upload_queue.enqueue(
             {"record_id": "rec-rej-fail", "cage_id": "C57-023"},
             record_path=rec_path,
         )
-        assert app_mod.upload_queue.get_payload("rec-rej-fail") is not None
-        assert app_mod.upload_queue.counts().get("Held", 0) == 1
+        assert _tstores(app_mod).upload_queue.get_payload("rec-rej-fail") is not None
+        assert _tstores(app_mod).upload_queue.counts().get("Held", 0) == 1
 
         with patch("mousevision.reject_recovery.shutil.rmtree", side_effect=OSError("busy")):
             resp = c.post(f"/api/runs/{run_id}/reject-suspect")
@@ -525,8 +539,8 @@ class TestReleaseRejectAPI:
         # Directory restored under original name — no false success.
         assert mouse_dir.exists()
         # Queue row must still exist so retry can complete (no irreversible drop).
-        assert app_mod.upload_queue.get_payload("rec-rej-fail") is not None
-        assert app_mod.upload_queue.counts().get("Held", 0) == 1
+        assert _tstores(app_mod).upload_queue.get_payload("rec-rej-fail") is not None
+        assert _tstores(app_mod).upload_queue.counts().get("Held", 0) == 1
         # No leftover quarantine dirs or journal item blocking retry.
         assert not list(run_dir.glob(".rejecting_*"))
 
@@ -536,7 +550,7 @@ class TestReleaseRejectAPI:
         _login(c)
 
         run_id = "run-api-rej-qfail"
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / f"run_20260716_{run_id[:8]}"
+        run_dir = _tstores(app_mod).output_root / f"run_20260716_{run_id[:8]}"
         run_dir.mkdir(parents=True)
         from mousevision.run import write_manifest
         write_manifest(run_dir, {"run_id": run_id, "cage_id": "C57-023"})
@@ -550,12 +564,12 @@ class TestReleaseRejectAPI:
             "ordinal": 1,
             "format_suspect": True,
         }), encoding="utf-8")
-        app_mod.upload_queue.enqueue(
+        _tstores(app_mod).upload_queue.enqueue(
             {"record_id": "rec-qfail", "cage_id": "C57-023"},
             record_path=rec_path,
         )
 
-        real_delete = app_mod.upload_queue.delete_by_record_id
+        real_delete = _tstores(app_mod).upload_queue.delete_by_record_id
         calls = {"n": 0}
 
         def flaky_delete(rid: str) -> int:
@@ -564,7 +578,7 @@ class TestReleaseRejectAPI:
                 raise RuntimeError("db locked")
             return real_delete(rid)
 
-        with patch.object(app_mod.upload_queue, "delete_by_record_id", side_effect=flaky_delete):
+        with patch.object(_tstores(app_mod).upload_queue, "delete_by_record_id", side_effect=flaky_delete):
             resp = c.post(f"/api/runs/{run_id}/reject-suspect")
         assert resp.status_code == 500, resp.text
         assert not mouse_dir.exists()  # disk already committed
@@ -577,13 +591,13 @@ class TestReleaseRejectAPI:
 
         # Startup recovery completes queue delete.
         recover_reject_state(
-            app_mod.DEFAULT_OUTPUT,
-            upload_queue=app_mod.upload_queue,
-            mark_meta_deleted=lambda rid: app_mod.records_meta.update(
+            _tstores(app_mod).output_root,
+            upload_queue=_tstores(app_mod).upload_queue,
+            mark_meta_deleted=lambda rid: _tstores(app_mod).records_meta.update(
                 rid, status="deleted", operator="system"
             ),
         )
-        assert app_mod.upload_queue.get_payload("rec-qfail") is None
+        assert _tstores(app_mod).upload_queue.get_payload("rec-qfail") is None
         assert load_reject_journal(run_dir) is None
 
     def test_reject_orphan_quarantine_recovered_on_startup(self, tmp_path):
@@ -750,7 +764,7 @@ class TestReleaseRejectAPI:
         _login(c)
 
         run_id = "run-normal-ok"
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / f"run_20260716_{run_id[:8]}"
+        run_dir = _tstores(app_mod).output_root / f"run_20260716_{run_id[:8]}"
         run_dir.mkdir(parents=True)
         (run_dir / "manifest.json").write_text(
             json.dumps({"run_id": run_id, "postflight_passed": True}),
@@ -832,7 +846,7 @@ class TestRejectFailClosedAndLocks:
         _login(c)
 
         run_id = "run-api-corrupt"
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / f"run_20260716_{run_id[:8]}"
+        run_dir = _tstores(app_mod).output_root / f"run_20260716_{run_id[:8]}"
         run_dir.mkdir(parents=True)
         from mousevision.run import write_manifest
         write_manifest(run_dir, {"run_id": run_id, "cage_id": "C57-023"})
@@ -844,7 +858,7 @@ class TestRejectFailClosedAndLocks:
             "record_id": "rec-good",
             "format_suspect": True,
         }), encoding="utf-8")
-        app_mod.upload_queue.enqueue(
+        _tstores(app_mod).upload_queue.enqueue(
             {"record_id": "rec-good", "cage_id": "C57-023"},
             record_path=good_rec,
         )
@@ -900,7 +914,7 @@ class TestRejectFailClosedAndLocks:
         _login(c)
 
         run_id = "run-conc-rej"
-        run_dir = Path(app_mod.DEFAULT_OUTPUT) / f"run_20260716_{run_id[:8]}"
+        run_dir = _tstores(app_mod).output_root / f"run_20260716_{run_id[:8]}"
         run_dir.mkdir(parents=True)
         from mousevision.run import write_manifest
         write_manifest(run_dir, {"run_id": run_id, "cage_id": "C57-023"})
@@ -911,7 +925,7 @@ class TestRejectFailClosedAndLocks:
             "record_id": "rec-conc",
             "format_suspect": True,
         }), encoding="utf-8")
-        app_mod.upload_queue.enqueue(
+        _tstores(app_mod).upload_queue.enqueue(
             {"record_id": "rec-conc", "cage_id": "C57-023"},
             record_path=rec,
         )
@@ -920,10 +934,15 @@ class TestRejectFailClosedAndLocks:
 
         def worker():
             from fastapi.testclient import TestClient
+            from ui.control_store import LEGACY_TENANT_ID as _LTID
             with TestClient(app_mod.app) as tc:
                 assert tc.post(
                     "/api/login",
                     json={"username": "admin", "password": "test-admin-ok"},
+                ).status_code == 200
+                # B3：新会话同样需要激活 legacy-default（租户上下文）。
+                assert tc.post(
+                    "/api/control/session/tenant", json={"tenant_id": _LTID}
                 ).status_code == 200
                 r = tc.post(f"/api/runs/{run_id}/reject-suspect")
                 results.append(r.status_code)
@@ -938,7 +957,7 @@ class TestRejectFailClosedAndLocks:
         assert sorted(results) in ([200, 400], [200, 200], [200, 409], [400, 200])
         # Exactly one successful delete of the mouse dir / queue gone.
         assert not mouse.exists()
-        assert app_mod.upload_queue.get_payload("rec-conc") is None
+        assert _tstores(app_mod).upload_queue.get_payload("rec-conc") is None
         from mousevision.reject_recovery import load_reject_journal
         assert load_reject_journal(run_dir) is None
 

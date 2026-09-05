@@ -249,16 +249,27 @@ def test_unstable_record_skipped_from_upload_queue(tmp_path: Path):
 
 
 def test_confirm_weight_api_enqueues_manual_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """POST confirm-weight must enqueue / refresh queue with confirmed payload."""
+    """POST confirm-weight must enqueue / refresh queue with confirmed payload.
+
+    B3 适配：业务 store 已按租户挂到 tenant_factory（无模块级单例可
+    monkeypatch），改为经 TestClient 走真实 API；管理员会话激活 legacy-default
+    租户（seed admin 兼任其 tenant_admin），数据落 legacy-default 租户目录。
+    """
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    from ui.control_store import LEGACY_TENANT_ID
+
     import ui.app as app_mod
 
-    monkeypatch.setattr(app_mod, "DEFAULT_OUTPUT", tmp_path)
-    monkeypatch.setattr(app_mod, "QUEUE_DB", tmp_path / "upload_queue.db")
-    app_mod.upload_queue = UploadQueue(tmp_path / "upload_queue.db")
-    app_mod.registry = MouseRegistry(tmp_path / "registry.json", tmp_path)
-    app_mod.records_meta = RecordsMetaStore(str(tmp_path / "records_meta.db"))
+    monkeypatch.setenv("MOUSEVISION_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setenv("MOUSEVISION_ADMIN_PASSWORD", "test-admin")
+    monkeypatch.delenv("MOUSEVISION_API_TOKEN", raising=False)
+    app_mod = importlib.reload(app_mod)
 
-    run_dir = tmp_path / "run_demo"
+    stores = app_mod.tenant_factory.stores(LEGACY_TENANT_ID)
+    run_dir = stores.output_root / "run_demo"
     mouse_dir = run_dir / "mouse_001"
     mouse_dir.mkdir(parents=True)
     record_id = "confirm-rid-1"
@@ -280,7 +291,7 @@ def test_confirm_weight_api_enqueues_manual_confirmed(tmp_path: Path, monkeypatc
         json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     (mouse_dir / "photo.jpg").write_bytes(b"\xff\xd8\xff")
-    app_mod.registry.register(
+    stores.registry.register(
         run_id="run_demo",
         run_dir=run_dir,
         cage_id="C57-001",
@@ -290,25 +301,33 @@ def test_confirm_weight_api_enqueues_manual_confirmed(tmp_path: Path, monkeypatc
         confidence=0.3,
         output_dir=mouse_dir,
     )
-    assert app_mod.upload_queue.get_payload(record_id) is None
+    assert stores.upload_queue.get_payload(record_id) is None
 
-    from ui.app import ConfirmWeightBody, api_confirm_weight
+    c = TestClient(app_mod.app)
+    assert c.post("/api/login", json={"username": "admin", "password": "test-admin"}).status_code == 200
+    assert c.post(
+        "/api/me/password",
+        json={"current_password": "test-admin", "new_password": "test-admin-ok"},
+    ).status_code == 200
+    assert c.post(
+        "/api/control/session/tenant", json={"tenant_id": LEGACY_TENANT_ID}
+    ).status_code == 200
 
-    result = api_confirm_weight(
-        record_id,
-        ConfirmWeightBody(weight=23.30, note="lcd read"),
-        user={"username": "tester", "role": "operator"},
+    res = c.post(
+        f"/api/records/{record_id}/confirm-weight",
+        json={"weight": 23.30, "note": "lcd read"},
     )
-    assert result["ok"] is True
-    assert result["weight"] == 23.30
-    assert result["weight_source"] == "manual_confirmed"
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is True
+    assert res.json()["weight"] == 23.30
+    assert res.json()["weight_source"] == "manual_confirmed"
 
     saved = json.loads((mouse_dir / "record.json").read_text(encoding="utf-8"))
     assert saved["weight"] == 23.30
     assert saved["requires_manual_weight"] is False
     assert saved["weight_source"] == "manual_confirmed"
 
-    payload = app_mod.upload_queue.get_payload(record_id)
+    payload = stores.upload_queue.get_payload(record_id)
     assert payload is not None
     assert payload["weight"] == 23.30
     assert payload["weight_source"] == "manual_confirmed"
@@ -317,10 +336,10 @@ def test_confirm_weight_api_enqueues_manual_confirmed(tmp_path: Path, monkeypatc
     saved["requires_manual_weight"] = True
     (mouse_dir / "record.json").write_text(json.dumps(saved), encoding="utf-8")
     # P2-b: requires_manual_weight alone no longer blocks if weight is filled.
-    app_mod._reject_if_manual_weight_required(record_id)  # should NOT raise
+    app_mod._reject_if_manual_weight_required(record_id, stores)  # should NOT raise
 
     saved["weight"] = None
     (mouse_dir / "record.json").write_text(json.dumps(saved), encoding="utf-8")
     with pytest.raises(Exception) as exc:
-        app_mod._reject_if_manual_weight_required(record_id)
+        app_mod._reject_if_manual_weight_required(record_id, stores)
     assert "手填" in str(exc.value.detail)
