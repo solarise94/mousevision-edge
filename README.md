@@ -22,7 +22,7 @@ K797 系列天平 ──蓝牙广播(无配对)──▶ Android App（WebView �
 
 ## 下载与使用（公众离线版）
 
-- 下载：[GitHub Releases](https://github.com/solarise94/mousevision-edge/releases)（`miceautomatic-local-v0.3.4.apk`，Android 8.0+，数据仅存本机）
+- 下载：[GitHub Releases](https://github.com/solarise94/mousevision-edge/releases)（`miceautomatic-local-v0.3.5.apk`，Android 8.0+，数据仅存本机）
 - 使用说明：[docs/USER_GUIDE.md](docs/USER_GUIDE.md)——用什么秤、怎么连接、怎么称重、怎么导出
 - 内测云版（数据直传服务器）不在 Release 分发，仅实验室内部渠道。
 
