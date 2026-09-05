@@ -4,7 +4,7 @@
 |------|------|
 | 产品名称 | 小鼠称重记录（MouseVision Mobile） |
 | 版本 | v1.0 设计稿 |
-| 关联文档 | [WEB_APP_FRAMEWORK.md](./WEB_APP_FRAMEWORK.md)、[README.md](../README.md) |
+| 关联文档 | [WEB_APP_FRAMEWORK.md](./WEB_APP_FRAMEWORK.md)、[CLOUD_ACCOUNT_GUIDE.md](./CLOUD_ACCOUNT_GUIDE.md)、[README.md](../README.md) |
 | 入口路径 | `/mobile` |
 | 目标用户 | 实验室操作人员（手持手机对单只小鼠称重录像） |
 
@@ -152,8 +152,17 @@ uploading → queued → processing → completed
 { "v": 1, "project_id": "default", "cage_id": "Box-20250708-001" }
 ```
 
+云版（租户隔离升级后）服务端生成 **v2**，加入工作区标识（`ui/boxes.py` `qr_payload(…, version=2, tenant_id=…)`）：
+
+```json
+{ "v": 2, "tenant_id": "<tenant_uuid>", "project_id": "default", "cage_id": "C57-023" }
+```
+
 - 前端解码后校验 `v` 与 `cage_id` 合法性（`^[A-Za-z0-9._-]{1,64}$`）；
-- 兼容旧标签：解析失败时回退为「整串即 `cage_id`」。
+- 兼容旧标签：解析失败时回退为「整串即 `cage_id`」；
+- **租户归属以服务端为准**：H5 `parseQr` 只取 `cage_id`（不解释 `tenant_id`），随后
+  `GET /api/boxes/{cage_id}` 在当前绑定工作区内查找——扫到其他工作区的箱子得到 404，
+  不会写入本工作区；服务端在生成 v2 payload 时写入 `tenant_id` 供上游系统与审计消费。
 
 #### 3.5.5 关联关系总览
 
@@ -853,7 +862,8 @@ sequenceDiagram
 ### 10.3 安全
 
 - 生产环境必须 HTTPS + 反向代理登录或 VPN
-- 共享 token 仅适用于全员可信内网；外网须代理注入 token
+- 云版（cloud）：手机以**设备凭证**（`mvdev_…`，`localStorage` 键 `mv.deviceCredential.v1`）访问工作区 API；服务端与 APK 均不再携带/注入共享 token（见 §13）
+- 本地版（local）：无实验室同步令牌，数据在本机；可选 share token 仅用于「共享数据」通道，语义不变
 - 写操作限流：每 IP 10 次/分钟上传（建议）
 
 ### 10.4 兼容性
@@ -951,9 +961,69 @@ ui/static/
     └── hero-scale.svg       # 首页插图
 ```
 
+## 13. 云版租户隔离与设备凭证（cloud edition）
+
+> 本节描述云版（cloud flavor / 服务器托管 H5）的租户隔离行为；**本地版（local）完全不变**：
+> 无令牌、数据在本机、可选 share 通道（`mv.shareOutbox.v1` 独立键，不入工作区）。
+> 运营侧操作步骤见 [CLOUD_ACCOUNT_GUIDE.md](./CLOUD_ACCOUNT_GUIDE.md)。
+
+### 13.1 身份：设备凭证（mvdev_）
+
+- 云版手机没有全局共享 token。每台设备绑定一个工作区，持有一把**设备凭证**
+  （`mvdev_` 前缀随机值，明文只在签发响应中出现一次，服务端只存 salted 哈希）。
+- 凭证存 `localStorage` 键 `mv.deviceCredential.v1`（`ui/static/device-credential.js`），
+  每次请求经 `api-client.js` 以 `X-MouseVision-Token` 头携带；请求头优先级：
+  **设备凭证 > `MV_CONFIG.token` > HTML meta**（后两者仅为 legacy 兼容读取器，云版页面不再注入）。
+- 凭证**固定**绑定一个 `tenant_id`，不能改绑；换工作区 = 撤旧签新（`POST /api/control/devices/{device_id}/rotate` 单事务轮换，旧凭证立即 401）。
+- 服务端按凭证行解析租户（`ui/tenant_context.py`），客户端 body/query 里传的任何 tenant 字段都不参与解析。
+
+### 13.2 绑定流程（H5 凭证引导页）
+
+云版启动时无有效凭证 → 全屏「绑定工作区」overlay（`mobile.js` `showBindingOverlay`）拦截全部 UI，
+两种方式二选一：
+
+| 方式 | 操作 | 接口 |
+|------|------|------|
+| 绑定码 | `tenant_admin` 在 PC 生成一次性绑定码（TTL ≤ 600s，默认 300s，单次消费），现场输入 | `POST /api/control/devices/bind` |
+| 子账号登录 | 输入用户名/密码换设备凭证；仅 operator/tenant_admin 成员可绑（viewer/parent_owner 403）；账号属多个工作区时返回 400 + `detail.tenants[]` 供选择 | `POST /api/control/devices/login` |
+
+绑定成功保存凭证后整页 reload 重建 outbox。启动与恢复时 `verifyCredential()` 用轻量请求校验：
+**401/403 = 凭证已被服务端撤销/轮换** → 清除本地凭证、回到绑定页并提示；网络错误静默（离线不
+影响本地称重，下次联网再验）。
+
+### 13.3 上报队列：outbox v2 键与批次快照
+
+| 存储键 | 使用身份 | 批次快照 | flush 校验 | 载荷 | 死信键 |
+|--------|----------|----------|------------|------|--------|
+| `mv.reportOutbox.v1`（默认模式，local 版与历史行为） | `MV_CONFIG.token` 或 meta（local 无令牌，仅 share 通道上传） | 无 | 无（历史行为） | multipart | `mv.reportOutbox.v1.dead` |
+| `mv.reportOutbox.v1`（legacy 模式） | legacy 共享令牌，或绑定 legacy-default 的设备凭证 | `{tenant_id: legacy-default}` | 凭证租户 ≠ 快照 → 拒绝（旧无快照批次视为 legacy-default） | JSON（含 `tenant_id` 标识；服务端仍按凭证解析） | `mv.reportOutbox.v1.dead` |
+| `mv.reportOutbox.v2.<tenant_id>` | 绑定该工作区的设备凭证 | `{tenant_id, credential_id}` | 当前凭证租户 ≠ 批次快照 → **整轮拒绝**：0 网络请求、原队列保留、`rejected[]` 供 UI | FormData + 凭证头 | `mv.reportOutbox.v2.<tenant_id>.dead` |
+| `mv.shareOutbox.v1` | local shareToken | 不动 | 无 | FormData（share 头） | `mv.shareOutbox.v1.dead` |
+
+防丢骨架（原子持久化、死信迁移、按 `clientBatchId` 出队、401/403 停止恢复、指数退避重排）未变，
+只在壳层加租户/凭证绑定（`ui/static/report-client.js`）。
+
+### 13.4 v1 队列兼容与换账号提示
+
+- **不静默迁移**：v1 键只在当前身份是 legacy 共享令牌或凭证绑定 `legacy-default` 时原位排空；
+  其他身份**不读、不写、不迁移** v1 与其他 `v2.<tid>` 键。
+- 换账号/换工作区后，设置页显示「上一工作区还有 N 条未上传」（`leftoverOtherWorkspaceQueues()`
+  只读计数），数据留在原键，等回到对应工作区身份再传。
+
+### 13.5 cloud APK 与托管页去 token
+
+- cloud APK 不再打包共享写 token：`assets/www/config.js` 中 `token: ''`、`shareToken: ''`，全包无 `mvdev_`/`MICE_SYNC` 残留；local APK 仍无实验室同步凭证（shareToken 语义不变）。
+- 服务器托管页面（`/`、`/pc`、`/mobile`、`/legacy`）**不再注入** `mousevision-api-token` meta（`_inject_api_token` 已删除）；`/mobile` 公开可访问，但云版必须先完成设备绑定才能上报。
+
+### 13.6 legacy 共享令牌（过渡期）
+
+`MOUSEVISION_API_TOKEN` 现在只是**过渡令牌**：服务端把它写死映射到 `legacy-default` 工作区
+（固定 UUID `00000000-0000-4000-8000-000000000001`），用于旧 APK（v1 键 + 共享令牌）排空存量队列；
+所有经该令牌的响应带 `X-MV-Deprecated-Token: 1` 观测标记。确认旧队列排空、现场 APK 升级完成后撤销。
+
 ---
 
-## 13. 附录
+## 14. 附录
 
 ### A. 环境变量（与现网一致）
 
@@ -961,7 +1031,7 @@ ui/static/
 |------|------|------|
 | `MOUSEVISION_OUTPUT_DIR` | `./output` | 数据根目录 |
 | `MOUSEVISION_MAX_UPLOAD_MB` | `250` | 上传大小上限 |
-| `MOUSEVISION_API_TOKEN` | 空 | 写操作 token |
+| `MOUSEVISION_API_TOKEN` | 空 | **过渡期 legacy 令牌**：仅映射 `legacy-default` 工作区；未配置时写接口 401（fail-closed，不再有 open mode） |
 
 ### B. 部署访问
 
