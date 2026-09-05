@@ -1,0 +1,12 @@
+{
+  "name": "miceautomatic-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Chromium E2E（合同 §16-G6）——仅测试依赖，不接管前端构建（PC 端保持原生 JS）",
+  "scripts": {
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}
