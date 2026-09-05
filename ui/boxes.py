@@ -28,13 +28,29 @@ def strain_from_cage(cage_id: str) -> str:
     return "其他"
 
 
-def qr_payload(cage_id: str, project_id: str = "default", version: int = 1) -> str:
-    """Structured QR content: {v, project_id, cage_id} (design §3.5.4)."""
-    return json.dumps(
-        {"v": version, "project_id": project_id, "cage_id": cage_id},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+def qr_payload(
+    cage_id: str,
+    project_id: str = "default",
+    version: int = 1,
+    tenant_id: str | None = None,
+) -> str:
+    """Structured QR content.
+
+    v1（兼容读）：``{"v":1,"project_id":...,"cage_id":...}``（design §3.5.4）。
+    v2（合同 §4.4）：``{"v":2,"tenant_id":...,"project_id":...,"cage_id":...}``
+    —— 设备已绑定工作区时，payload 的 tenant_id 与凭证不一致必须拒绝；
+    旧 v1 / 裸箱号只在当前绑定工作区内解释。
+    """
+    if version >= 2:
+        payload: dict[str, Any] = {
+            "v": version,
+            "tenant_id": tenant_id or "",
+            "project_id": project_id,
+            "cage_id": cage_id,
+        }
+    else:
+        payload = {"v": version, "project_id": project_id, "cage_id": cage_id}
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 class BoxRegistry:

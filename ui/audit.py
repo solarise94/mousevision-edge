@@ -72,7 +72,10 @@ class AuditStore:
                         action TEXT NOT NULL,
                         target_type TEXT,
                         target_id TEXT,
-                        detail TEXT
+                        detail TEXT,
+                        tenant_id TEXT,
+                        account_id TEXT,
+                        actor_type TEXT
                     )
                     """
                 )
@@ -82,6 +85,14 @@ class AuditStore:
                     ON audit_logs(at DESC)
                     """
                 )
+                # 单调向前迁移（合同 §6.4）：旧库补 tenant_id/account_id/actor_type。
+                # NULL = 控制面/平台级事件；租户业务审计必须带三字段。
+                existing = {row[1] for row in conn.execute("PRAGMA table_info(audit_logs)")}
+                for column in ("tenant_id", "account_id", "actor_type"):
+                    if column not in existing:
+                        conn.execute(
+                            f"ALTER TABLE audit_logs ADD COLUMN {column} TEXT"
+                        )
             finally:
                 conn.close()
 
@@ -124,7 +135,15 @@ class AuditStore:
         target_type: str | None = None,
         target_id: str | None = None,
         detail: Any = None,
+        tenant_id: str | None = None,
+        account_id: str | None = None,
+        actor_type: str | None = None,
     ) -> dict[str, Any]:
+        """写一条审计。
+
+        ``tenant_id/account_id/actor_type`` 为空表示控制面/平台级事件；
+        租户业务审计必须带全三字段（合同 §6.4）。敏感字段继续脱敏。
+        """
         entry_id = str(uuid.uuid4())
         at = _now()
         safe_detail = scrub_sensitive(detail) if detail is not None else None
@@ -137,10 +156,22 @@ class AuditStore:
                 conn.execute(
                     """
                     INSERT INTO audit_logs (
-                        id, at, actor, action, target_type, target_id, detail
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        id, at, actor, action, target_type, target_id, detail,
+                        tenant_id, account_id, actor_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (entry_id, at, actor, action, target_type, target_id, detail_text),
+                    (
+                        entry_id,
+                        at,
+                        actor,
+                        action,
+                        target_type,
+                        target_id,
+                        detail_text,
+                        tenant_id,
+                        account_id,
+                        actor_type,
+                    ),
                 )
             finally:
                 conn.close()
@@ -152,16 +183,32 @@ class AuditStore:
             "target_type": target_type,
             "target_id": target_id,
             "detail": safe_detail,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "actor_type": actor_type,
         }
 
-    def list(self, *, limit: int = 50, offset: int = 0, action: str | None = None) -> dict[str, Any]:
+    def list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        action: str | None = None,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         safe_limit = max(1, min(int(limit), 200))
         safe_offset = max(0, int(offset))
         where = ""
         params: list[Any] = []
+        clauses = []
         if action:
-            where = "WHERE action = ?"
+            clauses.append("action = ?")
             params.append(action)
+        if tenant_id:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if clauses:
+            where = "WHERE " + " AND ".join(clauses)
         with self.lock:
             conn = self._connect()
             try:

@@ -62,6 +62,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -81,7 +82,7 @@ from mousevision.realtime import (
 )
 from mousevision.realtime_journal import AttemptJournal, JournalMeta, journal_path
 from mousevision.realtime_finalize import finalize_session
-from ui.auth import require_api_token
+from ui.tenant_context import TenantContext
 
 log = logging.getLogger("realtime_api")
 
@@ -106,6 +107,10 @@ class ActiveSession:
     ``engine`` carries its own internal lock, so the only state here that
     needs :data:`_sessions_lock` is the dict membership itself plus
     ``last_frame_at`` (updated by the WS loop, read by the reaper).
+
+    租户隔离（合同 §6.3/§15-B3）：``tenant_id`` 在 session 创建时固化（服务端
+    从 TenantContext 解析，永不取自客户端字段）；``output_root`` 为该租户目录，
+    journal 与 finalize 落盘只进这棵目录。
     """
 
     session_id: str
@@ -119,6 +124,7 @@ class ActiveSession:
     last_frame_at: float = 0.0
     recording_t0_ms: float = 0.0  # client's recording start time (future use)
     device_id: str = "scale01"
+    tenant_id: str = ""  # 创建时固化的租户（空 = 无 factory 的旧测试装配）
     # Serializes frame processing for this session across socket reconnects
     # or concurrent REST probes that feed frames.
     frame_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -148,16 +154,26 @@ _config_path: str | Path | None = None
 _config_cache: dict[str, Any] | None = None
 _output_root: str | Path | None = None
 _config_lock = threading.Lock()
+# TenantStoreFactory（B3）：生产 app 经 configure(config, factory=...) 注入。
+# 为 None 时是"裸 router"测试装配（自身 FastAPI + configure(config, root)），
+# 维持旧的开放语义（无租户校验），仅用于隔离的测试 app；生产 app 恒有 factory。
+_factory: Any | None = None
 
 
-def configure(config_path: str | Path, output_root: str | Path | None = None) -> None:
+def configure(
+    config_path: str | Path,
+    output_root: str | Path | None = None,
+    factory: Any | None = None,
+) -> None:
     """Set the YAML config path (and optionally the output root) used by the
     module-level :data:`router`.
 
     Must be called once at startup, before the router handles requests.
     ``output_root`` defaults to ``MOUSEVISION_OUTPUT_DIR`` env or ``./output``.
+    ``factory``：TenantStoreFactory —— 会话创建时固化 tenant_id、按租户落盘
+    journal 与 finalize（§6.3）。测试装配的裸 router 可不传（无租户语义）。
     """
-    global _config_path, _output_root
+    global _config_path, _output_root, _factory
     with _config_lock:
         _config_path = str(config_path)
         if output_root is None:
@@ -165,8 +181,58 @@ def configure(config_path: str | Path, output_root: str | Path | None = None) ->
 
             output_root = _os.getenv("MOUSEVISION_OUTPUT_DIR", "output")
         _output_root = str(output_root)
+        _factory = factory
         # Invalidate cache so the next request reloads from the new path.
         _invalidate_config_locked()
+
+
+def _get_tenant_ctx(request: Request) -> TenantContext | None:
+    """请求级 TenantContext（fail-closed 401）；裸 router 装配返回 None。"""
+    if _factory is None:
+        # 旧 token 门（仅供隔离的测试 app）：配置了共享令牌则必须匹配。
+        import os
+
+        expected = os.getenv("MOUSEVISION_API_TOKEN", "").strip()
+        if expected:
+            supplied = (request.headers.get("x-mousevision-token") or "").strip()
+            if supplied != expected:
+                raise HTTPException(status_code=401, detail="无效或缺少 API token")
+        return None
+    ctx = _factory.context_from_request(request)
+    if ctx.actor_type == "legacy_token":
+        # B4 兼容窗口：legacy 令牌响应加可观测 deprecation 标记（Review S4；
+        # 不记 token 本身）。WS 通道无 HTTP 响应头，打标记无害、跳过响应即可。
+        request.state.mv_legacy_token = True
+    return ctx
+
+
+def _require_tenant_ctx(ctx: TenantContext | None) -> TenantContext:
+    """业务写端点的租户上下文守卫（Review S1）。
+
+    factory 模式下 ctx 为 account 级（platform / parent / 未激活会话）→ 403：
+    落盘必须有激活工作区，绝不写总根/CWD。裸 router 测试装配（factory=None）
+    不受影响。
+    """
+    if _factory is not None and (ctx is None or not ctx.tenant_id):
+        raise HTTPException(
+            status_code=403,
+            detail="请先激活工作区后再进行该操作（当前会话无激活工作区）",
+        )
+    return ctx
+
+
+def _session_upload_queue(session: ActiveSession) -> Any:
+    """finalize 落盘后的云同步队列：按会话租户经 factory 解析（§6.3）。"""
+    if _factory is not None and session.tenant_id:
+        try:
+            return _factory.stores(session.tenant_id).upload_queue
+        except KeyError:
+            log.error(
+                "realtime: tenant store missing at finalize (tenant=%s session=%s)",
+                session.tenant_id, session.session_id,
+            )
+            return None
+    return _get_upload_queue()
 
 
 def _get_output_root() -> str:
@@ -687,12 +753,22 @@ def _cleanup_expired_locked(now: float | None = None) -> int:
     return len(expired)
 
 
-def _get_session(session_id: str) -> ActiveSession:
-    """Fetch a session by id, running expiry first. Raises 404 if absent."""
+def _get_session(session_id: str, ctx: TenantContext | None = None) -> ActiveSession:
+    """Fetch a session by id, running expiry first. Raises 404 if absent.
+
+    跨租户的 session_id 一律按不存在处理（统一 404，不 403，合同 §6.1）：
+    ctx 租户与会话固化的 tenant_id 不一致 → 404。
+    """
     with _sessions_lock:
         _cleanup_expired_locked()
         session = _sessions.get(session_id)
     if session is None:
+        raise HTTPException(status_code=404, detail="realtime session not found")
+    if (
+        ctx is not None
+        and session.tenant_id
+        and ctx.tenant_id != session.tenant_id
+    ):
         raise HTTPException(status_code=404, detail="realtime session not found")
     return session
 
@@ -751,9 +827,13 @@ def _build_journal(
     project_id: str,
     device_id: str,
     weight_source: str = "ocr",
+    output_root: str | Path | None = None,
 ) -> AttemptJournal:
-    """Create an append-only journal for this session and write its meta."""
-    out_root = _get_output_root()
+    """Create an append-only journal for this session and write its meta.
+
+    ``output_root`` 传入会话租户目录（§6.3）；为 None 时退回全局根（裸 router
+    测试装配）。"""
+    out_root = str(output_root) if output_root is not None else _get_output_root()
     jpath = journal_path(out_root, session_id)
     j = AttemptJournal(jpath)
     j.write_meta(
@@ -772,14 +852,21 @@ def _build_journal(
 @router.post(
     "/session",
     response_model=CreateSessionResponse,
-    dependencies=[Depends(require_api_token)],
 )
-def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
+def create_session(
+    req: CreateSessionRequest,
+    ctx: TenantContext | None = Depends(_get_tenant_ctx),
+) -> CreateSessionResponse:
     """Create a new realtime weighing session.
 
     Returns the new ``session_id`` (the phone then opens the WebSocket with
     ``?session_id=...``) and the initial state (always ``calibrating``).
+
+    会话创建即固化 ``tenant_id`` 与租户 output_root（§6.3）；无有效凭证 → 401；
+    会话无激活工作区（account 级 ctx）→ 403（Review S1，journal/finalize 只落
+    激活租户目录）。
     """
+    ctx = _require_tenant_ctx(ctx)
     config = _get_config()
     try:
         engine = _create_engine(config, weight_source=req.weight_source)
@@ -788,13 +875,18 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
         raise HTTPException(status_code=400, detail=f"invalid realtime config: {exc}") from exc
     except Exception:  # noqa: BLE001 - surface as 500 with context, never crash the app
         log.exception("realtime: failed to build engine from config")
-        raise HTTPException(status_code=500, detail="failed to initialize session")
+        raise HTTPException(status_code=500, detail="failed to initialize session") from exc
 
     session_id = uuid.uuid4().hex
     now = time.time()
     device_id = str(config.get("device_id", "scale01"))
+    tenant_id = ctx.tenant_id if ctx is not None else ""
+    out_root: str | Path = (
+        ctx.output_root if ctx is not None else _get_output_root()
+    )
     journal = _build_journal(
-        session_id, req.cage_id, req.project_id, device_id, req.weight_source
+        session_id, req.cage_id, req.project_id, device_id, req.weight_source,
+        output_root=out_root,
     )
     session = ActiveSession(
         session_id=session_id,
@@ -802,18 +894,20 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
         project_id=req.project_id,
         engine=engine,
         journal=journal,
-        output_root=_get_output_root(),
+        output_root=str(out_root),
         created_at=now,
         weight_source=req.weight_source,
         last_frame_at=0.0,
         device_id=device_id,
+        tenant_id=tenant_id,
     )
     with _sessions_lock:
         _cleanup_expired_locked(now)
         _sessions[session_id] = session
     log.info(
-        "realtime: created session %s (cage=%s project=%s weight_source=%s)",
+        "realtime: created session %s (cage=%s project=%s weight_source=%s tenant=%s)",
         session_id, req.cage_id, req.project_id, req.weight_source,
+        tenant_id or "-",
     )
     return CreateSessionResponse(
         session_id=session_id,
@@ -825,20 +919,24 @@ def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
 
 @router.get(
     "/session/{session_id}/status",
-    dependencies=[Depends(require_api_token)],
 )
-def session_status(session_id: str) -> dict[str, Any]:
+def session_status(
+    session_id: str,
+    ctx: TenantContext | None = Depends(_get_tenant_ctx),
+) -> dict[str, Any]:
     """Poll the current session state (fallback when WS is disconnected)."""
-    return _status_payload(_get_session(session_id))
+    return _status_payload(_get_session(session_id, ctx))
 
 
 @router.post(
     "/session/{session_id}/retry",
-    dependencies=[Depends(require_api_token)],
 )
-def session_retry(session_id: str) -> dict[str, Any]:
+def session_retry(
+    session_id: str,
+    ctx: TenantContext | None = Depends(_get_tenant_ctx),
+) -> dict[str, Any]:
     """Request a re-weigh of the currently announced attempt."""
-    session = _get_session(session_id)
+    session = _get_session(session_id, ctx)
     # Snapshot the in-flight attempt so its rejection is durable BEFORE the
     # engine transitions out of ANNOUNCED.
     try:
@@ -859,11 +957,13 @@ def session_retry(session_id: str) -> dict[str, Any]:
 
 @router.post(
     "/session/{session_id}/accept",
-    dependencies=[Depends(require_api_token)],
 )
-def session_accept(session_id: str) -> dict[str, Any]:
+def session_accept(
+    session_id: str,
+    ctx: TenantContext | None = Depends(_get_tenant_ctx),
+) -> dict[str, Any]:
     """Accept the currently announced weight and return the attempt."""
-    session = _get_session(session_id)
+    session = _get_session(session_id, ctx)
     attempt = session.engine.accept_weight()
     if attempt is None:
         # Not in ANNOUNCED state (nothing to accept, or already accepted).
@@ -892,10 +992,11 @@ class FinishRequest(BaseModel):
 
 @router.post(
     "/session/{session_id}/finish",
-    dependencies=[Depends(require_api_token)],
 )
 def session_finish(
-    session_id: str, req: FinishRequest | None = Body(None)
+    session_id: str,
+    req: FinishRequest | None = Body(None),
+    ctx: TenantContext | None = Depends(_get_tenant_ctx),
 ) -> dict[str, Any]:
     """End the session, persist accepted attempts as durable records, and
     return a summary.
@@ -904,10 +1005,24 @@ def session_finish(
     attempt under a new run dir). Rejected attempts are written to the run
     manifest so the offline pipeline can skip them. The in-memory session is
     then removed; the journal file remains for audit.
+
+    finalize 只落会话固化的租户 output_root，云同步队列按会话租户经 factory
+    解析（§6.3）。
     """
     with _sessions_lock:
         _cleanup_expired_locked()
-        session = _sessions.pop(session_id, None)
+        session = _sessions.get(session_id)
+        if session is not None and (
+            ctx is None
+            or not session.tenant_id
+            or ctx.tenant_id == session.tenant_id
+        ):
+            session = _sessions.pop(session_id)
+        else:
+            # 跨租户（或已过期消失）：不 pop——会话必须保留在原租户（Review B1
+            # 修复：mismatch 时 session 引用不得残留，否则原租户数据被外部
+            # finalize 并返回 200）。统一按不存在处理（404，§6.1）。
+            session = None
     if session is None:
         raise HTTPException(status_code=404, detail="realtime session not found")
 
@@ -931,7 +1046,7 @@ def session_finish(
             cage_id=session.cage_id,
             project_id=session.project_id,
             device_id=session.device_id,
-            upload_queue=_get_upload_queue(),
+            upload_queue=_session_upload_queue(session),
             video_upload_job_id=(req.video_upload_job_id if req else None),
             capture_meta=(req.capture_meta if req else None),
             timing_summary=timing_summary,
@@ -963,6 +1078,25 @@ def session_finish(
 # --------------------------------------------------------------------- #
 # WebSocket endpoint
 # --------------------------------------------------------------------- #
+
+
+def stop_sessions_for_tenant(tenant_id: str) -> int:
+    """弹出某租户的全部活动会话（租户 reset 前调用，§15-B3）。
+
+    返回弹出的会话数；journal 文件保留在租户目录（随目录一起被 reset 清除）。
+    """
+    removed = 0
+    with _sessions_lock:
+        for sid in [
+            sid
+            for sid, s in _sessions.items()
+            if s.tenant_id == tenant_id
+        ]:
+            _sessions.pop(sid, None)
+            removed += 1
+    if removed:
+        log.info("realtime: dropped %d session(s) of tenant %s (reset)", removed, tenant_id)
+    return removed
 
 
 def _check_ws_token(token: str | None) -> bool:
@@ -1434,16 +1568,39 @@ async def realtime_ws(
 
     On disconnect the session is left in memory (the phone may reconnect);
     it is reaped after :data:`SESSION_TIMEOUT_S` of inactivity.
+
+    租户校验（合同 §6.3 / §15-B3）：factory 模式下按 cookie/header/query 令牌
+    解析 TenantContext；凭证租户与会话固化的租户不一致 → 关闭码 4403；
+    无有效凭证 → 4401。
     """
     # Auth first — close with 4401 before accepting so the client sees a code.
-    if not _check_ws_token(token):
+    ctx: TenantContext | None = None
+    if _factory is not None:
+        try:
+            ctx = _factory._resolver.try_resolve(websocket, extra_token=token)
+        except HTTPException:
+            ctx = None
+        if ctx is None:
+            await websocket.close(code=4401)
+            return
+    elif not _check_ws_token(token):
         await websocket.close(code=4401)
         return
 
     try:
+        # 先取原始会话（不做租户 404 折叠），以便区分 4404 与跨租户 4403。
         session = _get_session(session_id)
     except HTTPException:
         await websocket.close(code=4404)
+        return
+
+    if (
+        ctx is not None
+        and session.tenant_id
+        and ctx.tenant_id != session.tenant_id
+    ):
+        # 跨租户接管会话：以 4403 拒绝（合同 §9-7）。
+        await websocket.close(code=4403)
         return
 
     try:

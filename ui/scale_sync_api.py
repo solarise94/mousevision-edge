@@ -1,14 +1,15 @@
 """Scale time-sync REST API (MVP).
 
 Implements the contract in ``docs/SCALE_TIME_SYNC_MVP.md`` §5. The router is
-mounted by ``ui/app.py`` after :func:`configure` binds the output root:
+mounted by ``ui/app.py`` after :func:`configure` binds the tenant factory:
 
     import ui.scale_sync_api as scale_sync_api
-    scale_sync_api.configure(str(DEFAULT_OUTPUT))
+    scale_sync_api.configure(tenant_factory)
     app.include_router(scale_sync_api.router)
 
-All endpoints are gated by ``require_api_token`` (spec §5 — MVP allows uniform
-token auth to keep anonymous users out of weighing evidence).
+租户隔离（合同 §5 / §15-B3）：每个租户一套 ScaleSyncStore（
+``tenants/<tenant_id>/scale_sync.db`` + ``scale_sync/``），会话按
+TenantContext 校验租户归属；跨租户 session_id 统一 404。
 
 The CSV parsing, storage and clock-model math live in
 ``mousevision.scale_sync``; this module is a thin HTTP layer over it.
@@ -20,7 +21,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from mousevision.scale_sync import (
@@ -33,36 +34,96 @@ from mousevision.scale_sync import (
     ScaleSyncStore,
     SessionNotFound,
 )
-from ui.auth import require_api_token
+from ui.tenant_context import TenantContext
 
 # --------------------------------------------------------------------------- #
-# Module-level wiring (mirrors ui/realtime_api.py's configure() pattern)
+# Wiring（B3）：不再持有一次性 configure(output_root) 的全局业务写入语义；
+# 生产 app 注入 TenantStoreFactory，store 按请求租户解析。
+# factory 为 None 时是裸 router 测试装配（make_store_for_test / configure(root)）。
 # --------------------------------------------------------------------------- #
 
-_store: ScaleSyncStore | None = None
+_factory: Any = None
+_bare_store: ScaleSyncStore | None = None
 _store_lock = threading.Lock()
 
 
-def configure(output_root: str | Path) -> None:
-    """Bind (or rebind) the SQLite DB + file root. Call once before mount."""
-    global _store
-    out = Path(output_root)
+def configure(factory: Any | None = None, output_root: str | Path | None = None) -> None:
+    """生产 app：``configure(factory)``。测试装配可传 output_root（单店模式）。
+
+    兼容旧调用 ``configure("<root>")``：位置参数为无 stores 属性的字符串/路径
+    时按裸装配的 output_root 处理，既有 scale-sync 测试无需改动挂载方式。
+    """
+    global _factory, _bare_store
     with _store_lock:
-        _store = ScaleSyncStore(
-            db_path=out / "scale_sync.db",
-            files_root=out / "scale_sync",
-        )
-
-
-def _get_store() -> ScaleSyncStore:
-    if _store is None:
-        raise RuntimeError("scale_sync_api.configure() was not called")
-    return _store
+        if factory is not None and not hasattr(factory, "stores"):
+            output_root = output_root or factory
+            factory = None
+        _factory = factory
+        if output_root is not None:
+            out = Path(output_root)
+            _bare_store = ScaleSyncStore(
+                db_path=out / "scale_sync.db",
+                files_root=out / "scale_sync",
+            )
 
 
 def make_store_for_test(db_path: str | Path, files_root: str | Path) -> ScaleSyncStore:
     """Build an isolated store for tests (bypassing the global singleton)."""
     return ScaleSyncStore(db_path=db_path, files_root=files_root)
+
+
+def _store_for(ctx: TenantContext | None) -> ScaleSyncStore:
+    if ctx is not None and ctx.tenant_id:
+        assert _factory is not None, "scale_sync_api.configure(factory) missing"
+        stores = _factory.stores(ctx.tenant_id)
+        cached = stores.extra.get("scale_sync")
+        if cached is not None:
+            return cached
+        store = ScaleSyncStore(
+            db_path=stores.output_root / "scale_sync.db",
+            files_root=stores.output_root / "scale_sync",
+        )
+        stores.extra["scale_sync"] = store
+        return store
+    if _factory is not None:
+        # Review S2 修复：factory 模式下 account 级 ctx（platform / parent /
+        # 未激活 / paused 租户会话）显式 403，不再落 RuntimeError 500。
+        raise HTTPException(
+            status_code=403,
+            detail="请先激活工作区后再进行该操作（当前会话无激活工作区）",
+        )
+    if _bare_store is not None:
+        return _bare_store
+    raise RuntimeError("scale_sync_api.configure() was not called")
+
+
+def _resolve_ctx(request: Request) -> TenantContext | None:
+    """fail-closed 的 TenantContext；裸 router 测试装配返回 None。"""
+    if _factory is None:
+        _legacy_token_gate(request)
+        return None
+    ctx = _factory.context_from_request(request)
+    if getattr(ctx, "actor_type", "") == "legacy_token":
+        # B4 兼容窗口：legacy 令牌响应加可观测 deprecation 标记（Review S4；
+        # 不记 token 本身）。标记由 app 级中间件转成 X-MV-Deprecated-Token 响应头。
+        request.state.mv_legacy_token = True
+    return ctx
+
+
+def _legacy_token_gate(request: Request) -> None:
+    """裸 router（无 factory）装配的旧 token 门，仅供隔离的测试 app 使用。
+
+    语义 = B4 之前的 require_api_token：配置了 MOUSEVISION_API_TOKEN 则必须
+    匹配，未配置则放行。生产 app 恒走 factory 的 fail-closed 解析层。
+    """
+    import os
+
+    expected = os.getenv("MOUSEVISION_API_TOKEN", "").strip()
+    if not expected:
+        return
+    supplied = request.headers.get("x-mousevision-token", "").strip()
+    if supplied != expected:
+        raise HTTPException(status_code=401, detail="无效或缺少 API token")
 
 
 router = APIRouter(prefix="/api/scale-sync", tags=["scale-sync"])
@@ -124,9 +185,12 @@ class MatchRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-@router.post("/sessions", dependencies=[Depends(require_api_token)])
-def create_session(req: CreateSessionRequest) -> dict[str, Any]:
-    store = _get_store()
+@router.post("/sessions")
+def create_session(
+    req: CreateSessionRequest,
+    ctx: TenantContext | None = Depends(_resolve_ctx),
+) -> dict[str, Any]:
+    store = _store_for(ctx)
     warnings: list[str] = []
     if not (req.scale_device_id or "").strip():
         warnings.append("未填写 scale_device_id，现场无法区分多台天平")
@@ -144,10 +208,14 @@ def create_session(req: CreateSessionRequest) -> dict[str, Any]:
 
 @router.put(
     "/sessions/{session_id}/anchors/{kind}",
-    dependencies=[Depends(require_api_token)],
 )
-def put_anchor(session_id: str, kind: str, req: AnchorRequest) -> dict[str, Any]:
-    store = _get_store()
+def put_anchor(
+    session_id: str,
+    kind: str,
+    req: AnchorRequest,
+    ctx: TenantContext | None = Depends(_resolve_ctx),
+) -> dict[str, Any]:
+    store = _store_for(ctx)
     try:
         return store.put_anchor(session_id, kind, req.model_dump())
     except Exception as exc:  # noqa: BLE001
@@ -156,10 +224,13 @@ def put_anchor(session_id: str, kind: str, req: AnchorRequest) -> dict[str, Any]
 
 @router.delete(
     "/sessions/{session_id}/anchors/{kind}",
-    dependencies=[Depends(require_api_token)],
 )
-def delete_anchor(session_id: str, kind: str) -> dict[str, Any]:
-    store = _get_store()
+def delete_anchor(
+    session_id: str,
+    kind: str,
+    ctx: TenantContext | None = Depends(_resolve_ctx),
+) -> dict[str, Any]:
+    store = _store_for(ctx)
     try:
         return store.delete_anchor(session_id, kind)
     except Exception as exc:  # noqa: BLE001
@@ -168,13 +239,13 @@ def delete_anchor(session_id: str, kind: str) -> dict[str, Any]:
 
 @router.post(
     "/sessions/{session_id}/imports",
-    dependencies=[Depends(require_api_token)],
 )
 async def create_import(
     session_id: str,
     file: UploadFile = File(...),
+    ctx: TenantContext | None = Depends(_resolve_ctx),
 ) -> dict[str, Any]:
-    store = _get_store()
+    store = _store_for(ctx)
     name = (file.filename or "upload.csv").lower()
     if not (name.endswith(".csv") or (file.content_type or "").lower() in {"text/csv", "application/vnd.ms-excel"}):
         raise _err("只接受 .csv 文件", 400)
@@ -207,7 +278,6 @@ def _session_tz(store: ScaleSyncStore, session_id: str) -> str:
 
 @router.get(
     "/sessions/{session_id}/imports/{import_id}/readings",
-    dependencies=[Depends(require_api_token)],
 )
 def list_readings(
     session_id: str,
@@ -216,8 +286,9 @@ def list_readings(
     min_weight: float | None = Query(None),
     max_weight: float | None = Query(None),
     limit: int = Query(500, ge=1, le=5000),
+    ctx: TenantContext | None = Depends(_resolve_ctx),
 ) -> dict[str, Any]:
-    store = _get_store()
+    store = _store_for(ctx)
     try:
         items = store.list_readings(
             session_id,
@@ -234,10 +305,14 @@ def list_readings(
 
 @router.put(
     "/sessions/{session_id}/anchors/{kind}/match",
-    dependencies=[Depends(require_api_token)],
 )
-def match_anchor(session_id: str, kind: str, req: MatchRequest) -> dict[str, Any]:
-    store = _get_store()
+def match_anchor(
+    session_id: str,
+    kind: str,
+    req: MatchRequest,
+    ctx: TenantContext | None = Depends(_resolve_ctx),
+) -> dict[str, Any]:
+    store = _store_for(ctx)
     try:
         return store.match_anchor(
             session_id, kind, import_id=req.import_id, source_line_no=req.source_line_no
@@ -248,10 +323,12 @@ def match_anchor(session_id: str, kind: str, req: MatchRequest) -> dict[str, Any
 
 @router.post(
     "/sessions/{session_id}/calculate",
-    dependencies=[Depends(require_api_token)],
 )
-def calculate(session_id: str) -> dict[str, Any]:
-    store = _get_store()
+def calculate(
+    session_id: str,
+    ctx: TenantContext | None = Depends(_resolve_ctx),
+) -> dict[str, Any]:
+    store = _store_for(ctx)
     try:
         result = store.calculate(session_id)
     except Exception as exc:  # noqa: BLE001
@@ -261,10 +338,12 @@ def calculate(session_id: str) -> dict[str, Any]:
 
 @router.get(
     "/sessions/{session_id}",
-    dependencies=[Depends(require_api_token)],
 )
-def get_session(session_id: str) -> dict[str, Any]:
-    store = _get_store()
+def get_session(
+    session_id: str,
+    ctx: TenantContext | None = Depends(_resolve_ctx),
+) -> dict[str, Any]:
+    store = _store_for(ctx)
     try:
         return store.get_session_full(session_id)
     except Exception as exc:  # noqa: BLE001

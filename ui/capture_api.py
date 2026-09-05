@@ -6,6 +6,10 @@ Receives the raw K797 reading stream recorded by the phone
 weighing engine (``ui/static/weigh-engine.js``) so stability thresholds can be
 tuned against real scale behaviour.
 
+路由分类（合同 §5 / §15-B3）：``platform_tool`` —— ``scale_captures/`` 留在
+全局总根，仅平台/研发使用，**不按子账号开放、不进租户目录**；鉴权保持
+token 级（legacy 共享令牌可用；open mode 已在 B4 关闭）。
+
 Endpoint contract (multipart/form-data):
 
   - ``payload``    JSON string, REQUIRED. Must decode to an object containing a
@@ -26,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Form, HTTPException
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ui.auth import require_api_token
@@ -59,7 +63,26 @@ def _ensure_dir() -> Path:
     return _captures_dir
 
 
-@router.post("/api/scale-capture", dependencies=[Depends(require_api_token)])
+def _legacy_token_gate(
+    request: Request,
+    x_mousevision_token: str | None = Header(None, alias="X-MouseVision-Token"),
+) -> None:
+    """require_api_token + legacy deprecation 观测标记（Review S4）。
+
+    本模块鉴权只认 X-MouseVision-Token 头上的 legacy 共享令牌（require_api_token
+    语义）；通过即视为 legacy_token 通道，打 ``request.state.mv_legacy_token``
+    （app 级中间件转成 X-MV-Deprecated-Token 响应头；不记录 token 本身）。
+    """
+    import os
+
+    require_api_token(x_mousevision_token)
+    expected = os.getenv("MOUSEVISION_API_TOKEN", "").strip()
+    supplied = (x_mousevision_token or "").strip()
+    if expected and supplied and secrets.compare_digest(supplied, expected):
+        request.state.mv_legacy_token = True
+
+
+@router.post("/api/scale-capture", dependencies=[Depends(_legacy_token_gate)])
 async def receive_scale_capture(
     payload: str = Form(...),
     device_id: str = Form("unknown"),

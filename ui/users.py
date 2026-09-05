@@ -1,27 +1,50 @@
-"""User accounts, sessions, and role-based access."""
+"""User accounts, sessions, and role-based access.
+
+B2 起 :class:`UserStore` 是 control.db（ui/control_store.py）之上的**兼容门面**：
+公开方法签名不变，既有 handler（auth.py / app.py）继续工作。真实模型是
+合同 §4.1 的 users + memberships + account_owners + platform_admins；
+``users.role`` 概念由控制面推导：
+
+- platform_admin                → 派生 legacy ``admin``
+- legacy-default membership:
+    - tenant_admin              → ``admin``
+    - operator                  → ``operator``
+    - viewer                    → ``viewer``
+- 其余（其他租户成员 / 无成员）  → ``viewer``（最小权限，业务写走 B3 的
+  TenantContext，不再经旧 role 通道）
+
+旧 ``users.db`` 文件保留原位不读不删，由 B7 迁移工具消费；seed admin 的
+MOUSEVISION_ADMIN_PASSWORD / 随机密码打印语义移入 ControlStore。
+"""
 
 from __future__ import annotations
 
-import hashlib
-import os
-import secrets
-import sqlite3
-import threading
-import uuid
-from datetime import datetime, timedelta
 from typing import Any
+
+from ui.control_store import (
+    LEGACY_TENANT_ID,
+    ControlStore,
+)
 
 ROLES = frozenset({"admin", "operator", "viewer"})
 SESSION_COOKIE = "mv_session"
 SESSION_DAYS = 7
 PBKDF2_ITERATIONS = 260_000
 
+# 兼容 re-export：hash_password / verify_password 的唯一实现在本文件，
+# control_store 反向延迟复用（避免循环导入）。
+
 
 def _now() -> str:
+    from datetime import datetime
+
     return datetime.now().isoformat(timespec="seconds")
 
 
 def hash_password(password: str, *, salt: str | None = None) -> tuple[str, str]:
+    import hashlib
+    import secrets
+
     salt_val = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
@@ -33,99 +56,42 @@ def hash_password(password: str, *, salt: str | None = None) -> tuple[str, str]:
 
 
 def verify_password(password: str, password_hash: str, salt: str) -> bool:
+    import secrets
+
     candidate, _ = hash_password(password, salt=salt)
     return secrets.compare_digest(candidate, password_hash)
 
 
+_LEGACY_ROLE_BY_MEMBERSHIP = {
+    "tenant_admin": "admin",
+    "operator": "operator",
+    "viewer": "viewer",
+}
+
+
 class UserStore:
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
-        self.lock = threading.Lock()
-        self._init_db()
-        self._seed_admin()
+    """control.db 兼容门面：旧签名进，旧形状出；不再是独立的登录真相源。"""
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def __init__(self, control_store: ControlStore) -> None:
+        self.control = control_store
+        self.lock = control_store.lock
 
-    def _init_db(self) -> None:
-        with self.lock:
-            conn = self._connect()
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS users (
-                        id TEXT PRIMARY KEY,
-                        username TEXT NOT NULL UNIQUE,
-                        password_hash TEXT NOT NULL,
-                        salt TEXT NOT NULL,
-                        role TEXT NOT NULL DEFAULT 'operator',
-                        display_name TEXT NOT NULL DEFAULT '',
-                        must_change_password INTEGER NOT NULL DEFAULT 0,
-                        disabled INTEGER NOT NULL DEFAULT 0,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        token TEXT PRIMARY KEY,
-                        user_id TEXT NOT NULL,
-                        expires_at TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    )
-                    """
-                )
-            finally:
-                conn.close()
+    # ------------------------------------------------------------------ #
+    # 派生 role
+    # ------------------------------------------------------------------ #
+    def _legacy_role(self, user_id: str) -> str:
+        if self.control.is_platform_admin(user_id):
+            return "admin"
+        membership = self.control.get_membership(user_id, LEGACY_TENANT_ID)
+        if membership is not None:
+            return _LEGACY_ROLE_BY_MEMBERSHIP.get(str(membership["role"]), "viewer")
+        return "viewer"
 
-    def _seed_admin(self) -> None:
-        if self.count() > 0:
-            return
-        configured = os.getenv("MOUSEVISION_ADMIN_PASSWORD", "").strip()
-        if configured:
-            default_pw = configured
-            generated = False
-        else:
-            default_pw = secrets.token_urlsafe(12)
-            generated = True
-        self.create_user(
-            username="admin",
-            password=default_pw,
-            role="admin",
-            display_name="超级管理员",
-            must_change_password=1,
-        )
-        if generated:
-            print(
-                "[MouseVision] 已创建管理员 admin，一次性随机密码："
-                f"{default_pw}（请立即登录并修改；也可设置 MOUSEVISION_ADMIN_PASSWORD）",
-                flush=True,
-            )
-        else:
-            print(
-                "[MouseVision] 已创建管理员 admin（使用 MOUSEVISION_ADMIN_PASSWORD），首次登录须改密",
-                flush=True,
-            )
-
-    def count(self) -> int:
-        with self.lock:
-            conn = self._connect()
-            try:
-                row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
-                return int(row["n"] if row else 0)
-            finally:
-                conn.close()
-
-    def _public(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _public(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": row["id"],
             "username": row["username"],
-            "role": row["role"],
+            "role": self._legacy_role(row["id"]),
             "display_name": row["display_name"] or row["username"],
             "must_change_password": bool(row["must_change_password"]),
             "disabled": bool(row["disabled"]),
@@ -133,42 +99,45 @@ class UserStore:
             "updated_at": row["updated_at"],
         }
 
+    # ------------------------------------------------------------------ #
+    # 查询
+    # ------------------------------------------------------------------ #
+    def count(self) -> int:
+        return self.control.count()
+
     def get_by_id(self, user_id: str) -> dict[str, Any] | None:
-        with self.lock:
-            conn = self._connect()
-            try:
-                row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-                return self._public(row) if row else None
-            finally:
-                conn.close()
+        row = self.control.get_user(user_id)
+        return self._public(row) if row else None
 
     def get_by_username(self, username: str) -> dict[str, Any] | None:
-        with self.lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT * FROM users WHERE username = ?", (username,)
-                ).fetchone()
-                if row is None:
-                    return None
-                data = self._public(row)
-                data["_password_hash"] = row["password_hash"]
-                data["_salt"] = row["salt"]
-                return data
-            finally:
-                conn.close()
+        row = self.control.get_user_by_username(username)
+        if row is None:
+            return None
+        data = self._public(row)
+        data["_password_hash"] = row["_password_hash"]
+        data["_salt"] = row["_salt"]
+        return data
 
     def list_users(self) -> list[dict[str, Any]]:
-        with self.lock:
-            conn = self._connect()
-            try:
-                rows = conn.execute(
-                    "SELECT * FROM users ORDER BY created_at ASC"
-                ).fetchall()
-                return [self._public(r) for r in rows]
-            finally:
-                conn.close()
+        return [self._public(u) for u in self.control.list_users()]
 
+    def list_tenants_for_user(self, user_id: str) -> list[dict[str, Any]]:
+        """登录响应附加字段：用户可进入的租户列表（含经 parent 的只读项）。"""
+        return [
+            {
+                "tenant_id": item["tenant_id"],
+                "account_id": item["account_id"],
+                "name": item["name"],
+                "slug": item["slug"],
+                "role": item["role"],
+                "status": item["status"],
+            }
+            for item in self.control.list_user_tenants(user_id)
+        ]
+
+    # ------------------------------------------------------------------ #
+    # 用户 CRUD（legacy 语义：role 落在 legacy-default membership 上）
+    # ------------------------------------------------------------------ #
     def create_user(
         self,
         *,
@@ -180,38 +149,21 @@ class UserStore:
     ) -> dict[str, Any]:
         if role not in ROLES:
             raise ValueError(f"invalid role: {role}")
-        user_id = str(uuid.uuid4())
-        pw_hash, salt = hash_password(password)
-        now = _now()
-        with self.lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO users (
-                        id, username, password_hash, salt, role, display_name,
-                        must_change_password, disabled, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-                    """,
-                    (
-                        user_id,
-                        username,
-                        pw_hash,
-                        salt,
-                        role,
-                        display_name or username,
-                        int(must_change_password),
-                        now,
-                        now,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise KeyError(f"username exists: {username}") from exc
-            finally:
-                conn.close()
-        user = self.get_by_id(user_id)
+        user = self.control.create_user(
+            username,
+            password,
+            display_name=display_name,
+            must_change_password=must_change_password,
+        )
+        legacy = self.control.ensure_legacy_default()
+        membership_role = {"admin": "tenant_admin"}.get(role, role)
+        try:
+            self.control.add_membership(user["id"], legacy["id"], membership_role)
+        except KeyError:
+            self.control.set_membership_role(user["id"], legacy["id"], membership_role)
+        user = self.control.get_user(user["id"])
         assert user is not None
-        return user
+        return self._public(user)
 
     def update_user(self, user_id: str, **changes: Any) -> dict[str, Any]:
         allowed = {"role", "display_name", "disabled", "must_change_password", "password"}
@@ -220,139 +172,54 @@ class UserStore:
             raise ValueError(f"unsupported user fields: {sorted(unknown)}")
         if "role" in changes and changes["role"] not in ROLES:
             raise ValueError(f"invalid role: {changes['role']}")
-        updates: dict[str, Any] = {}
-        for key in ("role", "display_name", "disabled", "must_change_password"):
-            if key in changes:
-                updates[key] = changes[key]
-        if "password" in changes:
-            pw_hash, salt = hash_password(changes["password"])
-            updates["password_hash"] = pw_hash
-            updates["salt"] = salt
-            updates["must_change_password"] = 0
-        if not updates:
-            user = self.get_by_id(user_id)
-            if user is None:
-                raise KeyError(user_id)
-            return user
-        updates["updated_at"] = _now()
-        columns = list(updates)
-        assignments = ", ".join(f"{name} = ?" for name in columns)
-        values = [updates[name] for name in columns]
-        with self.lock:
-            conn = self._connect()
-            try:
-                cur = conn.execute(
-                    f"UPDATE users SET {assignments} WHERE id = ?",
-                    (*values, user_id),
-                )
-                if cur.rowcount == 0:
-                    raise KeyError(user_id)
-                # Password changes invalidate all existing sessions.
-                if "password_hash" in updates:
-                    conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-            finally:
-                conn.close()
-        user = self.get_by_id(user_id)
-        assert user is not None
-        return user
+        role = changes.pop("role", None)
+        user = self.control.update_user(user_id, **changes)
+        if role is not None:
+            legacy = self.control.ensure_legacy_default()
+            membership_role = {"admin": "tenant_admin"}.get(role, role)
+            if self.control.get_membership(user_id, legacy["id"]) is None:
+                self.control.add_membership(user_id, legacy["id"], membership_role)
+            else:
+                self.control.set_membership_role(user_id, legacy["id"], membership_role)
+            user = self.control.get_user(user_id)
+            assert user is not None
+        return self._public(user)
+
+    def delete_user(self, user_id: str) -> None:
+        self.control.delete_user(user_id)
+
+    # ------------------------------------------------------------------ #
+    # 认证与会话
+    # ------------------------------------------------------------------ #
+    def authenticate(self, username: str, password: str) -> dict[str, Any] | None:
+        row = self.control.authenticate(username, password)
+        return self._public(row) if row else None
+
+    def create_session(self, user_id: str) -> str:
+        accounts = self.control.accounts_for_user(user_id)
+        account_id = accounts[0]["id"] if accounts else None
+        return self.control.create_session(user_id, account_id=account_id)
+
+    def resolve_session(self, token: str | None) -> dict[str, Any] | None:
+        session = self.control.resolve_session(token)
+        if session is None:
+            return None
+        row = self.control.get_user(session["user_id"])
+        if row is None or row["disabled"]:
+            return None
+        public = self._public(row)
+        return {
+            "id": public["id"],
+            "username": public["username"],
+            "role": public["role"],
+            "display_name": public["display_name"],
+            "must_change_password": public["must_change_password"],
+        }
+
+    def delete_session(self, token: str) -> None:
+        self.control.delete_session(token)
 
     def delete_sessions(
         self, user_id: str, *, keep_token: str | None = None
     ) -> int:
-        with self.lock:
-            conn = self._connect()
-            try:
-                if keep_token:
-                    cur = conn.execute(
-                        "DELETE FROM sessions WHERE user_id = ? AND token != ?",
-                        (user_id, keep_token),
-                    )
-                else:
-                    cur = conn.execute(
-                        "DELETE FROM sessions WHERE user_id = ?", (user_id,)
-                    )
-                return int(cur.rowcount)
-            finally:
-                conn.close()
-
-    def delete_user(self, user_id: str) -> None:
-        with self.lock:
-            conn = self._connect()
-            try:
-                conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-                cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-                if cur.rowcount == 0:
-                    raise KeyError(user_id)
-            finally:
-                conn.close()
-
-    def authenticate(self, username: str, password: str) -> dict[str, Any] | None:
-        user = self.get_by_username(username)
-        if user is None or user.get("disabled"):
-            return None
-        if not verify_password(password, user["_password_hash"], user["_salt"]):
-            return None
-        public = {k: v for k, v in user.items() if not k.startswith("_")}
-        return public
-
-    def create_session(self, user_id: str) -> str:
-        token = secrets.token_urlsafe(32)
-        now = datetime.now()
-        expires = (now + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds")
-        with self.lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO sessions (token, user_id, expires_at, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (token, user_id, expires, _now()),
-                )
-            finally:
-                conn.close()
-        return token
-
-    def resolve_session(self, token: str | None) -> dict[str, Any] | None:
-        if not token:
-            return None
-        with self.lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    """
-                    SELECT s.token, s.expires_at, u.*
-                    FROM sessions s
-                    JOIN users u ON u.id = s.user_id
-                    WHERE s.token = ?
-                    """,
-                    (token,),
-                ).fetchone()
-            finally:
-                conn.close()
-        if row is None:
-            return None
-        try:
-            expires = datetime.fromisoformat(row["expires_at"])
-        except ValueError:
-            return None
-        if expires < datetime.now():
-            self.delete_session(token)
-            return None
-        if row["disabled"]:
-            return None
-        return {
-            "id": row["id"],
-            "username": row["username"],
-            "role": row["role"],
-            "display_name": row["display_name"] or row["username"],
-            "must_change_password": bool(row["must_change_password"]),
-        }
-
-    def delete_session(self, token: str) -> None:
-        with self.lock:
-            conn = self._connect()
-            try:
-                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-            finally:
-                conn.close()
+        return self.control.delete_sessions_for_user(user_id, keep_token=keep_token)

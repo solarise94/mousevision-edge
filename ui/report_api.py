@@ -7,14 +7,18 @@ on-disk layout as ``realtime_finalize`` (``run_*/mouse_NNN/record.json``
 + sibling ``photo.jpg``), so they appear in every existing page that
 reads from the registry / ``collect_records``.
 
-Endpoint: ``POST /api/records/report`` (multipart/form-data).
+Endpoint: ``POST /api/records/report`` (multipart/form-data; 也接受
+application/json —— legacy v1 outbox 兼容 flush 载荷)。
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 import math
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +26,8 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
+from starlette.datastructures import UploadFile
 from fastapi.responses import JSONResponse
 
 from mousevision.run import (
@@ -38,6 +43,35 @@ log = logging.getLogger("report_api")
 
 router = APIRouter()
 
+
+def _resolve_ctx(request: Request) -> Any:
+    """fail-closed 的 TenantContext；裸 router 测试装配返回 None。"""
+    if _factory is None:
+        _legacy_token_gate(request)
+        return None
+    ctx = _factory.context_from_request(request)
+    if getattr(ctx, "actor_type", "") == "legacy_token":
+        # B4 兼容窗口：legacy 令牌响应加可观测 deprecation 标记（Review S4；
+        # 不记 token 本身）。标记由 app 级中间件转成 X-MV-Deprecated-Token 响应头。
+        request.state.mv_legacy_token = True
+    return ctx
+
+
+def _legacy_token_gate(request: Request) -> None:
+    """裸 router（无 factory）装配的旧 token 门，仅供隔离的测试 app 使用。
+
+    语义 = B4 之前的 require_api_token：配置了 MOUSEVISION_API_TOKEN 则必须
+    匹配，未配置则放行。生产 app 恒走 factory 的 fail-closed 解析层。
+    """
+    import os
+
+    expected = os.getenv("MOUSEVISION_API_TOKEN", "").strip()
+    if not expected:
+        return
+    supplied = request.headers.get("x-mousevision-token", "").strip()
+    if supplied != expected:
+        raise HTTPException(status_code=401, detail="无效或缺少 API token")
+
 # Upper bound for a single weight value in grams. Matches the spec's
 # [0, 6553.5] envelope (uint16 decigram representation).
 _MAX_WEIGHT_G = 6553.5
@@ -45,12 +79,15 @@ _PLACEHOLDER_W, _PLACEHOLDER_H = 640, 480
 
 
 # --------------------------------------------------------------------------- #
-# Wiring: the app calls configure() once at import time to hand over the
-# same singletons (registry / records_meta / upload_queue / output_root)
-# that the rest of the UI reads from, so reported records are visible
-# everywhere without duplication.
+# Wiring（B3，合同 §14.2 / §15-B3）：本模块不再持有一次性 configure 进来的全局
+# 单例。生产 app 注入 TenantStoreFactory；请求时经 TenantContext 解析租户，
+# output_root / registry / upload_queue / boxes_store 全部取自该租户的
+# TenantStores。``persist_report_records()`` 仍是唯一落盘核心（调用方注入根）。
+# factory 为 None 时是裸 router 测试装配（无租户语义，等价旧行为）。
 # --------------------------------------------------------------------------- #
 
+_factory: Any = None
+# 裸 router 测试装配的全局单例（生产 app 不使用；B0.4 #12 的过渡保留）。
 _registry: Any = None
 _records_meta: Any = None
 _upload_queue: Any = None
@@ -59,18 +96,50 @@ _boxes_store: Any = None
 
 
 def configure(
-    registry: Any,
-    records_meta: Any,
-    upload_queue: Any,
-    output_root: str | Path,
-    boxes_store: Any = None,
+    factory: Any | None = None,
+    registry: Any | None = None,
+    records_meta: Any | None = None,
+    upload_queue: Any | None = None,
+    output_root: str | Path | None = None,
+    boxes_store: Any | None = None,
 ) -> None:
-    global _registry, _records_meta, _upload_queue, _output_root, _boxes_store
+    """生产 app：``configure(factory)``。测试装配可继续传全局单例（无租户）。"""
+    global _factory, _registry, _records_meta, _upload_queue, _output_root, _boxes_store
+    _factory = factory
     _registry = registry
     _records_meta = records_meta
     _upload_queue = upload_queue
-    _output_root = Path(output_root)
+    _output_root = Path(output_root) if output_root is not None else Path(".")
     _boxes_store = boxes_store
+
+
+def _tenant_wiring(ctx: Any) -> dict[str, Any]:
+    """按请求上下文返回该租户的落盘接线（root + store 集）。
+
+    factory 模式下 ctx 为 account 级（tenant_id 为空：platform / parent /
+    未激活 / paused 租户会话）→ 显式 403（Review S1 修复）：业务落盘必须有
+    激活工作区，绝不回落裸 router 的默认根（否则 run_* 落进程 CWD）。
+    裸 router 测试装配（factory=None）行为不变。
+    """
+    if _factory is not None:
+        if ctx is None or not getattr(ctx, "tenant_id", ""):
+            raise HTTPException(
+                status_code=403,
+                detail="请先激活工作区后再上报数据（当前会话无激活工作区）",
+            )
+        stores = _factory.stores(ctx.tenant_id)
+        return {
+            "output_root": stores.output_root,
+            "registry": stores.registry,
+            "upload_queue": stores.upload_queue,
+            "boxes_store": stores.box_registry,
+        }
+    return {
+        "output_root": _output_root,
+        "registry": _registry,
+        "upload_queue": _upload_queue,
+        "boxes_store": _boxes_store,
+    }
 
 
 def _existing_record_dir_for(
@@ -376,43 +445,154 @@ async def _read_dev_readings(upload: UploadFile) -> tuple[dict | None, str | Non
     return parsed, None
 
 
-@router.post("/api/records/report", dependencies=[Depends(require_api_token)])
+@router.post("/api/records/report")
 async def report_records(
-    cage_id: str = Form(...),
-    project_id: str = Form("default"),
-    device_id: str = Form("unknown"),
-    weight_source: str = Form("device_report"),
-    strain: str | None = Form(None),
-    records: str = Form(...),
-    video: UploadFile | None = File(None),
-    readings: UploadFile | None = File(None),
-    photos: list[UploadFile] = File(default_factory=list),
+    request: Request,
+    ctx: Any = Depends(_resolve_ctx),
 ) -> JSONResponse:
     """Receive a batch of device-judged weighing records.
 
     One successful upload = one run directory. Each reported record lands
     in ``mouse_NNN/`` with ``record.json`` + ``photo.jpg`` and (if a video
     was attached) the evidence video is stored once at run scope.
+
+    请求形态（B5）：multipart/form-data（主通道：records 文本 part + photos/
+    video/readings 文件 part）或 application/json（legacy v1 outbox 兼容 flush
+    载荷：{tenant_id, cage_id, ..., records, readings?}，照片以 dataURL 内嵌在
+    records 里，服务端解码；JSON 通道无法携带视频 Blob）。两种形态走同一个
+    ``persist_report_records()`` 落盘核心。
+
+    鉴权（合同 §6.2/§15-B3）：设备凭证（mvdev_ Bearer 或 X-MouseVision-Token
+    先查设备表）与 legacy 共享令牌（写死 legacy-default）均可；经
+    TenantContext 解析租户，落盘根 = ``output/tenants/<tenant_id>/``；客户端
+    传的 tenant/project/cage 字段不参与解析。
     """
-    cage = (cage_id or "").strip()
+    wiring = _tenant_wiring(ctx)
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("application/json"):
+        return await _report_from_json(request, wiring)
+
+    form = await request.form()
+    cage = _form_text(form, "cage_id")
     if not cage:
         raise HTTPException(status_code=400, detail="cage_id 不能为空")
-    project = (project_id or "default").strip() or "default"
-    device = (device_id or "unknown").strip() or "unknown"
-    wsrc = (weight_source or "device_report").strip() or "device_report"
+    project = _form_text(form, "project_id") or "default"
+    device = _form_text(form, "device_id") or "unknown"
+    wsrc = _form_text(form, "weight_source") or "device_report"
+    strain = _form_text(form, "strain") or None
+    records = form.get("records")
+    video = form.get("video") if isinstance(form.get("video"), UploadFile) else None
+    readings = form.get("readings") if isinstance(form.get("readings"), UploadFile) else None
+    photos = [up for up in form.getlist("photos") if isinstance(up, UploadFile)]
 
     return await persist_report_records(
-        output_root=_output_root,
-        registry=_registry,
-        upload_queue=_upload_queue,
-        boxes_store=_boxes_store,
+        output_root=wiring["output_root"],
+        registry=wiring["registry"],
+        upload_queue=wiring["upload_queue"],
+        boxes_store=wiring["boxes_store"],
         cage=cage,
         project=project,
         device=device,
         wsrc=wsrc,
         strain=strain,
-        records=records,
+        records=records if isinstance(records, str) else "",
         video=video,
+        readings=readings,
+        photos=photos,
+        mode="device_report",
+        finish_status="device_report",
+        log_prefix="report_api",
+    )
+
+
+def _form_text(form: Any, key: str) -> str:
+    value = form.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+# JSON 通道整体 body 上限（照片以 dataURL 内嵌，量级 = multipart 的 photos 之和）。
+_JSON_BODY_MAX_BYTES = 64 * 1024 * 1024
+_DATA_URL_RX = re.compile(r"^data:([^;,]+);base64,(.*)$", re.DOTALL)
+
+
+def _decode_data_url(value: str) -> bytes | None:
+    """客户端确认瞬间照片 dataURL → 原始字节（魔数校验不过 → None 跳过）。"""
+    match = _DATA_URL_RX.match(value or "")
+    if not match:
+        return None
+    try:
+        data = base64.b64decode(match.group(2), validate=False)
+    except (ValueError, TypeError):
+        return None
+    if not data or not _looks_like_image(data):
+        return None
+    return data
+
+
+def _shim_upload(filename: str, data: bytes) -> UploadFile:
+    """把内存字节包成 persist 核心期望的 UploadFile 形状（JSON 通道专用）。"""
+    return UploadFile(file=io.BytesIO(data), filename=filename)
+
+
+async def _report_from_json(request: Request, wiring: dict[str, Any]) -> JSONResponse:
+    """application/json 载荷 → 与 multipart 等价的落盘（legacy v1 flush 兼容）。
+
+    批次内快照的 ``tenant_id`` 只作客户端自证，不参与租户解析（§4.3：租户只
+    来自凭证）。照片取 records[].photo 的 dataURL 解码；readings 为内嵌 JSON
+    对象；JSON 通道不支持视频 Blob（客户端已注释该取舍）。
+    """
+    body = await request.body()
+    if len(body) > _JSON_BODY_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="report 载荷过大")
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"body 不是合法 JSON: {exc}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="report 载荷必须是 JSON 对象")
+
+    cage = str(payload.get("cage_id") or "").strip()
+    if not cage:
+        raise HTTPException(status_code=400, detail="cage_id 不能为空")
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise HTTPException(status_code=400, detail="records 必须是 JSON 数组")
+
+    photos: list[UploadFile] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        photo = rec.get("photo")
+        if not isinstance(photo, str) or not photo:
+            continue
+        decoded = _decode_data_url(photo)
+        if decoded is None:
+            continue
+        stem = re.sub(r"[^A-Za-z0-9_-]", "", str(rec.get("record_id") or ""))
+        if not stem:
+            continue
+        photos.append(_shim_upload(f"{stem}.jpg", decoded))
+
+    readings_payload = payload.get("readings")
+    readings: UploadFile | None = None
+    if isinstance(readings_payload, dict) and readings_payload:
+        readings = _shim_upload(
+            "readings.json",
+            json.dumps(readings_payload, ensure_ascii=False).encode("utf-8"),
+        )
+
+    return await persist_report_records(
+        output_root=wiring["output_root"],
+        registry=wiring["registry"],
+        upload_queue=wiring["upload_queue"],
+        boxes_store=wiring["boxes_store"],
+        cage=cage,
+        project=str(payload.get("project_id") or "default").strip() or "default",
+        device=str(payload.get("device_id") or "unknown").strip() or "unknown",
+        wsrc=str(payload.get("weight_source") or "device_report").strip() or "device_report",
+        strain=(str(payload.get("strain")).strip() or None) if payload.get("strain") else None,
+        records=json.dumps(records, ensure_ascii=False),
+        video=None,
         readings=readings,
         photos=photos,
         mode="device_report",

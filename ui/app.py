@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from mousevision.clip import clip_bounds_from_record
 from mousevision.detector import WeighingState
 from mousevision.driver import SessionDriver, SessionSavedEvent
-from mousevision.jobs import AnalysisJobManager, JobStore, _parse_preview_crop
+from mousevision.jobs import AnalysisJobManager, _parse_preview_crop
 from mousevision.pipeline import load_config
 from mousevision.reject_recovery import (
     clear_reject_journal,
@@ -50,22 +50,17 @@ from mousevision.source.video import VideoFileSource
 from mousevision.upload_queue import UploadQueue
 from ui.audit import AuditStore
 from ui.auth import (
-    api_token,
     check_login_rate_limit,
     clear_login_failures,
     cookie_secure,
     current_user,
     record_login_failure,
-    require_active_user,
-    require_api_token,
-    require_admin_session,
     require_role,
-    require_token_or_operator,
     require_user,
-    require_write_access,
     set_user_store,
 )
-from ui.boxes import BoxRegistry, qr_payload, strain_from_cage
+from ui.boxes import qr_payload, strain_from_cage
+from ui.control_store import ControlStore
 from ui.records_api import (
     collect_records,
     export_csv,
@@ -74,9 +69,18 @@ from ui.records_api import (
     overview_stats,
     verify_cages_view,
 )
-from ui.records_meta import RecordsMetaStore
 from ui.registry import MouseRegistry
-from ui.settings import SettingsStore
+from ui.tenant_context import (
+    ROLE_DEVICE,
+    ROLE_OPERATOR,
+    ROLE_PARENT_OWNER,
+    ROLE_PLATFORM_ADMIN,
+    ROLE_TENANT_ADMIN,
+    ROLE_VIEWER,
+    TenantContext,
+)
+from ui.tenant_jobs import TenantJobDispatcher
+from ui.tenant_stores import TenantStoreFactory, TenantStores
 from ui.users import SESSION_COOKIE, UserStore
 import ui.realtime_api as realtime_api
 import ui.scale_sync_api as scale_sync_api
@@ -86,16 +90,13 @@ STATIC = Path(__file__).resolve().parent / "static"
 DEFAULT_VIDEO = ROOT / "RefVideo" / "9494224d488d6e735c0f108cc5562a2d.mp4"
 DEFAULT_CONFIG = ROOT / "configs" / "scale_refvideo.yaml"
 DEFAULT_TEMPLATES = ROOT / "assets" / "templates"
+# 总根（合同 §5/§15-B3）：只承载控制面（control/）、租户目录（tenants/）、
+# share 通道（shared/）与研发采集（scale_captures/）；业务记录一律进租户目录。
 DEFAULT_OUTPUT = Path(os.getenv("MOUSEVISION_OUTPUT_DIR", str(ROOT / "output"))).resolve()
-REGISTRY_PATH = DEFAULT_OUTPUT / "mice_registry.json"
-QUEUE_DB = DEFAULT_OUTPUT / "upload_queue.db"
-JOB_DB = DEFAULT_OUTPUT / "jobs.db"
-BOX_DB = DEFAULT_OUTPUT / "boxes.db"
-META_DB = DEFAULT_OUTPUT / "records_meta.db"
+# 旧 users.db / audit.db 路径保留给 B7 迁移工具消费；门面不再读写旧 users.db。
 USERS_DB = DEFAULT_OUTPUT / "users.db"
-AUDIT_DB = DEFAULT_OUTPUT / "audit.db"
-SETTINGS_PATH = DEFAULT_OUTPUT / "settings.json"
-JOB_UPLOAD_ROOT = DEFAULT_OUTPUT / "job_uploads"
+CONTROL_DB = DEFAULT_OUTPUT / "control" / "control.db"
+AUDIT_DB = DEFAULT_OUTPUT / "control" / "audit.db"
 MAX_UPLOAD_BYTES = int(os.getenv("MOUSEVISION_MAX_UPLOAD_MB", "250")) * 1024 * 1024
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -114,12 +115,9 @@ def _strain_from_cage(cage_id: str) -> str:
     return "C57BL/6" if cage_id.upper().startswith("C57") else "-"
 
 
-def _inject_api_token(html: str) -> str:
-    token = api_token()
-    if not token:
-        return html
-    meta = f'  <meta name="mousevision-api-token" content="{token}" />\n'
-    return html.replace("</head>", f"{meta}</head>", 1)
+# B5（合同 §6.1/§15-B5）：共享写 token 不再注入任何 HTML（旧 `_inject_api_token`
+# 已删除）。云版 H5 通过 /api/control/devices/bind|login 获取设备凭证后自带
+# 请求头；local 版无实验室同步凭证。/mobile HTML 仍公开可访问（§6.1）。
 
 
 from mousevision.detect import detect_mouse_box as _detect_mouse_box
@@ -208,7 +206,12 @@ class SessionState:
 
 
 class PlaybackEngine:
-    def __init__(self, registry: MouseRegistry, upload_queue: UploadQueue) -> None:
+    def __init__(
+        self,
+        registry: MouseRegistry,
+        upload_queue: UploadQueue,
+        output_root: str | Path | None = None,
+    ) -> None:
         self.lock = threading.Lock()
         self.state = SessionState()
         self._thread: threading.Thread | None = None
@@ -217,7 +220,9 @@ class PlaybackEngine:
         self.video_path = DEFAULT_VIDEO
         self.config_path = DEFAULT_CONFIG
         self.templates_dir = DEFAULT_TEMPLATES
-        self.output_root = DEFAULT_OUTPUT
+        # 租户实例的写根（§2.6/§6.3）：由 factory 按租户注入；缺省仅用于
+        # 测试直接构造（等价旧行为）。
+        self.output_root = Path(output_root) if output_root is not None else DEFAULT_OUTPUT
         self.playback_speed = 1.0
         self.registry = registry
         self.upload_queue = upload_queue
@@ -695,73 +700,140 @@ class PlaybackEngine:
                         self.state.message = "回放结束"
 
 
-registry = MouseRegistry(REGISTRY_PATH, DEFAULT_OUTPUT)
-upload_queue = UploadQueue(QUEUE_DB)
-engine = PlaybackEngine(registry, upload_queue)
-job_store = JobStore(JOB_DB)
-box_registry = BoxRegistry(BOX_DB)
-records_meta = RecordsMetaStore(str(META_DB))
-# Share the upload queue with the realtime API so finalized realtime records
-# enter the same cloud-sync queue as offline analysis records.
-realtime_api.set_upload_queue(upload_queue)
-user_store = UserStore(str(USERS_DB))
+# 控制面（合同 §15-B2）：control.db + 租户 store 工厂 + UserStore 兼容门面。
+# B3 起（§15-B3 / B0.4 单例表）：业务 store 不再有模块级全局单例——业务 handler
+# 一律经 ``tenant_factory.stores(ctx.tenant_id)`` 取该租户的 store 集；
+# PlaybackEngine / AnalysisJobManager 等重对象按租户挂在 TenantStores.extra。
+control_store = ControlStore(str(CONTROL_DB))
+user_store = UserStore(control_store)
+tenant_factory = TenantStoreFactory(DEFAULT_OUTPUT, control_store)
+tenant_factory.ensure_legacy_default()
 audit_store = AuditStore(str(AUDIT_DB))
-settings_store = SettingsStore(SETTINGS_PATH)
 set_user_store(user_store)
 
 
-def _reserve_ordinals(cage_id: str, count: int, project_id: str) -> int:
-    return box_registry.reserve_ordinal(
-        cage_id,
-        count=count,
-        project_id=project_id,
-        baseline_records=DEFAULT_OUTPUT,
+def _build_playback_engine(stores: TenantStores) -> PlaybackEngine:
+    """按租户构建回放引擎：status/stream/photo/start/stop 禁止全局串台（§2.6）。"""
+    return PlaybackEngine(
+        stores.registry,
+        stores.upload_queue,
+        output_root=stores.output_root,
     )
 
 
-def _release_ordinals(cage_id: str, ordinal: int) -> None:
-    box_registry.release_ordinal(cage_id, ordinal)
+def _build_job_manager(stores: TenantStores) -> AnalysisJobManager:
+    """按租户构建分析管理器（单 worker 由 TenantJobDispatcher 驱动，§6.3）。"""
+
+    def _reserve(cage_id: str, count: int, project_id: str) -> int:
+        # ordinal 债务（§15-B3）：baseline 一律喂租户根，绝不扫全局根。
+        return stores.box_registry.reserve_ordinal(
+            cage_id,
+            count=count,
+            project_id=project_id,
+            baseline_records=stores.output_root,
+        )
+
+    def _release(cage_id: str, ordinal: int) -> None:
+        stores.box_registry.release_ordinal(cage_id, ordinal)
+
+    return AnalysisJobManager(
+        stores.job_store,
+        output_root=stores.output_root,
+        config_path=DEFAULT_CONFIG,
+        templates_dir=DEFAULT_TEMPLATES,
+        reserve_ordinals=_reserve,
+        release_ordinals=_release,
+        upload_queue=stores.upload_queue,
+    )
 
 
-job_manager = AnalysisJobManager(
-    job_store,
-    output_root=DEFAULT_OUTPUT,
-    config_path=DEFAULT_CONFIG,
-    templates_dir=DEFAULT_TEMPLATES,
-    reserve_ordinals=_reserve_ordinals,
-    release_ordinals=_release_ordinals,
-    upload_queue=upload_queue,
-)
+tenant_factory.register_extra_builder("playback", _build_playback_engine)
+tenant_factory.register_extra_builder("job_manager", _build_job_manager)
+# 单 worker 约束不变：跨租户共用一条分析队列/线程（§13.3）。
+job_dispatcher = TenantJobDispatcher(tenant_factory)
 
 
-def _audit(actor: str, action: str, **kwargs: Any) -> None:
-    audit_store.log(actor=actor, action=action, **kwargs)
+# ---- 请求级租户依赖（合同 §4.3 / §6.1 / §15-B3） --------------------------- #
+_READ_ROLES = frozenset({ROLE_VIEWER, ROLE_OPERATOR, ROLE_TENANT_ADMIN, ROLE_PARENT_OWNER})
+_WRITE_ROLES = frozenset({ROLE_OPERATOR, ROLE_TENANT_ADMIN})
+
+
+def _tenant_ctx(request: Request) -> TenantContext:
+    """解析 TenantContext（会话/设备/legacy，fail-closed 401）。"""
+    ctx = tenant_factory.context_from_request(request)
+    if ctx.actor_type == "legacy_token":
+        # B4 兼容窗口：legacy 令牌响应加可观测 deprecation 标记（不记 token）。
+        request.state.mv_legacy_token = True
+    return ctx
+
+
+def _read_ctx(request: Request) -> TenantContext:
+    """业务读：viewer/operator/tenant_admin + parent_owner（§4.2 默认只读）。"""
+    ctx = _tenant_ctx(request)
+    if not ctx.has_role(*_READ_ROLES):
+        raise HTTPException(status_code=403, detail="权限不足")
+    return ctx
+
+
+def _write_ctx(request: Request) -> TenantContext:
+    """业务写：operator/tenant_admin（设备上下文含 operator 可写；parent 不可写）。"""
+    ctx = _tenant_ctx(request)
+    tenant_factory.require_role(ctx, *_WRITE_ROLES)
+    return ctx
+
+
+def _stores(ctx: TenantContext) -> TenantStores:
+    try:
+        return tenant_factory.stores(ctx.tenant_id)
+    except KeyError as exc:
+        # 租户不存在/未激活：业务统一 404（§6.1，不 403）。
+        raise HTTPException(status_code=404, detail="资源不存在") from exc
+
+
+def _audit(actor: str, action: str, ctx: TenantContext | None = None, **kwargs: Any) -> None:
+    """租户业务审计带 tenant_id/account_id/actor_type 三字段（§6.4）。"""
+    audit_store.log(
+        actor=actor,
+        action=action,
+        tenant_id=(ctx.tenant_id or None) if ctx is not None else None,
+        account_id=(ctx.account_id or None) if ctx is not None else None,
+        actor_type=(ctx.actor_type if ctx is not None else None),
+        **kwargs,
+    )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Repair any half-applied renumber from a crash, then seed box ordinals.
-    for run in registry.list_runs():
-        restore_renumber_temps(Path(run["path"]))
-    # Finish crash-interrupted reject-suspect (rename/rmtree/queue/meta).
-    # Per-run flock is taken inside recover; prefer journal item actor over system.
-    try:
-        recover_reject_state(
-            DEFAULT_OUTPUT,
-            upload_queue=upload_queue,
-            mark_meta_deleted=lambda rid, operator="system": records_meta.update(
-                rid, status="deleted", operator=operator
-            ),
-            default_actor="system",
-        )
-    except Exception:
-        pass
-    box_registry.sync_from_records(DEFAULT_OUTPUT)
-    job_manager.start()
+    # 按租户恢复（§15-B3）：repair half-applied renumber、补 reject 恢复、
+    # 从记录播种 box ordinal —— 全部只对 control 中 active 的租户执行。
+    for tenant in tenant_factory.active_tenants():
+        tid = str(tenant["id"])
+        try:
+            stores = tenant_factory.stores(tid)
+        except KeyError:
+            continue
+        for run in stores.registry.list_runs():
+            restore_renumber_temps(Path(run["path"]))
+        try:
+            recover_reject_state(
+                stores.output_root,
+                upload_queue=stores.upload_queue,
+                mark_meta_deleted=lambda rid, operator="system": stores.records_meta.update(
+                    rid, status="deleted", operator=operator
+                ),
+                default_actor="system",
+            )
+        except Exception:
+            pass
+        stores.box_registry.sync_from_records(stores.output_root)
+    # 启动时已存在租户目录但无租户行的孤儿目录：报告不崩溃（§15-B3）。
+    for orphan in tenant_factory.orphan_tenant_dirs():
+        print(f"[MouseVision] 警告：发现无租户行的孤儿目录 {orphan.name}（未处理）", flush=True)
+    job_dispatcher.start()
     try:
         yield
     finally:
-        job_manager.stop()
+        job_dispatcher.stop()
 
 
 # ---- Defense-in-depth: 抬高 multipart 文本 part 上限 ----
@@ -801,26 +873,70 @@ app.add_middleware(
     allow_headers=["X-MouseVision-Token", "Content-Type"],
 )
 
-# Realtime weighing WebSocket + REST API
-realtime_api.configure(DEFAULT_CONFIG, str(DEFAULT_OUTPUT))
+
+def _same_origin_allowed(request: Request) -> bool:
+    """Cookie 会话写请求的同源（CSRF）校验（合同 §15-B4）。
+
+    规则：写方法（非 GET/HEAD/OPTIONS）且请求携带会话 Cookie 时，要求
+    Origin 或 Referer 的 host 与请求 Host 一致；二者都缺省时放行。
+    放行理由：CSRF 的攻击面是浏览器跨站请求自动附带 Cookie —— 现代浏览器
+    对跨站请求必带 Origin（受保护、不可伪造），缺 Origin/Referer 的是非浏览器
+    客户端（设备/脚本），它们不会自动附带环境 Cookie，不存在 CSRF 攻击面；
+    且会话 Cookie 已设 SameSite=Lax，跨站 POST 本就不携带。CORS 仍只放行打包
+    origin，与本项目其他来源策略互不影响。
+    设备/令牌通道（无 Cookie）与 share/bind 通道不受此约束。
+    """
+    host = (request.headers.get("host") or "").strip().lower()
+    if not host:
+        return True  # HTTP/1.0 极端场景；无 Host 无法构建跨站攻击面
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+
+    def _netloc(value: str) -> str:
+        from urllib.parse import urlparse
+
+        try:
+            parsed = urlparse(value)
+        except ValueError:
+            return ""
+        return (parsed.netloc or "").strip().lower()
+
+    if origin is not None:
+        return _netloc(origin) == host
+    if referer:
+        return _netloc(referer) == host
+    return True
+
+
+@app.middleware("http")
+async def _mv_tenant_http_guard(request: Request, call_next):
+    """两个横切职责（§15-B4）：
+    1) Cookie 会话写请求的同源校验（CSRF）；
+    2) legacy 共享令牌响应的 deprecation 观测标记（依赖在解析 ctx 时打上
+       request.state.mv_legacy_token；绝不记录 token 本身）。
+    """
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and request.cookies.get(SESSION_COOKIE):
+        if not _same_origin_allowed(request):
+            return JSONResponse({"detail": "跨站写请求被拒绝（CSRF 同源校验失败）"}, status_code=403)
+    response = await call_next(request)
+    if getattr(request.state, "mv_legacy_token", False):
+        response.headers["X-MV-Deprecated-Token"] = "1"
+    return response
+
+
+# Realtime weighing WebSocket + REST API（B3：注入 factory，会话固化租户）
+realtime_api.configure(DEFAULT_CONFIG, str(DEFAULT_OUTPUT), factory=tenant_factory)
 app.include_router(realtime_api.router)
 
-# Offline scale — phone clock calibration (MVP, see docs/SCALE_TIME_SYNC_MVP.md)
-scale_sync_api.configure(str(DEFAULT_OUTPUT))
+# Offline scale — phone clock calibration（B3：每租户 scale_sync.db + scale_sync/）
+scale_sync_api.configure(factory=tenant_factory)
 app.include_router(scale_sync_api.router)
 
 # Device-direct weighing report (pure-app: phone judges, server only persists).
-# Shares the same registry / records_meta / upload_queue singletons so reported
-# records appear everywhere offline-analysed records do.
+# B3：不再注入全局单例；请求时按 TenantContext 解析租户 root/store。
 import ui.report_api as report_api  # noqa: E402
 
-report_api.configure(
-    registry=registry,
-    records_meta=records_meta,
-    upload_queue=upload_queue,
-    output_root=str(DEFAULT_OUTPUT),
-    boxes_store=box_registry,
-)
+report_api.configure(tenant_factory)
 app.include_router(report_api.router)
 
 # Public data-sharing (local edition opt-in upload): same multipart shape as
@@ -838,6 +954,19 @@ import ui.capture_api as capture_api  # noqa: E402
 
 capture_api.configure(str(DEFAULT_OUTPUT))
 app.include_router(capture_api.router)
+
+# 控制面 API（平台/主账号/工作区管理、设备凭证、绑定码、会话租户切换）。
+import ui.control_api as control_api  # noqa: E402
+
+control_api.configure(control_store, tenant_factory)
+app.include_router(control_api.router)
+
+# 主账号 account 级汇总与跨工作区只读导出（B6，合同 §4.2/§15-B6）：
+# parent_owner / platform_admin 专用，逐租户扇出只读，不触碰业务写路径。
+import ui.account_api as account_api  # noqa: E402
+
+account_api.configure(control_store, tenant_factory)
+app.include_router(account_api.router)
 
 
 class _NoCacheStaticFiles(StaticFiles):
@@ -891,7 +1020,7 @@ def _html(content: str) -> HTMLResponse:
 
 @app.get("/legacy", response_class=HTMLResponse)
 def legacy_index() -> HTMLResponse:
-    return _html(_inject_api_token((STATIC / "index.html").read_text(encoding="utf-8")))
+    return _html((STATIC / "index.html").read_text(encoding="utf-8"))
 
 
 @app.get("/pc", response_class=HTMLResponse)
@@ -907,7 +1036,7 @@ def pc_spa(path: str) -> HTMLResponse:
 
 @app.get("/mobile", response_class=HTMLResponse)
 def mobile_index() -> HTMLResponse:
-    return _html(_inject_api_token((STATIC / "mobile.html").read_text(encoding="utf-8")))
+    return _html((STATIC / "mobile.html").read_text(encoding="utf-8"))
 
 
 @app.get("/mobile/{path:path}", response_class=HTMLResponse)
@@ -916,16 +1045,15 @@ def mobile_spa(path: str) -> HTMLResponse:
 
     `/api/*` and `/static/*` are separate routes and are not affected.
     """
-    return _html(_inject_api_token((STATIC / "mobile.html").read_text(encoding="utf-8")))
+    return _html((STATIC / "mobile.html").read_text(encoding="utf-8"))
 
 
 @app.get("/api/health")
 def api_health() -> dict[str, Any]:
+    """进程探活（§6.1）：只回 ok/service，不带任何业务/租户计数。"""
     return {
         "ok": True,
         "service": "mousevision",
-        "analysis_worker": "running",
-        "active_jobs": job_store.active_count(),
     }
 
 
@@ -941,17 +1069,17 @@ def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
-def _resolve_job_run_dir(job: dict[str, Any]) -> Path | None:
-    """Locate the on-disk run directory for a completed job's run_id."""
+def _resolve_job_run_dir(job: dict[str, Any], stores: TenantStores) -> Path | None:
+    """Locate the on-disk run directory for a completed job's run_id (tenant-scoped)."""
     run_id = str(job.get("run_id") or "").strip()
     if not run_id:
         return None
-    for run in registry.list_runs():
+    for run in stores.registry.list_runs():
         if str(run.get("run_id")) == run_id:
             path = Path(str(run.get("path") or ""))
             return path if path.is_dir() else None
-    # Fallback: scan output root for matching manifest short id / full id.
-    for run_dir in DEFAULT_OUTPUT.glob("run_*"):
+    # Fallback: scan the TENANT output root for matching manifest short id / full id.
+    for run_dir in stores.output_root.glob("run_*"):
         if not run_dir.is_dir():
             continue
         manifest = load_manifest(run_dir) or {}
@@ -983,7 +1111,7 @@ def _upload_suffix(filename: str | None, content_type: str | None) -> str:
     return ".video"
 
 
-@app.post("/api/jobs", dependencies=[Depends(require_api_token)])
+@app.post("/api/jobs")
 async def api_create_job(
     cage_id: str = Form(...),
     project_id: str = Form("default"),
@@ -994,8 +1122,10 @@ async def api_create_job(
     capture_mode: str | None = Form(None),
     capture_meta: str | None = Form(None),
     video: UploadFile = File(...),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> JSONResponse:
-    """Upload one video and enqueue a run-scoped analysis job."""
+    """Upload one video and enqueue a run-scoped analysis job（租户内，§15-B3）。"""
+    stores = _stores(ctx)
     cage = _clean_id(cage_id, field_name="箱号")
     project = _clean_id(project_id or "default", field_name="项目号")
     content_type = (video.content_type or "").lower()
@@ -1013,19 +1143,20 @@ async def api_create_job(
     # Server owns ordinal allocation; ignore any client-provided value except
     # as an idempotency hint. `expected_single` reserves exactly one slot.
     reserve_count = 1 if expected_single else 1
-    ordinal = box_registry.reserve_ordinal(
+    ordinal = stores.box_registry.reserve_ordinal(
         cage, count=reserve_count, project_id=project
     )
 
-    job = job_store.create_job(
+    job = stores.job_store.create_job(
         project_id=project,
         cage_id=cage,
         original_filename=video.filename,
         content_type=video.content_type,
         requested_ordinal=ordinal,
+        tenant_id=ctx.tenant_id,  # job 行固化租户（§6.3）
     )
     job_id = str(job["job_id"])
-    upload_dir = JOB_UPLOAD_ROOT / job_id
+    upload_dir = stores.output_root / "job_uploads" / job_id
     upload_dir.mkdir(parents=True, exist_ok=False)
     target = upload_dir / f"source{_upload_suffix(video.filename, content_type)}"
     size = 0
@@ -1044,7 +1175,7 @@ async def api_create_job(
                 handle.write(chunk)
         if size == 0:
             raise HTTPException(status_code=422, detail="视频文件为空")
-        upload_updates: dict[str, Any] = {
+        job_store_updates: dict[str, Any] = {
             "video_path": str(target.resolve()),
             "size_bytes": size,
             "stage": "uploaded",
@@ -1052,31 +1183,31 @@ async def api_create_job(
             "message": "上传完成",
         }
         if recorded_duration_sec is not None:
-            upload_updates["recorded_duration_sec"] = int(recorded_duration_sec)
+            job_store_updates["recorded_duration_sec"] = int(recorded_duration_sec)
         # Visible region the operator framed on screen, as normalized
         # {x,y,w,h}. Used only for legacy css_crop clients; canvas mode
         # ignores it. Advisory: invalid/missing falls back to full-frame.
         crop_obj = _parse_preview_crop(preview_crop)
         if crop_obj is not None:
-            upload_updates["preview_crop"] = json.dumps(crop_obj)
+            job_store_updates["preview_crop"] = json.dumps(crop_obj)
         mode = (capture_mode or "").strip().lower() or None
         if mode in ("canvas", "css_crop", "system", "realtime"):
-            upload_updates["capture_mode"] = mode
+            job_store_updates["capture_mode"] = mode
         if capture_meta:
             # Cap size so a runaway client cannot bloat the jobs DB.
             meta_text = capture_meta.strip()
             if len(meta_text) > 4000:
                 meta_text = meta_text[:4000]
-            upload_updates["capture_meta"] = meta_text
-        job_store.update(job_id, **upload_updates)
+            job_store_updates["capture_meta"] = meta_text
+        stores.job_store.update(job_id, **job_store_updates)
         # P1-d: validate codec before submitting analysis job.
         _validate_video_codec(target)
-        queued = job_manager.submit(job_id)
+        queued = job_dispatcher.submit(ctx.tenant_id, job_id)
         return JSONResponse(_job_payload(queued), status_code=202)
     except HTTPException as exc:
         target.unlink(missing_ok=True)
-        box_registry.release_ordinal(cage, ordinal)
-        job_store.update(
+        stores.box_registry.release_ordinal(cage, ordinal)
+        stores.job_store.update(
             job_id,
             status="failed",
             stage="upload_failed",
@@ -1087,8 +1218,8 @@ async def api_create_job(
         raise
     except Exception as exc:
         target.unlink(missing_ok=True)
-        box_registry.release_ordinal(cage, ordinal)
-        job_store.update(
+        stores.box_registry.release_ordinal(cage, ordinal)
+        stores.job_store.update(
             job_id,
             status="failed",
             stage="upload_failed",
@@ -1102,9 +1233,13 @@ async def api_create_job(
 
 
 @app.get("/api/jobs")
-def api_jobs(limit: int = Query(30, ge=1, le=100)) -> dict[str, Any]:
-    items = [_job_payload(job) for job in job_store.list_jobs(limit)]
-    return {"items": items, "active": job_store.active_count()}
+def api_jobs(
+    limit: int = Query(30, ge=1, le=100),
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    items = [_job_payload(job) for job in stores.job_store.list_jobs(limit)]
+    return {"items": items, "active": stores.job_store.active_count()}
 
 
 def _elapsed_sec(iso_ts: str | None) -> float:
@@ -1117,14 +1252,15 @@ def _elapsed_sec(iso_ts: str | None) -> float:
 
 
 @app.get("/api/jobs/queue")
-def api_jobs_queue() -> dict[str, Any]:
+def api_jobs_queue(ctx: TenantContext = Depends(_read_ctx)) -> dict[str, Any]:
     """Queue visibility for the mobile 'record done / waiting' screen.
 
     NOTE: must be registered before `/api/jobs/{job_id}` or it would be
     swallowed as job_id="queue".
     """
-    avg = job_store.avg_duration_sec()
-    processing_jobs = job_store.list_by_status("processing")
+    stores = _stores(ctx)
+    avg = stores.job_store.avg_duration_sec()
+    processing_jobs = stores.job_store.list_by_status("processing")
     processing = None
     if processing_jobs:
         p = processing_jobs[0]
@@ -1136,7 +1272,7 @@ def api_jobs_queue() -> dict[str, Any]:
             "processing_started_at": p.get("processing_started_at"),
             "elapsed_sec": elapsed,
         }
-    queued_rows = job_store.list_by_status("queued")
+    queued_rows = stores.job_store.list_by_status("queued")
     queued = [
         {
             "job_id": row["job_id"],
@@ -1167,12 +1303,16 @@ def _estimate_wait_sec(
 
 
 @app.get("/api/jobs/{job_id}/wait")
-def api_job_wait(job_id: str) -> dict[str, Any]:
+def api_job_wait(
+    job_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
     """Position + estimated wait for one queued/processing job."""
-    job = job_store.get(job_id)
+    stores = _stores(ctx)
+    job = stores.job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    snapshot = api_jobs_queue()
+    snapshot = api_jobs_queue(ctx)
     avg = snapshot["avg_duration_sec"]
     processing = snapshot["processing"]
     position = 0
@@ -1194,20 +1334,28 @@ def api_job_wait(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}")
-def api_job(job_id: str) -> dict[str, Any]:
-    job = job_store.get(job_id)
+def api_job(
+    job_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    job = stores.job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     return _job_payload(job)
 
 
-@app.get("/api/jobs/{job_id}/analysis-preview", dependencies=[Depends(require_api_token)])
-def api_job_analysis_preview(job_id: str) -> FileResponse:
+@app.get("/api/jobs/{job_id}/analysis-preview")
+def api_job_analysis_preview(
+    job_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+) -> FileResponse:
     """Serve the first analysed frame so operators can verify backend framing."""
-    job = job_store.get(job_id)
+    stores = _stores(ctx)
+    job = stores.job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    run_dir = _resolve_job_run_dir(job)
+    run_dir = _resolve_job_run_dir(job, stores)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="分析预览尚不可用")
     preview = run_dir / "analysis_preview.jpg"
@@ -1221,12 +1369,16 @@ def api_job_analysis_preview(job_id: str) -> FileResponse:
 
 
 @app.get("/api/jobs/{job_id}/report")
-def api_job_report(job_id: str) -> dict[str, Any]:
-    job = job_store.get(job_id)
+def api_job_report(
+    job_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    job = stores.job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     run_id = job.get("run_id")
-    mice = registry.list_mice(run_id=str(run_id)) if run_id else []
+    mice = stores.registry.list_mice(run_id=str(run_id)) if run_id else []
     items = []
     weights: list[float] = []
     confidences: list[float] = []
@@ -1276,8 +1428,8 @@ class BoxUpdate(BaseModel):
     mouse_no_pad: int | None = Field(None, ge=1, le=6)
 
 
-def _box_stats(cage_id: str) -> dict[str, Any]:
-    jobs = job_store.list_by_cage(cage_id)
+def _box_stats(cage_id: str, stores: TenantStores) -> dict[str, Any]:
+    jobs = stores.job_store.list_by_cage(cage_id)
     pending = sum(
         1 for j in jobs if j["status"] in {"uploading", "queued", "processing"}
     )
@@ -1285,10 +1437,10 @@ def _box_stats(cage_id: str) -> dict[str, Any]:
     # Count records actually on disk for this cage (deletes are reflected
     # immediately; job.record_count is only a snapshot at completion time).
     on_disk = 0
-    for run in registry.list_runs():
+    for run in stores.registry.list_runs():
         if (run.get("cage_id") or "-") != cage_id:
             continue
-        on_disk += len(registry._mice_in_dir(Path(run["path"]), run_id=run["run_id"]))
+        on_disk += len(stores.registry._mice_in_dir(Path(run["path"]), run_id=run["run_id"]))
     return {
         "record_count": on_disk,
         "pending_count": pending,
@@ -1298,21 +1450,28 @@ def _box_stats(cage_id: str) -> dict[str, Any]:
 
 @app.get("/api/boxes")
 def api_boxes(
-    strain: str | None = Query(None), limit: int = Query(100, ge=1, le=500)
+    strain: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    ctx: TenantContext = Depends(_read_ctx),
 ) -> dict[str, Any]:
-    boxes = box_registry.list(strain=strain, limit=limit)
+    stores = _stores(ctx)
+    boxes = stores.box_registry.list(strain=strain, limit=limit)
     for box in boxes:
-        box.update(_box_stats(box["cage_id"]))
+        box.update(_box_stats(box["cage_id"], stores))
     return {"items": boxes}
 
 
 @app.get("/api/boxes/recent")
-def api_boxes_recent(limit: int = Query(5, ge=1, le=50)) -> dict[str, Any]:
+def api_boxes_recent(
+    limit: int = Query(5, ge=1, le=50),
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
     """Home screen recent activity, ordered by last job time then created."""
-    boxes = box_registry.list(limit=200)
+    stores = _stores(ctx)
+    boxes = stores.box_registry.list(limit=200)
     enriched = []
     for box in boxes:
-        stats = _box_stats(box["cage_id"])
+        stats = _box_stats(box["cage_id"], stores)
         box.update(stats)
         enriched.append(box)
     enriched.sort(
@@ -1322,12 +1481,16 @@ def api_boxes_recent(limit: int = Query(5, ge=1, le=50)) -> dict[str, Any]:
     return {"items": enriched[:limit]}
 
 
-@app.post("/api/boxes", dependencies=[Depends(require_token_or_operator)])
-def api_create_box(body: BoxCreate) -> JSONResponse:
+@app.post("/api/boxes")
+def api_create_box(
+    body: BoxCreate,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> JSONResponse:
+    stores = _stores(ctx)
     cage = _clean_id(body.cage_id, field_name="箱号")
     project = _clean_id(body.project_id or "default", field_name="项目号")
     try:
-        box = box_registry.create(
+        box = stores.box_registry.create(
             cage_id=cage,
             strain=body.strain,
             notes=body.notes,
@@ -1336,50 +1499,66 @@ def api_create_box(body: BoxCreate) -> JSONResponse:
             mouse_no_pad=body.mouse_no_pad,
         )
     except KeyError:
-        raise HTTPException(status_code=409, detail="箱号已存在")
-    box.update(_box_stats(cage))
+        raise HTTPException(status_code=409, detail="箱号已存在") from None
+    box.update(_box_stats(cage, stores))
     return JSONResponse(box, status_code=201)
 
 
 @app.get("/api/boxes/{cage_id}")
-def api_box(cage_id: str) -> dict[str, Any]:
-    box = box_registry.get(cage_id)
+def api_box(
+    cage_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    box = stores.box_registry.get(cage_id)
     if box is None:
         raise HTTPException(status_code=404, detail="箱子不存在")
-    box.update(_box_stats(cage_id))
+    box.update(_box_stats(cage_id, stores))
     return box
 
 
-@app.patch("/api/boxes/{cage_id}", dependencies=[Depends(require_token_or_operator)])
-def api_update_box(cage_id: str, body: BoxUpdate) -> dict[str, Any]:
+@app.patch("/api/boxes/{cage_id}")
+def api_update_box(
+    cage_id: str,
+    body: BoxUpdate,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
     changes = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
-        box = box_registry.update(cage_id, **changes)
+        box = stores.box_registry.update(cage_id, **changes)
     except KeyError:
-        raise HTTPException(status_code=404, detail="箱子不存在")
-    box.update(_box_stats(cage_id))
+        raise HTTPException(status_code=404, detail="箱子不存在") from None
+    box.update(_box_stats(cage_id, stores))
     return box
 
 
-@app.post(
-    "/api/boxes/{cage_id}/reserve-ordinal",
-    dependencies=[Depends(require_api_token)],
-)
+@app.post("/api/boxes/{cage_id}/reserve-ordinal")
 def api_reserve_ordinal(
-    cage_id: str, project_id: str = Query("default")
+    cage_id: str,
+    project_id: str = Query("default"),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
+    stores = _stores(ctx)
     cage = _clean_id(cage_id, field_name="箱号")
     project = _clean_id(project_id or "default", field_name="项目号")
-    ordinal = box_registry.reserve_ordinal(cage, project_id=project)
+    # 序号在 (tenant_id, cage_id) 上原子分配（§4.4）；baseline 喂租户根（§15-B3）。
+    ordinal = stores.box_registry.reserve_ordinal(
+        cage, project_id=project, baseline_records=stores.output_root
+    )
     return {"cage_id": cage, "requested_ordinal": ordinal}
 
 
 @app.get("/api/boxes/{cage_id}/qr.svg", response_model=None)
-def api_box_qr(cage_id: str):
-    """Printable QR (SVG) carrying {v, project_id, cage_id} (design §3.5.4)."""
-    box = box_registry.get(cage_id)
+def api_box_qr(
+    cage_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+):
+    """Printable QR (SVG) carrying v2 {v, tenant_id, project_id, cage_id}（§4.4）。"""
+    stores = _stores(ctx)
+    box = stores.box_registry.get(cage_id)
     project = box["project_id"] if box else "default"
-    payload = qr_payload(cage_id, project)
+    payload = qr_payload(cage_id, project, version=2, tenant_id=ctx.tenant_id)
     import io
 
     import segno
@@ -1427,16 +1606,24 @@ def _item_from_record(job: dict[str, Any], mouse: dict[str, Any]) -> dict[str, A
 
 
 @app.get("/api/boxes/{cage_id}/records")
-def api_box_records(cage_id: str) -> dict[str, Any]:
+def api_box_records(
+    cage_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
     """Unified list: merge pending jobs and completed records (design §8.1a).
 
     Soft-deleted records are hidden from this mobile-facing endpoint.
     """
-    jobs = job_store.list_by_cage(cage_id)
+    stores = _stores(ctx)
+    jobs = stores.job_store.list_by_cage(cage_id)
     items: list[dict[str, Any]] = []
     for job in jobs:
         if job["status"] == "completed":
-            mice = registry.list_mice(run_id=str(job["run_id"])) if job.get("run_id") else []
+            mice = (
+                stores.registry.list_mice(run_id=str(job["run_id"]))
+                if job.get("run_id")
+                else []
+            )
             if not mice:
                 placeholder = _placeholder_from_job(job)
                 placeholder["warning"] = "no_detection"
@@ -1445,7 +1632,7 @@ def api_box_records(cage_id: str) -> dict[str, Any]:
             mice_sorted = sorted(mice, key=lambda m: int(m.get("ordinal") or 0))
             for mouse in mice_sorted:
                 rid = mouse.get("record_id")
-                if rid and records_meta.effective_status(str(rid)) == "deleted":
+                if rid and stores.records_meta.effective_status(str(rid)) == "deleted":
                     continue
                 item = _item_from_record(job, mouse)
                 if len(mice_sorted) > 1:
@@ -1469,19 +1656,19 @@ def api_box_records(cage_id: str) -> dict[str, Any]:
     # 但详情此前只遍历 job_store.list_by_cage → 永远为空。这里追加扫描 registry，
     # 补出「有 run 但无对应 job」的上报记录。不动 video 分析路径与 job_store 写入方。
     job_run_ids = {str(j["run_id"]) for j in jobs if j.get("run_id")}
-    for run in registry.list_runs():
+    for run in stores.registry.list_runs():
         if (run.get("cage_id") or "-") != cage_id:
             continue
         # 已有 job 的 run 由上方 jobs 遍历产出，避免与 video 分析路径的 job 重复列。
         if str(run["run_id"]) in job_run_ids:
             continue
-        mice = registry.list_mice(run_id=str(run["run_id"]))
+        mice = stores.registry.list_mice(run_id=str(run["run_id"]))
         if not mice:
             continue
         mice_sorted = sorted(mice, key=lambda m: int(m.get("ordinal") or 0))
         for mouse in mice_sorted:
             rid = mouse.get("record_id")
-            if rid and records_meta.effective_status(str(rid)) == "deleted":
+            if rid and stores.records_meta.effective_status(str(rid)) == "deleted":
                 continue
             # 无 job 的上报 run：构造内存合成 job 占位（不写入 job_store），
             # 复用 _item_from_record 产出与 job 关联记录一致的 item。
@@ -1508,11 +1695,16 @@ def api_box_records(cage_id: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-def _assert_record_readable(record_id: str, *, include_deleted: bool = False) -> dict[str, Any]:
-    mouse = registry.get_by_record_id(record_id)
+def _assert_record_readable(
+    record_id: str,
+    stores: TenantStores,
+    *,
+    include_deleted: bool = False,
+) -> dict[str, Any]:
+    mouse = stores.registry.get_by_record_id(record_id)
     if mouse is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    status = records_meta.effective_status(record_id)
+    status = stores.records_meta.effective_status(record_id)
     if status == "deleted" and not include_deleted:
         raise HTTPException(status_code=404, detail="记录不存在")
     return mouse
@@ -1522,13 +1714,16 @@ def _assert_record_readable(record_id: str, *, include_deleted: bool = False) ->
 def api_record(
     record_id: str,
     include_deleted: bool = Query(False),
-    user: dict[str, Any] | None = Depends(current_user),
+    ctx: TenantContext = Depends(_read_ctx),
 ) -> dict[str, Any]:
-    allow_deleted = bool(include_deleted and user and user.get("role") in {"admin", "operator"})
-    mouse = _assert_record_readable(record_id, include_deleted=allow_deleted)
+    stores = _stores(ctx)
+    allow_deleted = bool(
+        include_deleted and ctx.has_role(ROLE_OPERATOR, ROLE_TENANT_ADMIN)
+    )
+    mouse = _assert_record_readable(record_id, stores, include_deleted=allow_deleted)
     mouse["photo_url"] = f"/api/records/{record_id}/photo"
     mouse["label"] = f"第 {int(mouse.get('actual_ordinal', mouse['ordinal'])):02d} 只"
-    raw_path = DEFAULT_OUTPUT / mouse["dir"] / "record.json"
+    raw_path = stores.output_root / mouse["dir"] / "record.json"
     if raw_path.exists():
         try:
             raw = json.loads(raw_path.read_text(encoding="utf-8"))
@@ -1552,7 +1747,7 @@ def api_record(
                 mouse["weight"] = raw.get("weight")
         except Exception:
             pass
-    meta = records_meta.ensure(record_id)
+    meta = stores.records_meta.ensure(record_id)
     mouse["status"] = meta["status"]
     mouse["verified"] = bool(meta.get("verified"))
     mouse["notes"] = meta.get("notes") or ""
@@ -1564,19 +1759,20 @@ def api_record(
     return mouse
 
 
-def _serve_photo(path: Path, size: str = "thumb") -> Response:
+def _serve_photo(path: Path, size: str = "thumb", thumbs_root: Path | None = None) -> Response:
     """Serve a record photo, optionally as a compressed thumbnail.
 
-    size=thumb: resize to 320px wide, JPEG q80, cached to .thumbs/.
+    size=thumb: resize to 320px wide, JPEG q80, cached to <thumbs_root>/.thumbs/.
     size=full: serve the original unchanged.
     Record photos are immutable, so responses get long-lived cache headers.
+    缩略图缓存按租户根隔离（§15-B3）；thumbs_root 缺省仅供测试直接调用。
     """
     if not path.exists():
         raise HTTPException(status_code=404, detail="照片不存在")
     if size != "thumb":
         return FileResponse(path, headers={"Cache-Control": "max-age=31536000, immutable"})
 
-    thumb_dir = DEFAULT_OUTPUT / ".thumbs"
+    thumb_dir = (thumbs_root or DEFAULT_OUTPUT) / ".thumbs"
     thumb_dir.mkdir(parents=True, exist_ok=True)
     st = path.stat()
     key = hashlib.sha1(f"{path}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:24]
@@ -1606,23 +1802,29 @@ def api_record_photo(
     record_id: str,
     size: str = Query("thumb", pattern="^(thumb|full)$"),
     include_deleted: bool = Query(False),
-    user: dict[str, Any] | None = Depends(current_user),
+    ctx: TenantContext = Depends(_read_ctx),
 ):
-    allow_deleted = bool(include_deleted and user and user.get("role") in {"admin", "operator"})
-    mouse = _assert_record_readable(record_id, include_deleted=allow_deleted)
-    path = DEFAULT_OUTPUT / mouse["dir"] / mouse.get("photo", "photo.jpg")
-    return _serve_photo(path, size)
+    stores = _stores(ctx)
+    allow_deleted = bool(
+        include_deleted and ctx.has_role(ROLE_OPERATOR, ROLE_TENANT_ADMIN)
+    )
+    mouse = _assert_record_readable(record_id, stores, include_deleted=allow_deleted)
+    path = stores.output_root / mouse["dir"] / mouse.get("photo", "photo.jpg")
+    return _serve_photo(path, size, thumbs_root=stores.output_root)
 
 
 @app.get("/api/records/{record_id}/clip", response_model=None)
 def api_record_clip(
     record_id: str,
     include_deleted: bool = Query(False),
-    user: dict[str, Any] | None = Depends(current_user),
+    ctx: TenantContext = Depends(_read_ctx),
 ):
-    allow_deleted = bool(include_deleted and user and user.get("role") in {"admin", "operator"})
-    mouse = _assert_record_readable(record_id, include_deleted=allow_deleted)
-    raw_path = DEFAULT_OUTPUT / mouse["dir"] / "record.json"
+    stores = _stores(ctx)
+    allow_deleted = bool(
+        include_deleted and ctx.has_role(ROLE_OPERATOR, ROLE_TENANT_ADMIN)
+    )
+    mouse = _assert_record_readable(record_id, stores, include_deleted=allow_deleted)
+    raw_path = stores.output_root / mouse["dir"] / "record.json"
     clip_name = "clip.mp4"
     if raw_path.exists():
         try:
@@ -1630,7 +1832,7 @@ def api_record_clip(
             clip_name = str(raw.get("clip_file") or clip_name)
         except Exception:
             pass
-    path = DEFAULT_OUTPUT / mouse["dir"] / clip_name
+    path = stores.output_root / mouse["dir"] / clip_name
     if not path.is_file():
         raise HTTPException(status_code=404, detail="片段不存在")
     return FileResponse(
@@ -1640,11 +1842,11 @@ def api_record_clip(
     )
 
 
-def _load_mutable_record(record_id: str) -> tuple[dict[str, Any], Path, dict[str, Any]]:
-    mouse = registry.get_by_record_id(record_id)
+def _load_mutable_record(record_id: str, stores: TenantStores) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    mouse = stores.registry.get_by_record_id(record_id)
     if mouse is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    path = DEFAULT_OUTPUT / mouse["dir"] / "record.json"
+    path = stores.output_root / mouse["dir"] / "record.json"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="记录文件不存在")
     try:
@@ -1654,8 +1856,8 @@ def _load_mutable_record(record_id: str) -> tuple[dict[str, Any], Path, dict[str
     return mouse, path, raw
 
 
-def _reject_if_manual_weight_required(record_id: str) -> None:
-    _, _, raw = _load_mutable_record(record_id)
+def _reject_if_manual_weight_required(record_id: str, stores: TenantStores) -> None:
+    _, _, raw = _load_mutable_record(record_id, stores)
     # Block suspect records from verify/publish.
     if bool(raw.get("format_suspect")):
         raise HTTPException(
@@ -1708,13 +1910,14 @@ class ConfirmWeightBody(BaseModel):
     note: str | None = None
 
 
-@app.post("/api/records/{record_id}/confirm-weight", dependencies=[Depends(require_write_access)])
+@app.post("/api/records/{record_id}/confirm-weight")
 def api_confirm_weight(
     record_id: str,
     body: ConfirmWeightBody,
-    user: dict[str, Any] = Depends(require_write_access),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
-    mouse, path, raw = _load_mutable_record(record_id)
+    stores = _stores(ctx)
+    mouse, path, raw = _load_mutable_record(record_id, stores)
     # P2-b: confirm-weight is the universal correction endpoint.
     # Both manual-required and normal records can be corrected here.
     weight = round(float(body.weight), 2)
@@ -1731,25 +1934,25 @@ def api_confirm_weight(
     reasons = [r for r in reasons if r not in drop]
     raw["review_reason"] = ",".join(reasons)
     raw["needs_review"] = bool(reasons)
-    raw["manual_weight_by"] = user.get("username", "unknown")
+    raw["manual_weight_by"] = ctx.actor_id or user_label(ctx)
     raw["manual_weight_at"] = datetime.now().isoformat(timespec="seconds")
     if body.note:
         raw["manual_weight_note"] = str(body.note)
     path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
-    actor = user.get("username", "unknown")
+    actor = user_label(ctx)
     if body.note:
-        records_meta.update(record_id, operator=actor, notes=str(body.note))
+        stores.records_meta.update(record_id, operator=actor, notes=str(body.note))
     # Enqueue (or refresh) only after manual confirmation — unstable records
     # were intentionally held out of the pending upload queue.
     photo_path = path.parent / str(raw.get("photo") or "photo.jpg")
-    queued = upload_queue.update_by_record_id(
+    queued = stores.upload_queue.update_by_record_id(
         record_id,
         raw,
         record_path=path,
         photo_path=photo_path if photo_path.is_file() else None,
     )
     if not queued:
-        upload_queue.enqueue(
+        stores.upload_queue.enqueue(
             raw,
             record_path=path,
             photo_path=photo_path if photo_path.is_file() else None,
@@ -1758,6 +1961,7 @@ def api_confirm_weight(
     _audit(
         actor,
         "record.confirm_weight",
+        ctx=ctx,
         target_type="record",
         target_id=record_id,
         detail={"weight": weight, "guessed_weight": raw.get("guessed_weight")},
@@ -1773,17 +1977,38 @@ def api_confirm_weight(
     }
 
 
-@app.delete("/api/records/{record_id}", dependencies=[Depends(require_write_access)])
-def api_delete_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
-    mouse = registry.get_by_record_id(record_id)
-    if mouse is None:
+def user_label(ctx: TenantContext) -> str:
+    """审计/记录落款的主体标签（不落任何 token/secret）。"""
+    if ctx.actor_type in {"user", "platform"}:
+        try:
+            row = control_store.get_user(ctx.actor_id)
+        except Exception:
+            row = None
+        if row is not None:
+            return str(row["username"])
+        return ctx.actor_id or "unknown"
+    if ctx.actor_type == "device":
+        return f"device:{ctx.actor_id}"
+    if ctx.actor_type == "legacy_token":
+        return "legacy-token"
+    return ctx.actor_id or "unknown"
+
+
+@app.delete("/api/records/{record_id}")
+def api_delete_record(
+    record_id: str,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    if stores.registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    actor = user.get("username", "unknown")
-    records_meta.soft_delete(record_id, operator=actor)
-    upload_queue.delete_by_record_id(record_id)
+    actor = user_label(ctx)
+    stores.records_meta.soft_delete(record_id, operator=actor)
+    stores.upload_queue.delete_by_record_id(record_id)
     _audit(
         actor,
         "record.delete",
+        ctx=ctx,
         target_type="record",
         target_id=record_id,
         detail={"soft": True},
@@ -1791,13 +2016,17 @@ def api_delete_record(record_id: str, user: dict[str, Any] = Depends(require_wri
     return {"ok": True, "record_id": record_id, "status": "deleted"}
 
 
-@app.post("/api/records/{record_id}/restore", dependencies=[Depends(require_write_access)])
-def api_restore_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
-    if registry.get_by_record_id(record_id) is None:
+@app.post("/api/records/{record_id}/restore")
+def api_restore_record(
+    record_id: str,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    if stores.registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    actor = user.get("username", "unknown")
-    meta = records_meta.restore(record_id, operator=actor)
-    _audit(actor, "record.restore", target_type="record", target_id=record_id)
+    actor = user_label(ctx)
+    meta = stores.records_meta.restore(record_id, operator=actor)
+    _audit(actor, "record.restore", ctx=ctx, target_type="record", target_id=record_id)
     return {"ok": True, "meta": meta}
 
 
@@ -1806,60 +2035,77 @@ class RecordMetaUpdate(BaseModel):
     tags: str | None = None
 
 
-@app.patch("/api/records/{record_id}", dependencies=[Depends(require_write_access)])
+@app.patch("/api/records/{record_id}")
 def api_update_record_meta(
     record_id: str,
     body: RecordMetaUpdate,
-    user: dict[str, Any] = Depends(require_write_access),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
-    if registry.get_by_record_id(record_id) is None:
+    stores = _stores(ctx)
+    if stores.registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
     changes = {k: v for k, v in body.model_dump().items() if v is not None}
-    actor = user.get("username", "unknown")
-    meta = records_meta.update(record_id, operator=actor, **changes)
-    _audit(actor, "record.update", target_type="record", target_id=record_id, detail=changes)
+    actor = user_label(ctx)
+    meta = stores.records_meta.update(record_id, operator=actor, **changes)
+    _audit(actor, "record.update", ctx=ctx, target_type="record", target_id=record_id, detail=changes)
     return meta
 
 
-@app.post("/api/records/{record_id}/publish", dependencies=[Depends(require_write_access)])
-def api_publish_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
-    if registry.get_by_record_id(record_id) is None:
+@app.post("/api/records/{record_id}/publish")
+def api_publish_record(
+    record_id: str,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    if stores.registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    _reject_if_manual_weight_required(record_id)
-    actor = user.get("username", "unknown")
-    meta = records_meta.publish(record_id, operator=actor)
-    _audit(actor, "record.publish", target_type="record", target_id=record_id)
+    _reject_if_manual_weight_required(record_id, stores)
+    actor = user_label(ctx)
+    meta = stores.records_meta.publish(record_id, operator=actor)
+    _audit(actor, "record.publish", ctx=ctx, target_type="record", target_id=record_id)
     return {"ok": True, "meta": meta}
 
 
-@app.post("/api/records/{record_id}/unpublish", dependencies=[Depends(require_write_access)])
-def api_unpublish_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
-    if registry.get_by_record_id(record_id) is None:
+@app.post("/api/records/{record_id}/unpublish")
+def api_unpublish_record(
+    record_id: str,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    if stores.registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    actor = user.get("username", "unknown")
-    meta = records_meta.unpublish(record_id, operator=actor)
-    _audit(actor, "record.unpublish", target_type="record", target_id=record_id)
+    actor = user_label(ctx)
+    meta = stores.records_meta.unpublish(record_id, operator=actor)
+    _audit(actor, "record.unpublish", ctx=ctx, target_type="record", target_id=record_id)
     return {"ok": True, "meta": meta}
 
 
-@app.post("/api/records/{record_id}/verify", dependencies=[Depends(require_write_access)])
-def api_verify_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
-    if registry.get_by_record_id(record_id) is None:
+@app.post("/api/records/{record_id}/verify")
+def api_verify_record(
+    record_id: str,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    if stores.registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    _reject_if_manual_weight_required(record_id)
-    actor = user.get("username", "unknown")
-    meta = records_meta.verify(record_id, operator=actor)
-    _audit(actor, "record.verify", target_type="record", target_id=record_id)
+    _reject_if_manual_weight_required(record_id, stores)
+    actor = user_label(ctx)
+    meta = stores.records_meta.verify(record_id, operator=actor)
+    _audit(actor, "record.verify", ctx=ctx, target_type="record", target_id=record_id)
     return {"ok": True, "meta": meta}
 
 
-@app.post("/api/records/{record_id}/reject", dependencies=[Depends(require_write_access)])
-def api_reject_record(record_id: str, user: dict[str, Any] = Depends(require_write_access)) -> dict[str, Any]:
-    if registry.get_by_record_id(record_id) is None:
+@app.post("/api/records/{record_id}/reject")
+def api_reject_record(
+    record_id: str,
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    if stores.registry.get_by_record_id(record_id) is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    actor = user.get("username", "unknown")
-    meta = records_meta.reject(record_id, operator=actor)
-    _audit(actor, "record.reject", target_type="record", target_id=record_id)
+    actor = user_label(ctx)
+    meta = stores.records_meta.reject(record_id, operator=actor)
+    _audit(actor, "record.reject", ctx=ctx, target_type="record", target_id=record_id)
     return {"ok": True, "meta": meta}
 
 
@@ -1872,16 +2118,16 @@ class BatchRecordAction(BaseModel):
 
 
 
-def _find_run_dir_by_id(run_id: str) -> Path | None:
-    """Find run directory by exact manifest run_id."""
+def _find_run_dir_by_id(run_id: str, stores: TenantStores) -> Path | None:
+    """Find run directory by exact manifest run_id（只在租户根内查找，§15-B3）。"""
     run_id = str(run_id).strip()
     if not run_id:
         return None
-    for run in registry.list_runs():
+    for run in stores.registry.list_runs():
         if str(run.get("run_id")) == run_id:
             path = Path(str(run.get("path") or ""))
             return path if path.is_dir() else None
-    for run_dir in DEFAULT_OUTPUT.glob("run_*"):
+    for run_dir in stores.output_root.glob("run_*"):
         if not run_dir.is_dir():
             continue
         manifest = load_manifest(run_dir) or {}
@@ -1890,10 +2136,10 @@ def _find_run_dir_by_id(run_id: str) -> Path | None:
     return None
 
 
-@app.post("/api/runs/{run_id}/release-suspect", dependencies=[Depends(require_write_access)])
+@app.post("/api/runs/{run_id}/release-suspect")
 def api_release_suspect(
     run_id: str,
-    user: dict[str, Any] = Depends(require_write_access),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
     """P0-b: Manually release a format_suspect run after operator confirms
     the video is complete. Promotes all Held records to Pending and clears
@@ -1909,19 +2155,26 @@ def api_release_suspect(
     The full transition runs under a per-run cross-process lock so concurrent
     release/reject/recovery cannot interleave journal or queue updates.
     """
-    actor = str(user.get("username") or "unknown")
-    run_dir = _find_run_dir_by_id(run_id)
+    stores = _stores(ctx)
+    actor = user_label(ctx)
+    run_dir = _find_run_dir_by_id(run_id, stores)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="run not found")
 
     try:
         with run_dir_lock(run_dir):
-            return _release_suspect_locked(run_dir, run_id, actor)
+            return _release_suspect_locked(run_dir, run_id, actor, stores, ctx)
     except RunLockTimeout as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def _release_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, Any]:
+def _release_suspect_locked(
+    run_dir: Path,
+    run_id: str,
+    actor: str,
+    stores: TenantStores,
+    ctx: TenantContext,
+) -> dict[str, Any]:
     # Collect suspect records first so we do not write postflight_passed for
     # an already-clean run (would incorrectly shield incomplete postflight).
     suspect_paths: list[Path] = []
@@ -1960,21 +2213,21 @@ def _release_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str,
             rec_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
             rid = str(raw.get("record_id") or "")
             if rid:
-                upload_queue.release_held([rid])
+                stores.upload_queue.release_held([rid])
                 released += 1
         except Exception as exc:
             errors.append(f"{rec_path.parent.name}: {exc}")
     detail = {"released": released, "errors": errors}
-    _audit(actor, "run.release_suspect", target_type="run", target_id=run_id, detail=detail)
+    _audit(actor, "run.release_suspect", ctx=ctx, target_type="run", target_id=run_id, detail=detail)
     if errors and released == 0:
         raise HTTPException(status_code=500, detail={"ok": False, **detail})
     return {"ok": True, "run_id": run_id, "released": released, "errors": errors}
 
 
-@app.post("/api/runs/{run_id}/reject-suspect", dependencies=[Depends(require_write_access)])
+@app.post("/api/runs/{run_id}/reject-suspect")
 def api_reject_suspect(
     run_id: str,
-    user: dict[str, Any] = Depends(require_write_access),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
     """P0-b: Manually reject a format_suspect run. Deletes all records
     and removes them from the upload queue.
@@ -1987,21 +2240,28 @@ def api_reject_suspect(
     Requires a reliable record_id before any destructive step. Recovery uses
     the journal's original actor for metadata attribution.
     """
-    actor = str(user.get("username") or "unknown")
-    run_dir = _find_run_dir_by_id(run_id)
+    stores = _stores(ctx)
+    actor = user_label(ctx)
+    run_dir = _find_run_dir_by_id(run_id, stores)
     if run_dir is None:
         raise HTTPException(status_code=404, detail="run not found")
 
     try:
         with run_dir_lock(run_dir):
-            return _reject_suspect_locked(run_dir, run_id, actor)
+            return _reject_suspect_locked(run_dir, run_id, actor, stores, ctx)
     except RunLockTimeout as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-def _reject_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, Any]:
+def _reject_suspect_locked(
+    run_dir: Path,
+    run_id: str,
+    actor: str,
+    stores: TenantStores,
+    ctx: TenantContext,
+) -> dict[str, Any]:
     def _mark_meta_deleted(rid: str, operator: str = "system") -> None:
-        records_meta.update(rid, status="deleted", operator=operator)
+        stores.records_meta.update(rid, status="deleted", operator=operator)
 
     # Finish crash-interrupted reject for THIS run only (already under lock;
     # recover_reject_state will re-lock the same path — fcntl flock is re-entrant
@@ -2021,7 +2281,7 @@ def _reject_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, 
         _recover_one_run(
             run_dir,
             stats,
-            upload_queue=upload_queue,
+            upload_queue=stores.upload_queue,
             mark_meta_deleted=_mark_meta_deleted,
             default_actor=actor,
         )
@@ -2062,7 +2322,7 @@ def _reject_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, 
                 run_dir,
                 mouse_dir,
                 journal=journal,
-                upload_queue=upload_queue,
+                upload_queue=stores.upload_queue,
                 mark_meta_deleted=_mark_meta_deleted,
             )
             deleted += 1
@@ -2098,7 +2358,7 @@ def _reject_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, 
             errors.append(f"manifest: {exc}")
 
     detail = {"deleted": deleted, "errors": errors}
-    _audit(actor, "run.reject_suspect", target_type="run", target_id=run_id, detail=detail)
+    _audit(actor, "run.reject_suspect", ctx=ctx, target_type="run", target_id=run_id, detail=detail)
     if errors:
         raise HTTPException(
             status_code=500,
@@ -2106,55 +2366,58 @@ def _reject_suspect_locked(run_dir: Path, run_id: str, actor: str) -> dict[str, 
         )
     return {"ok": True, "run_id": run_id, "deleted": deleted}
 
-@app.post("/api/records/{record_id}/detection-label", dependencies=[Depends(require_write_access)])
+@app.post("/api/records/{record_id}/detection-label")
 def api_set_detection_label(
     record_id: str,
     body: dict[str, Any] = Body(...),
-    user: dict[str, Any] = Depends(require_write_access),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
     """P2-b: Set detection_label (mouse / glove / empty / other) for training flywheel."""
     label = str(body.get("label") or "").strip().lower()
     if label not in {"mouse", "glove", "empty", "other"}:
         raise HTTPException(status_code=400, detail="label must be mouse/glove/empty/other")
-    actor = str(user.get("username") or "unknown")
-    meta = records_meta.update(record_id, operator=actor, detection_label=label)
-    _audit(actor, "record.detection_label", target_type="record", target_id=record_id, detail={"label": label})
+    stores = _stores(ctx)
+    actor = user_label(ctx)
+    meta = stores.records_meta.update(record_id, operator=actor, detection_label=label)
+    _audit(actor, "record.detection_label", ctx=ctx, target_type="record", target_id=record_id, detail={"label": label})
     return {"ok": True, "record_id": record_id, "detection_label": label}
 
 
-@app.post("/api/records/batch", dependencies=[Depends(require_write_access)])
+@app.post("/api/records/batch")
 def api_batch_records(
     body: BatchRecordAction,
-    user: dict[str, Any] = Depends(require_write_access),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
-    actor = user.get("username", "unknown")
+    stores = _stores(ctx)
+    actor = user_label(ctx)
     handlers = {
-        "publish": records_meta.publish,
-        "unpublish": records_meta.unpublish,
-        "delete": records_meta.soft_delete,
-        "restore": records_meta.restore,
-        "verify": records_meta.verify,
-        "reject": records_meta.reject,
+        "publish": stores.records_meta.publish,
+        "unpublish": stores.records_meta.unpublish,
+        "delete": stores.records_meta.soft_delete,
+        "restore": stores.records_meta.restore,
+        "verify": stores.records_meta.verify,
+        "reject": stores.records_meta.reject,
     }
     handler = handlers[body.action]
     results = []
     for rid in body.record_ids:
-        if registry.get_by_record_id(rid) is None:
+        if stores.registry.get_by_record_id(rid) is None:
             results.append({"record_id": rid, "ok": False, "error": "not_found"})
             continue
         if body.action in {"publish", "verify"}:
             try:
-                _reject_if_manual_weight_required(rid)
+                _reject_if_manual_weight_required(rid, stores)
             except HTTPException as exc:
                 results.append({"record_id": rid, "ok": False, "error": str(exc.detail)})
                 continue
         meta = handler(rid, operator=actor)
         if body.action == "delete":
-            upload_queue.delete_by_record_id(rid)
+            stores.upload_queue.delete_by_record_id(rid)
         results.append({"record_id": rid, "ok": True, "meta": meta})
     _audit(
         actor,
         f"record.batch.{body.action}",
+        ctx=ctx,
         target_type="record",
         target_id=",".join(body.record_ids[:5]),
         detail={"count": len(body.record_ids)},
@@ -2173,14 +2436,16 @@ def api_records(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     include_deleted: bool = Query(False),
-    user: dict[str, Any] = Depends(require_active_user),
+    ctx: TenantContext = Depends(_read_ctx),
 ) -> dict[str, Any]:
+    stores = _stores(ctx)
     # tab=deleted always includes deleted; otherwise require explicit flag.
+    # （读上下文已过身份门槛；删除视图沿用旧"任意已登录用户"语义。）
     show_deleted = tab == "deleted" or include_deleted
     items = collect_records(
-        registry,
-        records_meta,
-        DEFAULT_OUTPUT,
+        stores.registry,
+        stores.records_meta,
+        stores.output_root,
         tab=tab if tab != "all" else None,
         strain=strain,
         cage_id=cage_id,
@@ -2192,7 +2457,7 @@ def api_records(
     total = len(items)
     start = (page - 1) * page_size
     page_items = items[start : start + page_size]
-    overview = overview_stats(registry, records_meta, DEFAULT_OUTPUT)
+    overview = overview_stats(stores.registry, stores.records_meta, stores.output_root)
     return {
         "items": page_items,
         "total": total,
@@ -2215,18 +2480,20 @@ def api_overview(
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     status: str | None = Query(None),
-    user: dict[str, Any] = Depends(require_active_user),
+    ctx: TenantContext = Depends(_read_ctx),
 ) -> dict[str, Any]:
+    stores = _stores(ctx)
     return overview_stats(
-        registry, records_meta, DEFAULT_OUTPUT,
+        stores.registry, stores.records_meta, stores.output_root,
         strain=strain, cage_id=cage_id,
         date_from=date_from, date_to=date_to, status=status,
     )
 
 
 @app.get("/api/mice-admin")
-def api_mice_admin(user: dict[str, Any] = Depends(require_active_user)) -> dict[str, Any]:
-    return {"items": mice_admin_view(registry, records_meta, DEFAULT_OUTPUT)}
+def api_mice_admin(ctx: TenantContext = Depends(_read_ctx)) -> dict[str, Any]:
+    stores = _stores(ctx)
+    return {"items": mice_admin_view(stores.registry, stores.records_meta, stores.output_root)}
 
 
 @app.get("/api/verify-cages")
@@ -2235,10 +2502,11 @@ def api_verify_cages(
     cage_id: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
-    user: dict[str, Any] = Depends(require_active_user),
+    ctx: TenantContext = Depends(_read_ctx),
 ) -> dict[str, Any]:
+    stores = _stores(ctx)
     return verify_cages_view(
-        registry, records_meta, DEFAULT_OUTPUT,
+        stores.registry, stores.records_meta, stores.output_root,
         strain=strain, cage_id=cage_id, date_from=date_from, date_to=date_to,
     )
 
@@ -2252,13 +2520,14 @@ def api_export(
     q: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
-    user: dict[str, Any] = Depends(require_active_user),
+    ctx: TenantContext = Depends(_read_ctx),
 ) -> Response:
+    stores = _stores(ctx)
     show_deleted = tab == "deleted"
     items = collect_records(
-        registry,
-        records_meta,
-        DEFAULT_OUTPUT,
+        stores.registry,
+        stores.records_meta,
+        stores.output_root,
         tab=tab if tab != "all" else None,
         strain=strain,
         cage_id=cage_id,
@@ -2277,8 +2546,9 @@ def api_export(
         media = "text/csv; charset=utf-8"
         filename = f"mousevision_export_{stamp}.csv"
     _audit(
-        user.get("username", "unknown"),
+        user_label(ctx),
         "export.download",
+        ctx=ctx,
         target_type="export",
         target_id=format,
         detail={"count": len(items)},
@@ -2295,6 +2565,33 @@ class LoginRequest(BaseModel):
     password: str
 
 
+def _auto_activate_tenant(token: str, user_id: str, tenants: list[dict[str, Any]]) -> str | None:
+    """B6（合同 §15-B6 / B3+B4 遗留#1）：登录自动激活唯一可访问租户（保旧 UX）。
+
+    - 0 个可访问租户（纯平台管理员 / 空主账号）→ 不激活（account 级上下文）；
+    - 恰好 1 个 active 租户（membership 或 parent_owner 唯一 account 唯一租户）
+      → 会话自动设置 active_tenant_id，旧行为「登录即可用」得以保留；
+    - 多个 → 不自动选择，由 PC 工作区切换器显式激活。
+
+    平台管理员（platform_admin）一律不自动激活：§4.2 平台角色不落在工作区上，
+    且必须保住 B3+B4 决策#1「账号级会话 + 显式设备/legacy 令牌 → 按令牌解析」
+    的既有语义（平台会话一旦激活租户就会压过显式令牌）。
+
+    返回被激活的 tenant_id（未激活返回 None）。租户必须 status=active；
+    paused 租户不参与自动激活（解析层本就会拒绝其上下文）。
+    """
+    if control_store.is_platform_admin(user_id):
+        return None
+    active = [
+        t for t in tenants if str(t.get("status") or "active") == "active"
+    ]
+    if len(active) != 1:
+        return None
+    tenant_id = str(active[0]["tenant_id"])
+    control_store.set_session_tenant(token, tenant_id)
+    return tenant_id
+
+
 @app.post("/api/login")
 def api_login(request: Request, body: LoginRequest) -> JSONResponse:
     check_login_rate_limit(request)
@@ -2304,8 +2601,19 @@ def api_login(request: Request, body: LoginRequest) -> JSONResponse:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     clear_login_failures(request)
     token = user_store.create_session(user["id"])
+    # 响应形状只增不改：附加 tenants（用户可进入的工作区列表，合同 §15-B2）
+    # 与 active_tenant_id（B6 登录自动激活的结果，未激活为 null）。
+    tenants = user_store.list_tenants_for_user(user["id"])
+    active_tenant_id = _auto_activate_tenant(token, user["id"], tenants)
     _audit(user["username"], "auth.login", target_type="user", target_id=user["id"])
-    resp = JSONResponse({"ok": True, "user": user})
+    resp = JSONResponse(
+        {
+            "ok": True,
+            "user": user,
+            "tenants": tenants,
+            "active_tenant_id": active_tenant_id,
+        }
+    )
     resp.set_cookie(
         SESSION_COOKIE,
         token,
@@ -2363,6 +2671,9 @@ def api_change_own_password(
         raise HTTPException(status_code=401, detail="当前密码不正确")
     updated = user_store.update_user(user["id"], password=body.new_password)
     token = user_store.create_session(user["id"])
+    # B6：改密撤销全部会话后补发的新会话同样走自动激活，保持租户上下文连续
+    #（否则改密后所有业务 API 突然 403，需用户重新手动切换）。
+    _auto_activate_tenant(token, user["id"], user_store.list_tenants_for_user(user["id"]))
     _audit(user["username"], "auth.change_password", target_type="user", target_id=user["id"])
     resp = JSONResponse({"ok": True, "user": updated})
     resp.set_cookie(
@@ -2390,9 +2701,35 @@ class UserUpdate(BaseModel):
     password: str | None = None
 
 
+def _require_platform_admin_actor(actor: dict[str, Any]) -> None:
+    """账号级全局操作的门槛（Review S3 权限收紧）：仅 platform_admin。
+
+    ``require_role("admin")`` 的 admin 派生链里含 legacy-default tenant_admin
+    （兼容旧 PC 登录）；账号级全局操作（建号/改任意用户密码/禁用/删除/看全平台
+    名录）不得随该派生链泄露。tenant_admin 管理本租户成员走
+    ``/api/control/tenants/{id}/members``。
+    """
+    if not control_store.is_platform_admin(actor["id"]):
+        raise HTTPException(status_code=403, detail="需要平台管理员权限")
+
+
 @app.get("/api/users", dependencies=[Depends(require_role("admin"))])
-def api_list_users() -> dict[str, Any]:
-    return {"items": user_store.list_users()}
+def api_list_users(
+    actor: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """用户名录（Review S3 收紧）：platform_admin 看全表；其余 admin 派生身份
+    （legacy-default tenant_admin）只能看到自己 membership 所在租户的成员名录。"""
+    if control_store.is_platform_admin(actor["id"]):
+        return {"items": user_store.list_users()}
+    items: dict[str, dict[str, Any]] = {}
+    for item in control_store.list_user_tenants(actor["id"]):
+        if item.get("via") != "member":
+            continue  # 仅 membership 所在租户；parent_owner 视界不走此通道
+        for row in control_store.list_tenant_members(str(item["tenant_id"])):
+            public = user_store.get_by_id(str(row["user_id"]))
+            if public is not None:
+                items[public["id"]] = public
+    return {"items": list(items.values())}
 
 
 @app.post("/api/users", dependencies=[Depends(require_role("admin"))])
@@ -2400,6 +2737,7 @@ def api_create_user(
     body: UserCreate,
     actor: dict[str, Any] = Depends(require_role("admin")),
 ) -> JSONResponse:
+    _require_platform_admin_actor(actor)
     try:
         user = user_store.create_user(
             username=body.username,
@@ -2425,6 +2763,7 @@ def api_update_user(
     body: UserUpdate,
     actor: dict[str, Any] = Depends(require_role("admin")),
 ) -> dict[str, Any]:
+    _require_platform_admin_actor(actor)
     changes = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
         user = user_store.update_user(user_id, **changes)
@@ -2440,6 +2779,7 @@ def api_delete_user(
     user_id: str,
     actor: dict[str, Any] = Depends(require_role("admin")),
 ) -> dict[str, Any]:
+    _require_platform_admin_actor(actor)
     if actor["id"] == user_id:
         raise HTTPException(status_code=400, detail="不能删除当前登录用户")
     try:
@@ -2450,64 +2790,91 @@ def api_delete_user(
     return {"ok": True}
 
 
-@app.get("/api/logs", dependencies=[Depends(require_role("admin", "operator"))])
+@app.get("/api/logs")
 def api_logs(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     action: str | None = Query(None),
+    request: Request = None,  # noqa: B008 - FastAPI 注入
 ) -> dict[str, Any]:
-    return audit_store.list(limit=limit, offset=offset, action=action)
+    """审计查询（§6.4）：仅会话用户；租户成员只见本租户业务审计；平台管理员
+    可见全部（含控制面事件）。legacy 令牌/设备凭证不得读审计。"""
+    ctx = _tenant_ctx(request)
+    if ctx.actor_type not in {"user", "platform"}:
+        raise HTTPException(status_code=403, detail="权限不足")
+    if ROLE_PLATFORM_ADMIN in ctx.roles:
+        return audit_store.list(limit=limit, offset=offset, action=action)
+    if not ctx.has_role(ROLE_OPERATOR, ROLE_TENANT_ADMIN):
+        raise HTTPException(status_code=403, detail="权限不足")
+    return audit_store.list(
+        limit=limit, offset=offset, action=action, tenant_id=ctx.tenant_id
+    )
 
 
 @app.get("/api/settings")
-def api_get_settings(user: dict[str, Any] = Depends(require_active_user)) -> dict[str, Any]:
-    return settings_store.get()
+def api_get_settings(ctx: TenantContext = Depends(_read_ctx)) -> dict[str, Any]:
+    stores = _stores(ctx)
+    return stores.settings_store.get()
 
 
-@app.put("/api/settings", dependencies=[Depends(require_role("admin"))])
+@app.put("/api/settings")
 def api_put_settings(
     body: dict[str, Any] = Body(...),
-    actor: dict[str, Any] = Depends(require_role("admin")),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> dict[str, Any]:
+    # 设置是工作区管理动作：tenant_admin（§4.2）；operator/设备不得改。
+    if not ctx.has_role(ROLE_TENANT_ADMIN):
+        raise HTTPException(status_code=403, detail="需要本工作区管理员权限")
+    stores = _stores(ctx)
     try:
-        updated = settings_store.update(body)
+        updated = stores.settings_store.update(body)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    _audit(actor["username"], "settings.update", target_type="settings", detail=body)
+    _audit(user_label(ctx), "settings.update", ctx=ctx, target_type="settings", detail=body)
     return updated
 
 
 
 @app.get("/api/status")
-def api_status() -> dict[str, Any]:
-    return engine.status()
+def api_status(ctx: TenantContext = Depends(_read_ctx)) -> dict[str, Any]:
+    """当前租户的回放状态（§2.6：禁止返回"全局正在播什么"）。"""
+    return _stores(ctx).extra["playback"].status()
 
 
 @app.get("/api/runs")
-def api_runs() -> dict[str, Any]:
-    runs = registry.list_runs()
-    active = registry.active_run()
+def api_runs(ctx: TenantContext = Depends(_read_ctx)) -> dict[str, Any]:
+    stores = _stores(ctx)
+    runs = stores.registry.list_runs()
+    active = stores.registry.active_run()
     return {
         "items": runs,
         "active_run_id": active["run_id"] if active else None,
     }
 
 
-@app.post("/api/runs/active", dependencies=[Depends(require_token_or_operator)])
-def api_set_active_run(run_id: str = Query(...)) -> dict[str, Any]:
-    runs = registry.list_runs()
+@app.post("/api/runs/active")
+def api_set_active_run(
+    run_id: str = Query(...),
+    ctx: TenantContext = Depends(_write_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    runs = stores.registry.list_runs()
     match = next((r for r in runs if r["run_id"] == run_id), None)
     if match is None:
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-    registry.set_active_run(run_id, Path(match["path"]))
+    stores.registry.set_active_run(run_id, Path(match["path"]))
     return {"ok": True, "active_run_id": run_id}
 
 
 @app.get("/api/mice")
-def api_mice(run_id: str | None = Query(None)) -> dict[str, Any]:
-    active = registry.active_run()
+def api_mice(
+    run_id: str | None = Query(None),
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
+    stores = _stores(ctx)
+    active = stores.registry.active_run()
     rid = run_id or (active["run_id"] if active else None)
-    mice = registry.list_mice(run_id=rid)
+    mice = stores.registry.list_mice(run_id=rid)
     items = []
     for m in mice:
         items.append(
@@ -2520,7 +2887,7 @@ def api_mice(run_id: str | None = Query(None)) -> dict[str, Any]:
         )
     return {
         "items": items,
-        "next_index": registry.peek_next_ordinal(rid),
+        "next_index": stores.registry.peek_next_ordinal(rid),
         "run_id": rid,
         "cage_id": active.get("cage_id") if active else None,
         "run": active,
@@ -2528,10 +2895,16 @@ def api_mice(run_id: str | None = Query(None)) -> dict[str, Any]:
 
 
 @app.get("/api/mice/{index}")
-def api_mouse(index: int, run_id: str | None = Query(None)) -> dict[str, Any]:
-    mouse = registry.get(index, run_id=run_id)
+def api_mouse(
+    index: int,
+    run_id: str | None = Query(None),
+    ctx: TenantContext = Depends(_read_ctx),
+) -> dict[str, Any]:
+    # B0.6 补充收口：鼠只明细不再匿名可读（§6.1）。
+    stores = _stores(ctx)
+    mouse = stores.registry.get(index, run_id=run_id)
     if mouse is None:
-        return {"error": "not found"}
+        raise HTTPException(status_code=404, detail="记录不存在")
     mouse["photo_url"] = f"/api/mice/{index}/photo" + (
         f"?run_id={mouse['run_id']}" if mouse.get("run_id") else ""
     )
@@ -2544,14 +2917,16 @@ def api_mouse_photo(
     index: int,
     run_id: str | None = Query(None),
     size: str = Query("thumb", pattern="^(thumb|full)$"),
+    ctx: TenantContext = Depends(_read_ctx),
 ):
-    mouse = registry.get(index, run_id=run_id)
+    stores = _stores(ctx)
+    mouse = stores.registry.get(index, run_id=run_id)
     if mouse is None:
-        return {"error": "not found"}
-    path = DEFAULT_OUTPUT / mouse["dir"] / mouse.get("photo", "photo.jpg")
+        raise HTTPException(status_code=404, detail="记录不存在")
+    path = stores.output_root / mouse["dir"] / mouse.get("photo", "photo.jpg")
     if not path.exists():
-        return {"error": "photo missing"}
-    return _serve_photo(path, size)
+        raise HTTPException(status_code=404, detail="照片不存在")
+    return _serve_photo(path, size, thumbs_root=stores.output_root)
 
 
 class StartPlaybackRequest(BaseModel):
@@ -2564,10 +2939,16 @@ class StartPlaybackRequest(BaseModel):
     ordinal: int | None = None
 
 
-@app.post("/api/start", dependencies=[Depends(require_token_or_operator)])
-def api_start(body: StartPlaybackRequest | None = Body(default=None)) -> Any:
+@app.post("/api/start")
+def api_start(
+    body: StartPlaybackRequest | None = Body(default=None),
+    ctx: TenantContext = Depends(_write_ctx),
+) -> Any:
+    """当前租户的回放（PlaybackEngine 按租户分实例，§2.6/§15-B3）。"""
+    stores = _stores(ctx)
+    eng = stores.extra["playback"]
     req = body or StartPlaybackRequest()
-    result = engine.start(
+    result = eng.start(
         cage_id=req.cage_id,
         speed=req.speed,
         continuous=req.continuous,
@@ -2582,84 +2963,101 @@ def api_start(body: StartPlaybackRequest | None = Body(default=None)) -> Any:
     return result
 
 
-@app.post("/api/reset", dependencies=[Depends(require_admin_session)])
-def api_reset(actor: dict[str, Any] = Depends(require_admin_session)) -> Any:
-    """Clear registry and old weighing outputs (keeps debug folders).
+@app.post("/api/tenants/{tenant_id}/reset")
+def api_tenant_reset(
+    tenant_id: str,
+    ctx: TenantContext = Depends(_tenant_ctx),
+) -> Any:
+    """租户级 reset（合同 §2.5/§6.3/§15-B3）。
 
-    Admin session only — machine tokens and operator accounts cannot wipe data.
+    顺序：先把该租户置 paused 阻止新写入 → 停其 realtime 会话与回放 →
+    校验无活动 job → 只删该租户目录 → 重建 store 缓存 → 恢复 active。
+    仅本租户 tenant_admin 或平台管理员；parent_owner 默认不可（§4.2）。
     """
-    if job_store.active_count():
-        return JSONResponse(
-            {"ok": False, "error": "active_jobs", "message": "仍有上传或分析任务运行中"},
-            status_code=409,
-        )
+    try:
+        tid = tenant_factory.validate_tenant_id(tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="工作区不存在") from exc
+    tenant = control_store.get_tenant(tid)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="工作区不存在")
+    allowed = (ROLE_PLATFORM_ADMIN in ctx.roles) or (
+        ctx.tenant_id == tid and ROLE_TENANT_ADMIN in ctx.roles
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="需要本工作区管理员权限")
 
-    engine.stop()
+    control_store.set_tenant_status(tid, "paused")  # 阻止该租户新写入
     removed = 0
-    keep = {
-        "debug_digits",
-        "roi_preview",
-        "roi_probe",
-        "mice_registry.json",
-        "upload_queue.db",
-        "jobs.db",
-        "jobs.db-shm",
-        "jobs.db-wal",
-        JOB_UPLOAD_ROOT.name,
-    }
-    if DEFAULT_OUTPUT.exists():
-        for path in list(DEFAULT_OUTPUT.iterdir()):
-            if path.name in keep:
-                continue
-            if not path.is_dir():
-                continue
-            has_records = (path / "record.json").exists() or any(path.glob("**/record.json"))
-            if path.name.startswith("run_") or has_records:
-                shutil.rmtree(path)
-                removed += 1
-    job_store.clear()
-    if JOB_UPLOAD_ROOT.exists():
-        shutil.rmtree(JOB_UPLOAD_ROOT)
-    JOB_UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    if REGISTRY_PATH.exists():
-        REGISTRY_PATH.unlink()
-    if QUEUE_DB.exists():
-        QUEUE_DB.unlink()
-    global registry, upload_queue
-    registry = MouseRegistry(REGISTRY_PATH, DEFAULT_OUTPUT)
-    upload_queue = UploadQueue(QUEUE_DB)
-    engine.registry = registry
-    engine.upload_queue = upload_queue
+    try:
+        realtime_api.stop_sessions_for_tenant(tid)
+        stores = tenant_factory.stores(tid)
+        eng = stores.extra.get("playback")
+        if eng is not None:
+            eng.stop()
+        if stores.job_store.active_count():
+            return JSONResponse(
+                {"ok": False, "error": "active_jobs", "message": "仍有上传或分析任务运行中"},
+                status_code=409,
+            )
+        tenant_dir = tenant_factory.tenants_root / tid
+        if tenant_dir.exists():
+            shutil.rmtree(tenant_dir)
+        tenant_factory.drop_tenant(tid)
+        stores = tenant_factory.stores(tid)  # 重建目录 + store 缓存
+        stores.box_registry.sync_from_records(stores.output_root)
+        removed = 1
+    finally:
+        control_store.set_tenant_status(tid, "active")
     _audit(
-        actor.get("username", "admin"),
-        "system.reset",
-        target_type="system",
+        user_label(ctx),
+        "tenant.reset",
+        ctx=ctx,
+        target_type="tenant",
+        target_id=tid,
         detail={"removed": removed},
     )
+    fresh = tenant_factory.stores(tid)
     return {
         "ok": True,
         "removed": removed,
         "jobs_cleared": True,
-        "next_index": registry.peek_next_ordinal(),
+        "next_index": fresh.registry.peek_next_ordinal(),
     }
 
 
-@app.post("/api/stop", dependencies=[Depends(require_token_or_operator)])
-def api_stop() -> dict[str, Any]:
-    return engine.stop()
+@app.post("/api/reset")
+def api_reset() -> Any:
+    """旧全局清盘端点已按合同删除（§2.5/§6.3/§15-B3：reset 变为租户操作）。
+
+    保留路由为永久 403 墓碑，避免任何主体（含平台管理员/共享令牌）再触发
+    全盘 rmtree；使用 `POST /api/tenants/{tenant_id}/reset`。
+    """
+    raise HTTPException(
+        status_code=403,
+        detail="全局 reset 已移除；请使用 POST /api/tenants/{tenant_id}/reset",
+    )
+
+
+@app.post("/api/stop")
+def api_stop(ctx: TenantContext = Depends(_write_ctx)) -> dict[str, Any]:
+    return _stores(ctx).extra["playback"].stop()
 
 
 @app.get("/api/upload-queue")
-def api_upload_queue() -> dict[str, Any]:
-    return {"counts": upload_queue.counts(), "pending": upload_queue.list_pending(20)}
+def api_upload_queue_stats(ctx: TenantContext = Depends(_read_ctx)) -> dict[str, Any]:
+    stores = _stores(ctx)
+    return {"counts": stores.upload_queue.counts(), "pending": stores.upload_queue.list_pending(20)}
 
 
 @app.get("/api/stream")
-def api_stream() -> StreamingResponse:
+def api_stream(ctx: TenantContext = Depends(_read_ctx)) -> StreamingResponse:
+    eng = _stores(ctx).extra["playback"]
+
     def gen():
         while True:
-            with engine.lock:
-                jpeg = engine.state.frame_jpeg
+            with eng.lock:
+                jpeg = eng.state.frame_jpeg
             if jpeg is None:
                 time.sleep(0.05)
                 continue
@@ -2670,15 +3068,17 @@ def api_stream() -> StreamingResponse:
 
 
 @app.get("/api/photo", response_model=None)
-def api_photo():
-    with engine.lock:
-        out = engine.state.output_dir
-        mouse_no = engine.state.mouse_no
-        run_id = engine.state.run_id
+def api_photo(ctx: TenantContext = Depends(_read_ctx)):
+    stores = _stores(ctx)
+    eng = stores.extra["playback"]
+    with eng.lock:
+        out = eng.state.output_dir
+        mouse_no = eng.state.mouse_no
+        run_id = eng.state.run_id
     if mouse_no is not None:
-        mouse = registry.get(mouse_no, run_id=run_id)
+        mouse = stores.registry.get(mouse_no, run_id=run_id)
         if mouse:
-            path = DEFAULT_OUTPUT / mouse["dir"] / mouse.get("photo", "photo.jpg")
+            path = stores.output_root / mouse["dir"] / mouse.get("photo", "photo.jpg")
             if path.exists():
                 return FileResponse(path)
     if not out:
@@ -2691,12 +3091,16 @@ def api_photo():
 
 # ---------------------------------------------------------------------------
 # Algorithm lab: side-by-side agent vs classic (http_ocr/template) compare
+# （B3：compare_runs 进租户目录 —— _compare_root(stores)；不再有全局 COMPARE_ROOT）
 # ---------------------------------------------------------------------------
 
-COMPARE_ROOT = DEFAULT_OUTPUT / "compare_runs"
 _COMPARE_LOCK = threading.Lock()
 _COMPARE_BRANCHES = ("agent", "classic")
 _COMPARE_SOURCE_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv")
+
+
+def _compare_root(stores: TenantStores) -> Path:
+    return stores.output_root / "compare_runs"
 
 
 def _find_run_source(run_dir: Path) -> Path | None:
@@ -2712,49 +3116,50 @@ def _find_run_source(run_dir: Path) -> Path | None:
     return None
 
 
-def _resolve_run_dir_for_source(source_run_id: str) -> Path:
+def _resolve_run_dir_for_source(source_run_id: str, stores: TenantStores) -> Path:
     """Resolve a registry run_id to its run dir, enforcing path-traversal safety.
 
     Used by compare to reuse a platform video in place (read-only, no copy).
+    只在当前租户根内解析（§15-B3）。
     """
     cleaned = _clean_id(source_run_id, field_name="source_run_id")
     target: Path | None = None
-    for run in registry.list_runs():
+    for run in stores.registry.list_runs():
         if run.get("run_id") == cleaned:
             target = Path(run["path"])
             break
     if target is None:
         # Allow matching by directory name as a fallback.
-        candidate = DEFAULT_OUTPUT / cleaned
+        candidate = stores.output_root / cleaned
         if candidate.is_dir():
             target = candidate
     if target is None:
         raise HTTPException(status_code=404, detail=f"未找到 run: {cleaned}")
     try:
-        target.resolve().relative_to(DEFAULT_OUTPUT.resolve())
+        target.resolve().relative_to(stores.output_root.resolve())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="非法 run 路径") from exc
     return target
 
 
-def _compare_result_path(compare_id: str) -> Path:
-    return COMPARE_ROOT / compare_id / "compare_result.json"
+def _compare_result_path(compare_id: str, stores: TenantStores) -> Path:
+    return _compare_root(stores) / compare_id / "compare_result.json"
 
 
-def _resolve_compare_branch_dir(compare_id: str, branch: str) -> Path:
+def _resolve_compare_branch_dir(compare_id: str, branch: str, stores: TenantStores) -> Path:
     """Locate the run_dir recorded for a compare branch.
 
-    Validates the path lies under COMPARE_ROOT to prevent traversal. Falls back
-    to globbing `COMPARE_ROOT/<cmp>/<branch>/run_*` if compare_result.json is
-    missing or malformed.
+    Validates the path lies under the tenant COMPARE_ROOT to prevent traversal.
+    Falls back to globbing `COMPARE_ROOT/<cmp>/<branch>/run_*` if
+    compare_result.json is missing or malformed.
     """
     if branch not in _COMPARE_BRANCHES:
         raise HTTPException(status_code=422, detail="branch 仅支持 agent|classic")
-    cmp_root = COMPARE_ROOT / compare_id
+    cmp_root = _compare_root(stores) / compare_id
     if not cmp_root.is_dir():
         raise HTTPException(status_code=404, detail="compare not found")
     run_dir: Path | None = None
-    result_path = _compare_result_path(compare_id)
+    result_path = _compare_result_path(compare_id, stores)
     if result_path.is_file():
         try:
             data = json.loads(result_path.read_text(encoding="utf-8"))
@@ -2762,7 +3167,7 @@ def _resolve_compare_branch_dir(compare_id: str, branch: str) -> Path:
             if rd:
                 cand = Path(rd)
                 try:
-                    cand.resolve().relative_to(COMPARE_ROOT.resolve())
+                    cand.resolve().relative_to(_compare_root(stores).resolve())
                     run_dir = cand
                 except ValueError:
                     run_dir = None
@@ -2899,7 +3304,7 @@ def _run_pipeline_branch(
     }
 
 
-@app.post("/api/lab/compare", dependencies=[Depends(require_token_or_operator)])
+@app.post("/api/lab/compare")
 async def api_lab_compare(
     video: UploadFile | None = File(None),
     source_run_id: str = Form(""),
@@ -2907,6 +3312,7 @@ async def api_lab_compare(
     classic_reader: str = Form("http_ocr"),
     run_agent: bool = Form(True),
     run_classic: bool = Form(True),
+    ctx: TenantContext = Depends(_write_ctx),
 ) -> JSONResponse:
     """Run agent and/or classic pipeline on one video; return side-by-side.
 
@@ -2915,8 +3321,9 @@ async def api_lab_compare(
     (read-only, no copy). Providing both or neither yields 422.
 
     Used by the algorithm lab UI for A/B evaluation. Does not touch the
-    production job queue ordinal allocator.
+    production job queue ordinal allocator. 产物进当前租户 compare_runs（§15-B3）。
     """
+    stores = _stores(ctx)
     classic = (classic_reader or "http_ocr").strip().lower()
     if classic not in {"http_ocr", "template", "ocr"}:
         raise HTTPException(status_code=422, detail="classic_reader 仅支持 http_ocr|template")
@@ -2934,7 +3341,7 @@ async def api_lab_compare(
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     compare_id = f"cmp_{stamp}_{uuid.uuid4().hex[:8]}"
-    work = COMPARE_ROOT / compare_id
+    work = _compare_root(stores) / compare_id
     work.mkdir(parents=True, exist_ok=False)
 
     video_name: str
@@ -2961,7 +3368,7 @@ async def api_lab_compare(
                 raise HTTPException(status_code=422, detail="空视频")
             video_name = video.filename or "source"
         else:
-            run_dir = _resolve_run_dir_for_source(source_run_id)
+            run_dir = _resolve_run_dir_for_source(source_run_id, stores)
             src = _find_run_source(run_dir)
             if src is None:
                 raise HTTPException(
@@ -3064,21 +3471,28 @@ async def api_lab_compare(
 
 
 @app.get("/api/lab/compare/{compare_id}")
-def api_lab_compare_get(compare_id: str) -> Any:
+def api_lab_compare_get(
+    compare_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+) -> Any:
+    # B0.6 补充收口：compare 结果不再匿名可读（§6.1）；只读本租户产物。
+    stores = _stores(ctx)
     cleaned = _clean_id(compare_id, field_name="compare_id")
-    path = COMPARE_ROOT / cleaned / "compare_result.json"
+    path = _compare_root(stores) / cleaned / "compare_result.json"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="compare not found")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-@app.get("/api/lab/compares", dependencies=[Depends(require_token_or_operator)])
-def api_lab_compares_list() -> Any:
+@app.get("/api/lab/compares")
+def api_lab_compares_list(ctx: TenantContext = Depends(_read_ctx)) -> Any:
     """List compare run directories (newest first) for the UI history dropdown."""
+    stores = _stores(ctx)
+    compare_root = _compare_root(stores)
     out: list[dict[str, Any]] = []
-    if not COMPARE_ROOT.exists():
+    if not compare_root.exists():
         return {"items": out}
-    for d in sorted(COMPARE_ROOT.glob("cmp_*"), reverse=True):
+    for d in sorted(compare_root.glob("cmp_*"), reverse=True):
         if not d.is_dir():
             continue
         item: dict[str, Any] = {
@@ -3109,11 +3523,12 @@ def api_lab_compares_list() -> Any:
     return {"items": out}
 
 
-@app.get("/api/lab/videos", dependencies=[Depends(require_token_or_operator)])
-def api_lab_videos() -> Any:
+@app.get("/api/lab/videos")
+def api_lab_videos(ctx: TenantContext = Depends(_read_ctx)) -> Any:
     """List platform videos persisted as ``source.<ext>`` in registry run dirs."""
+    stores = _stores(ctx)
     items: list[dict[str, Any]] = []
-    for run in registry.list_runs():
+    for run in stores.registry.list_runs():
         run_path = Path(run["path"])
         if not run_path.is_dir():
             continue
@@ -3146,22 +3561,25 @@ def api_lab_videos() -> Any:
 @app.get(
     "/api/lab/videos/{run_id}/poster",
     response_model=None,
-    dependencies=[Depends(require_token_or_operator)],
 )
-def api_lab_video_poster(run_id: str):
+def api_lab_video_poster(
+    run_id: str,
+    ctx: TenantContext = Depends(_read_ctx),
+):
     """Serve a poster for a platform video: analysis_preview, else first mouse photo."""
+    stores = _stores(ctx)
     cleaned = _clean_id(run_id, field_name="run_id")
     run_dir: Path | None = None
-    for run in registry.list_runs():
+    for run in stores.registry.list_runs():
         if run.get("run_id") == cleaned:
             run_dir = Path(run["path"])
             break
-    if run_dir is None and (DEFAULT_OUTPUT / cleaned).is_dir():
-        run_dir = DEFAULT_OUTPUT / cleaned
+    if run_dir is None and (stores.output_root / cleaned).is_dir():
+        run_dir = stores.output_root / cleaned
     if run_dir is None or not run_dir.is_dir():
         raise HTTPException(status_code=404, detail="run 不存在")
     try:
-        run_dir.resolve().relative_to(DEFAULT_OUTPUT.resolve())
+        run_dir.resolve().relative_to(stores.output_root.resolve())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="非法 run 路径") from exc
 
@@ -3178,28 +3596,34 @@ def api_lab_video_poster(run_id: str):
 @app.get(
     "/api/lab/compare/{compare_id}/branches/{branch}/mice/{ordinal}/photo",
     response_model=None,
-    dependencies=[Depends(require_token_or_operator)],
 )
 def api_lab_compare_mouse_photo(
     compare_id: str,
     branch: str,
     ordinal: int,
     size: str = Query("thumb", pattern="^(thumb|full)$"),
+    ctx: TenantContext = Depends(_read_ctx),
 ):
+    stores = _stores(ctx)
     cleaned = _clean_id(compare_id, field_name="compare_id")
-    run_dir = _resolve_compare_branch_dir(cleaned, branch)
+    run_dir = _resolve_compare_branch_dir(cleaned, branch, stores)
     mouse_dir = _resolve_compare_mouse_dir(run_dir, ordinal)
-    return _serve_photo(mouse_dir / "photo.jpg", size)
+    return _serve_photo(mouse_dir / "photo.jpg", size, thumbs_root=stores.output_root)
 
 
 @app.get(
     "/api/lab/compare/{compare_id}/branches/{branch}/mice/{ordinal}/clip",
     response_model=None,
-    dependencies=[Depends(require_token_or_operator)],
 )
-def api_lab_compare_mouse_clip(compare_id: str, branch: str, ordinal: int):
+def api_lab_compare_mouse_clip(
+    compare_id: str,
+    branch: str,
+    ordinal: int,
+    ctx: TenantContext = Depends(_read_ctx),
+):
+    stores = _stores(ctx)
     cleaned = _clean_id(compare_id, field_name="compare_id")
-    run_dir = _resolve_compare_branch_dir(cleaned, branch)
+    run_dir = _resolve_compare_branch_dir(cleaned, branch, stores)
     mouse_dir = _resolve_compare_mouse_dir(run_dir, ordinal)
     clip = mouse_dir / "clip.mp4"
     if not clip.is_file():

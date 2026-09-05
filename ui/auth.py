@@ -58,10 +58,14 @@ def cookie_secure(request: Request | None = None) -> bool:
 def require_api_token(
     x_mousevision_token: str | None = Header(None, alias="X-MouseVision-Token"),
 ) -> None:
-    """Machine/mobile write gate. Does NOT imply an admin user session."""
+    """Machine/mobile write gate. Does NOT imply an admin user session.
+
+    B4（合同 §4.3/§15-B4）：云版 open mode 关闭——未配置
+    ``MOUSEVISION_API_TOKEN`` 时一律 401，不再匿名放行。
+    """
     expected = api_token()
     if not expected:
-        return
+        raise HTTPException(status_code=401, detail="请先登录或提供有效 API token")
     if x_mousevision_token != expected:
         raise HTTPException(status_code=401, detail="无效或缺少 API token")
 
@@ -154,8 +158,9 @@ def require_token_or_operator(
 
     expected = api_token()
     if not expected:
-        # Open mode (no token configured): allow for mobile/legacy compatibility.
-        return {"auth": "open", "username": "anonymous", "role": "machine"}
+        # B4（合同 §4.3/§15-B4）：open mode 关闭——未配置 token 时拒绝，
+        # 不再产出匿名写身份（fail-closed 的 TenantContext 解析层已接管业务路由）。
+        raise HTTPException(status_code=401, detail="请先登录或提供有效 API token")
     if x_mousevision_token == expected:
         return {"auth": "token", "username": "api-token", "role": "machine"}
     raise HTTPException(status_code=401, detail="请先登录或提供有效 API token")

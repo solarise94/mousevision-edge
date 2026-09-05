@@ -125,7 +125,8 @@ class JobStore:
                         processing_started_at TEXT,
                         completed_at TEXT,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        tenant_id TEXT
                     )
                     """
                 )
@@ -153,6 +154,10 @@ class JobStore:
             "preview_crop": "TEXT",
             "capture_mode": "TEXT",
             "capture_meta": "TEXT",
+            # 租户隔离（合同 §6.3 / §15-B3）：job 行固化 tenant_id；worker 出队时
+            # 以该字段经 TenantStoreFactory 重新解析 store/root。租户目录内的库
+            # 该列恒等于所属租户，保留列是为了跨库汇总与防串号校验。
+            "tenant_id": "TEXT",
         }
         for column, coltype in additions.items():
             if column not in existing:
@@ -168,6 +173,7 @@ class JobStore:
         original_filename: str | None,
         content_type: str | None,
         requested_ordinal: int | None = None,
+        tenant_id: str | None = None,
     ) -> dict[str, Any]:
         job_id = str(uuid.uuid4())
         now = _now()
@@ -179,8 +185,8 @@ class JobStore:
                     INSERT INTO analysis_jobs (
                         job_id, project_id, cage_id, status, stage, progress,
                         original_filename, content_type, requested_ordinal,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, 'uploading', 'uploading', 0, ?, ?, ?, ?, ?)
+                        tenant_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'uploading', 'uploading', 0, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id,
@@ -189,6 +195,7 @@ class JobStore:
                         original_filename,
                         content_type,
                         requested_ordinal,
+                        tenant_id,
                         now,
                         now,
                     ),
@@ -482,7 +489,14 @@ class AnalysisJobManager:
         self._prune_interval = 8
         self._jobs_since_prune = 0
 
-    def start(self) -> None:
+    def recover(self) -> list[str]:
+        """Crash recovery without starting the worker thread.
+
+        Fails interrupted jobs, reconciles Held/Pending crash windows, prunes
+        aged-out source clips, and returns the ids of jobs still ``queued``.
+        Called by :meth:`start` and by the tenant dispatcher (which owns the
+        single worker thread for all tenants).
+        """
         # Finish crash-interrupted reject ops on the queue side only.
         # Without mark_meta_deleted, items stay at queue_gone (never fake-done);
         # app lifespan recovers with the metadata callback.
@@ -497,19 +511,22 @@ class AnalysisJobManager:
         except Exception:
             pass
         self._reconcile_held()
+        self.store.fail_interrupted()
+        # Drop source clips that aged out during downtime.
+        try:
+            self.prune_uploads()
+        except Exception:
+            pass
+        return [job["job_id"] for job in self.store.list_by_status("queued")]
+
+    def start(self) -> None:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
-            self.store.fail_interrupted()
-            # Drop source clips that aged out during downtime.
-            try:
-                self.prune_uploads()
-            except Exception:
-                pass
+            queued = self.recover()
             self._stop.clear()
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
-            queued = [job["job_id"] for job in self.store.list_by_status("queued")]
         for job_id in queued:
             self._queue.put(job_id)
 
@@ -517,8 +534,35 @@ class AnalysisJobManager:
         self._stop.set()
         self._queue.put(None)
         thread = self._thread
-        if thread is not None and thread.is_alive():
+        if thread is not None and self._thread.is_alive():
             thread.join(timeout=3.0)
+
+    def enqueue(self, job_id: str) -> dict[str, Any]:
+        """Validate + mark a job ``queued`` WITHOUT touching the internal queue.
+
+        The single-thread tenant dispatcher (ui/tenant_jobs.py) calls this and
+        then enqueues ``(tenant_id, job_id)`` on its own queue; a standalone
+        :class:`AnalysisJobManager` uses :meth:`submit` (enqueue + own worker).
+        """
+        job = self.store.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        raw_path = job.get("video_path")
+        if not raw_path:
+            raise ValueError("job video_path is missing")
+        video_path = Path(str(raw_path))
+        if not video_path.is_file():
+            raise FileNotFoundError(video_path)
+        with self._lock:
+            return self.store.update(
+                job_id,
+                status="queued",
+                stage="queued",
+                progress=0.05,
+                message="视频已上传，等待分析",
+                error=None,
+                queued_at=_now(),
+            )
 
     def submit(self, job_id: str) -> dict[str, Any]:
         job = self.store.get(job_id)
@@ -530,16 +574,8 @@ class AnalysisJobManager:
         video_path = Path(str(raw_path))
         if not video_path.is_file():
             raise FileNotFoundError(video_path)
+        queued = self.enqueue(job_id)
         with self._lock:
-            queued = self.store.update(
-                job_id,
-                status="queued",
-                stage="queued",
-                progress=0.05,
-                message="视频已上传，等待分析",
-                error=None,
-                queued_at=_now(),
-            )
             self._queue.put(job_id)
         return queued
 
@@ -554,97 +590,106 @@ class AnalysisJobManager:
             job_id = self._queue.get()  # blocks until submit() or sentinel
             if job_id is None:
                 break
-            job = self.store.get(job_id)
-            if job is None or job.get("status") != "queued":
-                continue
-            video_path = job.get("video_path")
-            cage_id = str(job.get("cage_id") or "")
-            requested_ordinal = job.get("requested_ordinal")
-            result: Any = None
-            try:
-                self.store.update(
-                    job_id,
-                    status="processing",
-                    stage="ocr_and_curve_analysis",
-                    progress=0.15,
-                    message="正在识别称量过程",
-                    error=None,
-                    processing_started_at=_now(),
+            self.process_one(job_id)
+
+    def process_one(self, job_id: str) -> None:
+        """Process one queued job synchronously (worker loop body).
+
+        The tenant dispatcher resolves the job's own store/root per dequeue and
+        calls this on the per-tenant manager; a standalone manager uses its own
+        single worker thread. Never caches the previous job's root across calls.
+        """
+        job = self.store.get(job_id)
+        if job is None or job.get("status") != "queued":
+            return
+        video_path = job.get("video_path")
+        cage_id = str(job.get("cage_id") or "")
+        requested_ordinal = job.get("requested_ordinal")
+        result: Any = None
+        try:
+            self.store.update(
+                job_id,
+                status="processing",
+                stage="ocr_and_curve_analysis",
+                progress=0.15,
+                message="正在识别称量过程",
+                error=None,
+                processing_started_at=_now(),
+            )
+            result = self.analysis_fn(job)
+            count = int(result.get("record_count") or 0)
+            decoded_frames = int(result.get("decoded_frames") or 0)
+            # Zero-detect: the reserved slot detected nothing. Release it
+            # (best-effort, tail-only) so a run of empty videos does not
+            # permanently consume ordinals (design §3.5.2 rule 3).
+            if (
+                count == 0
+                and self.release_ordinals is not None
+                and requested_ordinal is not None
+            ):
+                self.release_ordinals(cage_id, int(requested_ordinal))
+            self.store.update(
+                job_id,
+                status="completed",
+                stage="completed",
+                progress=1.0,
+                run_id=result.get("run_id"),
+                record_count=count,
+                decoded_frames=decoded_frames,
+                message=("未检出鼠只" if count == 0 else f"分析完成，共检出 {count} 只"),
+                error=None,
+                completed_at=_now(),
+            )
+        except VideoFormatError as exc:
+            # Corrupt/truncated upload. Ordinal release is handled entirely
+            # inside _run_pipeline: the zero-decode path releases the
+            # requested ordinal directly (nothing was persisted), and the
+            # truncation path rolls back persisted records and releases
+            # ordinals only when the rollback is confirmed clean. Releasing
+            # here too would either double-release (harmless) or, worse,
+            # release against a rollback shortfall (leaving orphan records
+            # that could collide with a reused ordinal). So this branch does
+            # NOT release — it only records the failure.
+            self.store.update(
+                job_id,
+                status="failed",
+                stage="failed",
+                progress=1.0,
+                message="视频格式异常",
+                error=str(exc),
+                completed_at=_now(),
+            )
+        except Exception as exc:
+            # Only release ordinal when we can prove no records occupy it.
+            # Gaps are acceptable; collisions are not (design §3.5.2).
+            # analysis_fn returns a dict (no .records); if it raised before
+            # returning, fall back to an on-disk occupancy check.
+            if (
+                self.release_ordinals is not None
+                and requested_ordinal is not None
+                and not self._records_persisted_for_job(
+                    result, cage_id, requested_ordinal
                 )
-                result = self.analysis_fn(job)
-                count = int(result.get("record_count") or 0)
-                decoded_frames = int(result.get("decoded_frames") or 0)
-                # Zero-detect: the reserved slot detected nothing. Release it
-                # (best-effort, tail-only) so a run of empty videos does not
-                # permanently consume ordinals (design §3.5.2 rule 3).
-                if (
-                    count == 0
-                    and self.release_ordinals is not None
-                    and requested_ordinal is not None
-                ):
+            ):
+                try:
                     self.release_ordinals(cage_id, int(requested_ordinal))
-                self.store.update(
-                    job_id,
-                    status="completed",
-                    stage="completed",
-                    progress=1.0,
-                    run_id=result.get("run_id"),
-                    record_count=count,
-                    decoded_frames=decoded_frames,
-                    message=("未检出鼠只" if count == 0 else f"分析完成，共检出 {count} 只"),
-                    error=None,
-                    completed_at=_now(),
-                )
-            except VideoFormatError as exc:
-                # Corrupt/truncated upload. Ordinal release is handled entirely
-                # inside _run_pipeline: the zero-decode path releases the
-                # requested ordinal directly (nothing was persisted), and the
-                # truncation path rolls back persisted records and releases
-                # ordinals only when the rollback is confirmed clean. Releasing
-                # here too would either double-release (harmless) or, worse,
-                # release against a rollback shortfall (leaving orphan records
-                # that could collide with a reused ordinal). So this branch does
-                # NOT release — it only records the failure.
-                self.store.update(
-                    job_id,
-                    status="failed",
-                    stage="failed",
-                    progress=1.0,
-                    message="视频格式异常",
-                    error=str(exc),
-                    completed_at=_now(),
-                )
-            except Exception as exc:
-                # Only release ordinal when we can prove no records occupy it.
-                # Gaps are acceptable; collisions are not (design §3.5.2).
-                # analysis_fn returns a dict (no .records); if it raised before
-                # returning, fall back to an on-disk occupancy check.
-                if (
-                    self.release_ordinals is not None
-                    and requested_ordinal is not None
-                    and not self._records_persisted_for_job(
-                        result, cage_id, requested_ordinal
-                    )
-                ):
-                    try:
-                        self.release_ordinals(cage_id, int(requested_ordinal))
-                    except Exception:
-                        pass
-                self.store.update(
-                    job_id,
-                    status="failed",
-                    stage="failed",
-                    progress=1.0,
-                    message="分析失败",
-                    error=str(exc),
-                    completed_at=_now(),
-                )
-            finally:
-                # Source videos are retained for VIDEO_RETENTION_DAYS so a
-                # 0-detect or failed run can be re-inspected. Prune
-                # opportunistically but not on every single job (avoid scanning
-                # the whole table each time).
-                self._maybe_prune_uploads()
+                except Exception:
+                    pass
+            self.store.update(
+                job_id,
+                status="failed",
+                stage="failed",
+                progress=1.0,
+                message="分析失败",
+                error=str(exc),
+                completed_at=_now(),
+            )
+        finally:
+            # Source videos are retained for VIDEO_RETENTION_DAYS so a
+            # 0-detect or failed run can be re-inspected. Prune
+            # opportunistically but not on every single job (avoid scanning
+            # the whole table each time).
+            self._maybe_prune_uploads()
 
     def _run_pipeline(self, job: dict[str, Any]) -> dict[str, Any]:
         raw_path = job.get("video_path")
