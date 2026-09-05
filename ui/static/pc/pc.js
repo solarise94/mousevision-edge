@@ -22,9 +22,16 @@
     pendingBadge: 0,
     miceGroups: [],
     expandedCages: {},
+    // B6：会话租户上下文（/api/control/session）与主账号工作区汇总。
+    session: null,        // { user, active_tenant_id, roles, tenants }
+    tenants: [],          // 当前用户可进入的工作区（子账号只会有自己的）
+    activeTenantId: null, // 会话激活的工作区（null = 未激活 / account 级）
+    accounts: [],         // parent_owner / platform 可见的主账号（403 → 空）
+    accountSummary: null, // /api/account/summary 响应（工作区总览页数据）
   };
 
   const ROUTES = [
+    { id: "workspaces", label: "工作区总览", section: "数据管理", visible: () => state.accounts.length > 0 },
     { id: "data", label: "数据管理", section: "数据管理" },
     { id: "overview", label: "数据总览", section: "数据管理" },
     { id: "verify", label: "快捷核对", section: "数据管理", badge: () => state.pendingBadge },
@@ -97,7 +104,74 @@
   }
 
   function canWrite() {
+    // B6：写能力按「当前激活工作区」的角色判断（§4.2 作用域角色）。
+    if (state.activeTenantId) {
+      const roles = (state.session && state.session.roles) || [];
+      return roles.includes("operator") || roles.includes("tenant_admin");
+    }
+    // 未激活租户（platform / legacy-default 旧语义）：沿用派生 admin/operator。
     return state.user && ["admin", "operator"].includes(state.user.role);
+  }
+
+  // 当前激活租户是否只读（parent_owner 主账号只读 / viewer 只读）。
+  function isReadOnlyTenant() {
+    if (!state.activeTenantId) return false;
+    const roles = (state.session && state.session.roles) || [];
+    return roles.includes("parent_owner") || (roles.length === 1 && roles[0] === "viewer");
+  }
+
+  function activeTenant() {
+    return state.tenants.find((t) => t.tenant_id === state.activeTenantId) || null;
+  }
+
+  // 拉取会话租户上下文与主账号可见性（B6）。
+  async function loadSession() {
+    try {
+      state.session = await api("/api/control/session");
+      state.tenants = state.session.tenants || [];
+      state.activeTenantId = state.session.active_tenant_id || null;
+    } catch (_) {
+      state.session = null;
+      state.tenants = [];
+      state.activeTenantId = null;
+    }
+    try {
+      const r = await api("/api/control/accounts");
+      state.accounts = r.items || [];
+    } catch (_) {
+      state.accounts = []; // 子账号：API 已拒绝，UI 不渲染任何 account 入口
+    }
+  }
+
+  // 切换激活工作区（B6）：调 session/tenant 端点后清空租户态数据并刷新。
+  async function switchTenant(tenantId) {
+    const opts = { method: tenantId ? "POST" : "DELETE", headers: { "Content-Type": "application/json" } };
+    if (tenantId) opts.body = JSON.stringify({ tenant_id: tenantId });
+    await api("/api/control/session/tenant", opts);
+    resetTenantData();
+    await loadSession();
+    if (state.activeTenantId) {
+      navigate("data", true);
+    } else {
+      navigate(state.accounts.length ? "workspaces" : "data", true);
+    }
+  }
+
+  function resetTenantData() {
+    state.records = [];
+    state.stats = {};
+    state.selectedId = null;
+    state.selected = null;
+    state.tab = "all";
+    state.page = 1;
+    state.total = 0;
+    state.pendingBadge = 0;
+    state.boxes = [];
+    state.overview = null;
+    state.miceGroups = [];
+    state.expandedCages = {};
+    state.verifyCages = undefined;
+    state.accountSummary = null;
   }
 
   function fmtWeight(w) {
@@ -134,6 +208,12 @@
       render();
       return;
     }
+    await loadSession();
+    // B6：主账号/平台未激活工作区时默认落在「工作区总览」。
+    if (!state.activeTenantId && state.accounts.length && (state.route === "data" || state.route === "")) {
+      state.route = "workspaces";
+      history.replaceState(null, "", "/pc/workspaces");
+    }
     await loadRoute();
     render();
   }
@@ -149,6 +229,14 @@
 
   async function loadRoute() {
     if (!state.user) return;
+    // B6：未激活工作区时，业务页面对 parent 会 403 —— 引导到工作区总览。
+    if (!state.activeTenantId && state.accounts.length && state.route !== "workspaces") {
+      state.route = "workspaces";
+      history.replaceState(null, "", "/pc/workspaces");
+    }
+    // data-loading 供 E2E 断言「页面进入终态、无永久 loading」（G6）。
+    const appEl = document.getElementById("app");
+    if (appEl) appEl.setAttribute("data-loading", "1");
     try {
       if (state.route === "verify") {
         await loadVerifyCages();
@@ -181,12 +269,17 @@
         const r = await api("/api/users");
         state.users = r.items || [];
       }
+      if (state.route === "workspaces") {
+        state.accountSummary = await api("/api/account/summary");
+      }
       if (state.pendingBadge === undefined || state.pendingBadge === 0) {
         state.pendingBadge = state.stats.pending_count || 0;
       }
       render();
     } catch (e) {
       console.error(e);
+    } finally {
+      if (appEl) appEl.removeAttribute("data-loading");
     }
   }
 
@@ -432,9 +525,41 @@
     });
   }
 
+  // B6：工作区切换器。子账号只会看到自己的工作区（列表来自
+  // /api/control/session，API 已按身份过滤）；parent_owner 的只读工作区
+  // 带「（只读）」标注。
+  function tenantSwitcher() {
+    if (!state.tenants.length && !state.accounts.length) return null;
+    const sel = h("select", { class: "tenant-select", "data-testid": "tenant-switcher", "aria-label": "当前工作区" });
+    if (state.accounts.length) {
+      sel.appendChild(h("option", { value: "" }, "⚙ 工作区总览（主账号）"));
+    }
+    state.tenants.forEach((t) => {
+      if (String(t.status || "active") !== "active") return;
+      const readonly = t.role === "parent_owner" || t.role === "viewer";
+      sel.appendChild(
+        h("option", { value: t.tenant_id }, (t.name || t.tenant_id) + (readonly ? "（只读）" : ""))
+      );
+    });
+    const known = state.tenants.some((t) => t.tenant_id === state.activeTenantId);
+    sel.value = state.activeTenantId && known ? state.activeTenantId : "";
+    if (sel.value !== (state.activeTenantId || "") && !state.accounts.length && sel.options.length) {
+      sel.value = sel.options[0].value; // 子账号兜底：值异常时回落第一项
+    }
+    sel.addEventListener("change", () => {
+      const v = sel.value || null;
+      switchTenant(v).catch((e) => {
+        alert(e.message || "切换工作区失败");
+        render();
+      });
+    });
+    return h("label", { class: "tenant-switcher" }, h("span", null, "工作区"), sel);
+  }
+
   function shell(nodes) {
     const sections = {};
     ROUTES.forEach((r) => {
+      if (r.visible && !r.visible()) return;
       if (r.roles && state.user && !r.roles.includes(state.user.role) && state.user.role !== "admin")
         return;
       sections[r.section] = sections[r.section] || [];
@@ -475,6 +600,13 @@
           { class: "sidebar-foot" },
           h("strong", null, state.user?.display_name || state.user?.username || ""),
           state.user?.role || "",
+          (() => {
+            const t = activeTenant();
+            return t
+              ? h("div", { class: "muted", "data-testid": "current-workspace" },
+                  `工作区：${t.name || t.tenant_id}${isReadOnlyTenant() ? "（只读）" : ""}`)
+              : null;
+          })(),
           h("br"),
           h("button", {
             class: "btn ghost",
@@ -497,6 +629,8 @@
           h(
             "div",
             { class: "topbar-actions" },
+            tenantSwitcher(),
+            isReadOnlyTenant() ? h("span", { class: "readonly-pill", title: "主账号对子工作区默认只读（§4.2）" }, "只读") : null,
             h("button", { class: "btn ghost", onClick: () => loadRoute() }, "刷新"),
             h("button", {
               class: "btn ghost",
@@ -1132,6 +1266,87 @@
     return viewData();
   }
 
+  // B6：主账号工作区汇总页（/api/account/summary，parent_owner / platform）。
+  function viewWorkspaces() {
+    const data = state.accountSummary || { items: [], total_tenants: 0 };
+    const items = data.items || [];
+    const totalRecords = items.reduce((a, r) => a + (r.records || 0), 0);
+    const totalPending = items.reduce((a, r) => a + (r.pending_uploads || 0), 0);
+
+    const kpis = h(
+      "div",
+      { class: "kpi-row" },
+      h("div", { class: "kpi" }, h("div", { class: "label" }, "工作区数"), h("div", { class: "value" }, String(items.length))),
+      h("div", { class: "kpi" }, h("div", { class: "label" }, "记录总数"), h("div", { class: "value green" }, String(totalRecords))),
+      h("div", { class: "kpi" }, h("div", { class: "label" }, "待上传"), h("div", { class: "value" }, String(totalPending)))
+    );
+
+    const exportBar = h(
+      "div",
+      { class: "filters" },
+      h("span", { class: "muted", style: "font-size:12px" }, "跨工作区导出（每行带 tenant_id / tenant_name）："),
+      h("a", { class: "btn primary", "data-testid": "account-export-csv", href: "/api/account/export?format=csv" }, "导出 CSV"),
+      h("a", { class: "btn", "data-testid": "account-export-xlsx", href: "/api/account/export?format=xlsx" }, "导出 XLSX")
+    );
+
+    if (!items.length) {
+      return [kpis, exportBar, h("div", { class: "empty" }, "没有可访问的工作区")];
+    }
+
+    const cards = items.map((row) => {
+      const inSession = state.tenants.find((t) => t.tenant_id === row.tenant_id);
+      const role = inSession && inSession.role;
+      const canEnter = Boolean(role); // 有成员/主账号角色才能激活进入（平台无角色行置灰）
+      const card = h(
+        "div",
+        { class: "workspace-card", "data-testid": "workspace-card", "data-tenant-id": row.tenant_id },
+        h(
+          "div",
+          { class: "workspace-head" },
+          h("strong", { class: "workspace-name" }, row.tenant_name || row.tenant_id),
+          row.account_name ? h("span", { class: "muted" }, row.account_name) : null,
+          h("span", { class: `status-badge ${row.status === "active" ? "status-published" : "status-deleted"}` },
+            row.status === "active" ? "active" : row.status)
+        ),
+        h(
+          "div",
+          { class: "workspace-counts" },
+          h("span", null, `箱子 ${row.boxes ?? 0}`),
+          h("span", null, `记录 ${row.records ?? 0}`),
+          h("span", null, `待上传 ${row.pending_uploads ?? 0}`)
+        ),
+        h("div", { class: "muted workspace-sync" }, `最近同步：${row.last_sync_at || "—"}`),
+        h(
+          "div",
+          { class: "workspace-actions" },
+          role === "parent_owner"
+            ? h("span", { class: "muted", style: "font-size:11px" }, "只读（主账号）")
+            : null,
+          h("button", {
+            class: "btn primary",
+            "data-testid": "workspace-enter",
+            disabled: canEnter ? null : "disabled",
+            title: canEnter
+              ? "以只读/成员身份进入该工作区"
+              : "平台账号无该工作区成员身份，v1 不支持代管进入（只读汇总/导出不受影响）",
+            onClick: () => {
+              switchTenant(row.tenant_id).catch((e) => alert(e.message || "进入失败"));
+            },
+          }, "进入")
+        )
+      );
+      return card;
+    });
+
+    return [
+      kpis,
+      exportBar,
+      h("div", { class: "workspace-grid", "data-testid": "workspace-grid" }, ...cards),
+      h("p", { class: "muted", style: "font-size:11px" },
+        "主账号对子工作区默认只读（§4.2）；代管写入口 v1 不提供，按钮置灰为预期行为。"),
+    ];
+  }
+
   function viewExport() {
     const buildUrl = (fmt) => {
       const p = new URLSearchParams({ format: fmt, tab: state.tab });
@@ -1346,8 +1561,17 @@
                 }),
               });
               state.user = r.user;
-              navigate("data", true);
+              // B6：改密换发的新会话已由服务端自动激活；刷新会话上下文再落点。
+              await loadSession();
+              if (!state.activeTenantId && state.accounts.length) {
+                state.route = "workspaces";
+                history.replaceState(null, "", "/pc/workspaces");
+              } else {
+                state.route = "data";
+                history.replaceState(null, "", "/pc");
+              }
               await loadRoute();
+              render();
             } catch (e) {
               err.textContent = e.message || "修改失败";
             }
@@ -1390,8 +1614,18 @@
                 render();
                 return;
               }
-              navigate("data", true);
+              // B6：登录响应已含 tenants / active_tenant_id（服务端单租户自动
+              // 激活）；再拉会话与主账号可见性决定落点。
+              await loadSession();
+              if (!state.activeTenantId && state.accounts.length) {
+                state.route = "workspaces";
+                history.replaceState(null, "", "/pc/workspaces");
+              } else {
+                state.route = "data";
+                history.replaceState(null, "", "/pc");
+              }
               await loadRoute();
+              render();
             } catch (e) {
               err.textContent = e.message || "登录失败";
             }
@@ -1414,6 +1648,7 @@
       return;
     }
     const views = {
+      workspaces: viewWorkspaces,
       data: viewData,
       overview: viewOverview,
       verify: viewQuickVerify,

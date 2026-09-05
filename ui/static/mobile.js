@@ -19,6 +19,10 @@
   /* 公众版「纯本地」判定：config.js 注入 MV_CONFIG.edition === "local"。
    * 云版（无 edition 或 "cloud"）行为与现状完全一致——本地数据层仅在本版生效。 */
   var IS_LOCAL_EDITION = !!(window.MV_CONFIG && window.MV_CONFIG.edition === "local");
+  /* 云版语义 = 非 local（B5，合同 §6.2/§7）：APK config.js 注入 edition="cloud"；
+   * 服务器托管的 /mobile 无 MV_CONFIG——B5 起服务端不再注入共享 token meta，
+   * 托管 H5 与云版 APK 一样走设备凭证绑定。local 版零变化。 */
+  var IS_CLOUD_EDITION = !IS_LOCAL_EDITION;
 
   /* ------------------------------------------------------------------ *
    * 状态 (design §7.5)
@@ -108,8 +112,19 @@
    * 离线记录上报队列（app 级单例）。纯 app 化后称重结果由本地控制器
    * 入队，outbox 负责联网补传 POST /api/records/report。整个 app 生命周期
    * 复用同一个实例（localStorage 持久化 + online 事件自动 flush）。
+   *
+   * B5（合同 §7.3-7.6）云版租户绑定——由设备凭证决定 outbox 模式：
+   *   - 凭证绑定 legacy-default → legacy 模式：v1 键原位（旧队列原位排空，
+   *     不静默迁入新身份），JSON 载荷声明 legacy-default 租户（§7.6）；
+   *   - 普通凭证 → v2 模式：键 mv.reportOutbox.v2.<tenant_id>，批次快照
+   *     {tenant_id, credential_id}，flush 前校验凭证租户（§7.3-7.5）；
+   *   - 云版无凭证 → 不启动 outbox（绑定页拦截全部 UI，绑定后刷新重建）；
+   *     已有 v1/v2 旧队列原样保留，绝不无凭证上传；
+   *   - local 版 → 与现状完全一致（v1 默认键；share 通道照旧隔离）。
    * ------------------------------------------------------------------ */
-  const reportOutbox = ReportClient.createOutbox({
+  var deviceCredential = (IS_CLOUD_EDITION && window.MvDeviceCredential)
+    ? window.MvDeviceCredential.load() : null;
+  var outboxOpts = {
     storage: localStorage,
     // 独立 app（打包进 APK）跨源时上报接口必须前置 MV_CONFIG.apiBase；
     // 服务器托管 H5 无 MV_CONFIG → apiUrl() 原样返回，等价现状（同源）。
@@ -124,8 +139,20 @@
         if (rel === "/outbox" || rel === "/settings") render();
       } catch (_) {}
     },
-  });
-  reportOutbox.start();
+  };
+  if (deviceCredential && deviceCredential.tenant_id === ReportClient.LEGACY_DEFAULT_TENANT_ID) {
+    outboxOpts.legacyDefaultTenantId = ReportClient.LEGACY_DEFAULT_TENANT_ID;
+    outboxOpts.boundTenantId = deviceCredential.tenant_id;
+    outboxOpts.token = function () { return deviceCredential ? deviceCredential.token : ""; };
+  } else if (deviceCredential) {
+    outboxOpts.tenantId = deviceCredential.tenant_id;
+    outboxOpts.credentialId = deviceCredential.device_id;
+    outboxOpts.boundTenantId = deviceCredential.tenant_id;
+    outboxOpts.token = function () { return deviceCredential ? deviceCredential.token : ""; };
+  }
+  const reportOutbox = ReportClient.createOutbox(outboxOpts);
+  // 云版无凭证时不启动（绑定页拦截）；local 版与有凭证的云版照常启动。
+  if (!(IS_CLOUD_EDITION && !deviceCredential)) reportOutbox.start();
 
   /* ------------------------------------------------------------------ *
    * 公众版「共享数据以改善应用」上传通道（local edition 专用）。
@@ -175,6 +202,48 @@
       })
     : null;
   if (shareOutbox) shareOutbox.start();
+
+  /* ------------------------------------------------------------------ *
+   * 云版工作区状态辅助（B5，§7.5-7.6 / 任务 B5-7）。
+   * - workspaceLabel()：当前工作区显示名（凭证里的 tenant_name）。
+   * - leftoverOtherWorkspaceQueues()：统计「上一工作区」遗留队列条数。
+   *   规则（§7.5）：只读计数，绝不静默迁移/上传——当前凭证租户 ≠ 队列租户
+   *   时，v1 键与其他租户的 v2 键都算遗留；绑定 legacy-default 时 v1 键由
+   *   legacy 模式 outbox 排空（不算遗留）。
+   * ------------------------------------------------------------------ */
+  function currentOutboxKey() {
+    if (!deviceCredential) return null;
+    if (deviceCredential.tenant_id === ReportClient.LEGACY_DEFAULT_TENANT_ID) {
+      return ReportClient.DEFAULT_STORAGE_KEY;
+    }
+    return ReportClient.OUTBOX_KEY_V2_PREFIX + deviceCredential.tenant_id;
+  }
+
+  function leftoverOtherWorkspaceQueues() {
+    if (!IS_CLOUD_EDITION || !deviceCredential) return 0;
+    var ownKey = currentOutboxKey();
+    var total = 0;
+    try {
+      var v1Prefix = ReportClient.DEFAULT_STORAGE_KEY;
+      var v2Prefix = ReportClient.OUTBOX_KEY_V2_PREFIX;
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (!k || k === ownKey) continue;
+        var isV1 = k === v1Prefix;
+        var isV2Other = k.indexOf(v2Prefix) === 0 && k.indexOf(".dead") < 0;
+        if (isV1 || isV2Other) {
+          total += ReportClient.readQueueCount(localStorage, k);
+        }
+      }
+    } catch (_) {}
+    return total;
+  }
+
+  function workspaceLabel() {
+    if (!IS_CLOUD_EDITION) return "";
+    if (!deviceCredential) return "未绑定工作区";
+    return deviceCredential.tenant_name || deviceCredential.tenant_id;
+  }
 
   /* 构造并启动一个天平通道，挂载标准读数/状态/stale 回调。
    * deviceId 可选：支持设备选择 API 时传入以锁定设备；否则走旧直连。 */
@@ -972,9 +1041,10 @@
     );
     const content = h("div", { class: "content" });
 
-    // 日期副标题
+    // 日期副标题；云版已绑定时附当前工作区名（任务 B5-7：首页显示工作区）。
     const today = new Date();
     const dateStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
+    const wsLabel = workspaceLabel();
 
     // 品牌头部：logo（薄荷绿底白鼠站秤）+ 标题。对齐 page-title 体系，简洁不喧宾夺主。
     const brand = h("div", { class: "brand-header" }, [
@@ -987,7 +1057,8 @@
       }),
       h("div", { class: "brand-text" }, [
         h("div", { class: "brand-title" }, "小鼠称重"),
-        h("div", { class: "brand-subtitle" }, dateStr),
+        h("div", { class: "brand-subtitle" },
+          wsLabel && wsLabel !== "未绑定工作区" ? `${dateStr} · ${wsLabel}` : dateStr),
       ]),
     ]);
     content.appendChild(brand);
@@ -3652,7 +3723,31 @@
               h("p", { class: "export-note" }, "视频证据保留在 app 内，暂不支持导出"),
             ]
           : [
-              h("div", { class: "li-sub" }, "数据同步"),
+              // 云版（B5）：当前工作区 + 凭证状态 + 上一工作区遗留提示（§7.5）
+              h("div", { class: "li-sub" }, "工作区"),
+              h("div", { class: "kv" }, [
+                h("span", { class: "k" }, "当前工作区"),
+                h("span", { class: "v" }, workspaceLabel() || "—"),
+              ]),
+              h("div", { class: "kv" }, [
+                h("span", { class: "k" }, "设备绑定"),
+                h("span", { class: "v" }, deviceCredential
+                  ? (deviceCredential.device_label || "已绑定")
+                  : "未绑定"),
+              ]),
+              (function () {
+                const leftover = leftoverOtherWorkspaceQueues();
+                if (leftover <= 0) return null;
+                return h("div", { class: "kv" }, [
+                  h("span", { class: "k" }, "上一工作区"),
+                  h("span", { class: "v", style: "color:#e67e22" }, `还有 ${leftover} 条未上传`),
+                ]);
+              })(),
+              (typeof reportOutbox.lastAuthFailed === "function") && reportOutbox.lastAuthFailed()
+                ? h("div", { class: "li-sub", style: "color:#c0392b" },
+                  "上次上报被服务器拒绝（凭证可能已被撤销），可点「重新验证」确认")
+                : null,
+              h("div", { class: "li-sub", style: "margin-top:8px" }, "数据同步"),
               h("div", { class: "kv" }, [
                 h("span", { class: "k" }, "待同步"),
                 h("span", { class: "v" }, `${pendingSync} 条`),
@@ -3681,6 +3776,28 @@
             h("div", { class: "li-sub" }, "管理端"),
             h("button", { class: "btn ghost", onClick: () => (location.href = apiUrl("/?intent=manage")) }, "打开管理端"),
           ]),
+        // 云版（B5，任务 B5-7）：设备凭证管理——重新验证 / 退出绑定后可重新
+        // 走绑定流程（撤销 → 重绑可走通）。
+        IS_CLOUD_EDITION && deviceCredential
+          ? h("div", { class: "card" }, [
+              h("div", { class: "li-sub" }, "设备凭证"),
+              h("button", {
+                class: "btn outline",
+                onClick: async () => {
+                  const ok = await verifyCredential("设备凭证已被撤销，请重新绑定工作区");
+                  if (ok) toast("凭证有效");
+                  render();
+                },
+              }, "重新验证"),
+              h("button", {
+                class: "btn ghost",
+                onClick: () => {
+                  if (window.MvDeviceCredential) window.MvDeviceCredential.clear();
+                  location.reload();
+                },
+              }, "退出绑定（换工作区）"),
+            ])
+          : null,
       ])
     );
     mount(screen);
@@ -3836,6 +3953,161 @@
     ]);
   }
 
+  /* ================================================================== *
+   * 云版设备凭证引导（B5，§6.2 / §7 / 任务 B5-5、B5-7）
+   * 仅云版语义生效（IS_CLOUD_EDITION）；local 版完全不触及以下逻辑。
+   * ================================================================== */
+
+  /* 绑定页（全屏覆盖层）。云版无凭证时启动即展示；凭证被撤销（401）后
+   * 重新展示并带提示。两种绑定方式：输绑定码 / 子账号登录（多工作区账号
+   * 会先选择工作区再登录绑定）。绑定成功 → 保存凭证 → 整页刷新（outbox
+   * 按新凭证重建，队列键/快照随绑定固定，避免热切换的半绑定状态）。 */
+  function showBindingOverlay(hint) {
+    if (!IS_CLOUD_EDITION) return;
+    const old = document.getElementById("mv-bind-overlay");
+    if (old) old.remove();
+
+    const cred = window.MvDeviceCredential;
+    let mode = "code"; // "code" | "login"
+
+    const pane = h("div", {});
+    const overlay = h("div", {
+      id: "mv-bind-overlay",
+      style: "position:fixed;inset:0;z-index:300;background:#f6f8f7;overflow:auto",
+    });
+
+    function codePane() {
+      const codeInput = h("input", { placeholder: "输入管理员提供的一次性绑定码", autocomplete: "off" });
+      const labelInput = h("input", { placeholder: "设备备注（可选，如「3 号手机」）", maxlength: "64" });
+      const err = h("div", { class: "li-sub", style: "color:#c0392b;min-height:1.2em" }, "");
+      const btn = h("button", {
+        class: "btn primary",
+        onClick: async () => {
+          btn.disabled = true;
+          err.textContent = "";
+          try {
+            await cred.bindWithCode(codeInput.value, labelInput.value.trim());
+            location.reload();
+          } catch (e) {
+            err.textContent = (e && e.message) || "绑定失败";
+            btn.disabled = false;
+          }
+        },
+      }, "绑定此设备");
+      return h("div", { class: "card" }, [
+        h("div", { class: "field" }, [h("label", {}, "绑定码"), codeInput]),
+        h("div", { class: "field" }, [h("label", {}, "设备备注"), labelInput]),
+        err,
+        btn,
+      ]);
+    }
+
+    function loginPane() {
+      const userInput = h("input", { placeholder: "子账号用户名", autocomplete: "username" });
+      const passInput = h("input", { type: "password", placeholder: "密码", autocomplete: "current-password" });
+      const labelInput = h("input", { placeholder: "设备备注（可选）", maxlength: "64" });
+      const err = h("div", { class: "li-sub", style: "color:#c0392b;min-height:1.2em" }, "");
+      const tenantPickWrap = h("div", {});
+      let selectedTenant = null;
+
+      function renderTenantPick(tenants) {
+        tenantPickWrap.innerHTML = "";
+        tenantPickWrap.appendChild(h("div", { class: "li-sub" },
+          "该账号属于多个工作区，请选择要绑定的工作区："));
+        tenants.forEach((t) => {
+          tenantPickWrap.appendChild(h("button", {
+            class: "btn outline",
+            onClick: () => {
+              selectedTenant = t;
+              err.textContent = "";
+              tenantPickWrap.querySelectorAll("button").forEach((b) => (b.disabled = false));
+              btn.textContent = `绑定到「${t.name}」`;
+            },
+          }, `${t.name}（${t.role === "tenant_admin" ? "管理员" : "操作员"}）`));
+        });
+      }
+
+      const btn = h("button", {
+        class: "btn primary",
+        onClick: async () => {
+          btn.disabled = true;
+          err.textContent = "";
+          try {
+            await cred.login(
+              userInput.value,
+              passInput.value,
+              selectedTenant ? selectedTenant.tenant_id : null,
+              labelInput.value.trim(),
+            );
+            location.reload();
+          } catch (e) {
+            btn.disabled = false;
+            if (e && e.code === "pick-tenant") {
+              renderTenantPick(e.tenants || []);
+              return;
+            }
+            err.textContent = (e && e.message) || "登录失败";
+          }
+        },
+      }, "登录并绑定设备");
+
+      return h("div", { class: "card" }, [
+        tenantPickWrap,
+        h("div", { class: "field" }, [h("label", {}, "用户名"), userInput]),
+        h("div", { class: "field" }, [h("label", {}, "密码"), passInput]),
+        h("div", { class: "field" }, [h("label", {}, "设备备注"), labelInput]),
+        err,
+        btn,
+      ]);
+    }
+
+    function renderPane(nextMode) {
+      mode = nextMode;
+      pane.innerHTML = "";
+      if (mode === "code") pane.appendChild(codePane());
+      else pane.appendChild(loginPane());
+      tabCode.classList.toggle("active-tab", mode === "code");
+      tabLogin.classList.toggle("active-tab", mode === "login");
+    }
+
+    const tabCode = h("button", { class: "btn outline", onClick: () => switchMode("code") }, "绑定码");
+    const tabLogin = h("button", { class: "btn outline", onClick: () => switchMode("login") }, "子账号登录");
+    function switchMode(m) { renderPane(m); }
+
+    overlay.appendChild(h("div", { style: "max-width:420px;margin:48px auto;padding:0 16px" }, [
+      h("div", { class: "brand-header" }, [
+        h("img", { class: "brand-logo", src: "/static/app-icon-192.png", alt: "", width: 44, height: 44 }),
+        h("div", { class: "brand-text" }, [
+          h("div", { class: "brand-title" }, "绑定工作区"),
+          h("div", { class: "brand-subtitle" }, "绑定后本机即可向对应工作区上传称重记录"),
+        ]),
+      ]),
+      hint ? h("div", { class: "card", style: "border-left:4px solid #e67e22" }, hint) : null,
+      h("div", { class: "group", style: "display:flex;gap:8px;margin:12px 0" }, [tabCode, tabLogin]),
+      pane,
+    ]));
+    renderPane("code");
+    document.body.appendChild(overlay);
+  }
+
+  /* 启动 / 手动触发：用当前凭证轻量校验一次。401/403 = 凭证已被服务端撤销
+   * → 清除本地凭证并回到绑定页（§7.2 / 任务 B5-5）。网络错误静默（离线
+   * 不影响本地称重；下次联网后再验）。 */
+  function verifyCredential(hintOnFail) {
+    if (!IS_CLOUD_EDITION || !deviceCredential) return Promise.resolve(true);
+    return apiFetch("/api/boxes/recent")
+      .then(function (res) {
+        if (res.status === 401 || res.status === 403) {
+          if (window.MvDeviceCredential) window.MvDeviceCredential.clear();
+          deviceCredential = null;
+          showBindingOverlay(hintOnFail || "设备凭证已被撤销，请重新绑定工作区");
+          return false;
+        }
+        return true;
+      })
+      .catch(function () { return true; });
+  }
+
   /* ------------------------------------------------------------------ *
    * 路由注册
    * ------------------------------------------------------------------ */
@@ -3856,6 +4128,7 @@
     if (typeof window !== "undefined") {
       window.__MV_DEBUG = {
         IS_LOCAL_EDITION,
+        IS_CLOUD_EDITION,
         makeApiRoutes,
         buildExportCsv,
         buildExportJson,
@@ -3875,4 +4148,11 @@
   } catch (_) {}
 
   render();
+
+  // 云版设备凭证引导（B5，§7.2）：无凭证 → 绑定页拦截全部 UI；有凭证 →
+  // 静默校验一次（401/403 = 已被撤销 → 清凭证、回绑定页）。local 版不触及。
+  if (IS_CLOUD_EDITION) {
+    if (!deviceCredential) showBindingOverlay("");
+    else verifyCredential("");
+  }
 })();

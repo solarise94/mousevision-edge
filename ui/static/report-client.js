@@ -38,6 +38,12 @@
   "use strict";
 
   var DEFAULT_STORAGE_KEY = "mv.reportOutbox.v1";
+  // B5（合同 §7.3-7.6）：租户 outbox v2——每个工作区一个键；批次内固化
+  // {tenant_id, credential_id} 快照；flush 前校验当前凭证绑定租户，不匹配
+  // 拒绝发送且批次留在原队列（防止换账号把旧草稿传到错误工作区）。
+  var OUTBOX_KEY_V2_PREFIX = "mv.reportOutbox.v2.";
+  // 与 ui/control_store.py 的 LEGACY_TENANT_ID 一致（§16-G5 固定 UUID）。
+  var LEGACY_DEFAULT_TENANT_ID = "00000000-0000-4000-8000-000000000001";
   var DEFAULT_ENDPOINT = "/api/records/report";
   var TOKEN_META_SELECTOR = 'meta[name="mousevision-api-token"]';
 
@@ -192,10 +198,19 @@
     return String(recordId == null ? "" : recordId).replace(/[^A-Za-z0-9_-]/g, "");
   }
 
-  /* ------------------------------------------------------------------ *
+  /* ------------------------------------------------------------------
    * outbox 工厂。opts 全部可选，依赖注入便于测试：
    *   storage      localStorage 兼容对象（getItem/setItem/removeItem）
-   *   key          存储键，默认 "mv.reportOutbox.v1"
+   *   key          存储键。缺省按租户模式推导（见下）；显式传入时优先生效
+   *                （share 通道等自定义键继续用这里）。
+   *   tenantId     租户模式：工作区 UUID。键 = "mv.reportOutbox.v2.<tenantId>"，
+   *                批次入队时快照 {tenant_id, credential_id}。
+   *   credentialId 当前设备凭证 ID（快照进批次；与 tenantId 配套）。
+   *   boundTenantId 当前凭证绑定的租户（flush 校验基准；缺省= tenantId）。
+   *   legacyDefaultTenantId
+   *                legacy 模式：批次固化该租户（= legacy-default），存储键
+   *                保持 v1 全局键；flush 发送 JSON 载荷并携带 tenant_id
+   *                （合同 §7.6：v1 队列只上传 legacy tenant，不静默迁入新账号）。
    *   token        字符串 / ()=>string；缺省则每次 flush 时从 document 读
    *   endpoint     默认 "/api/records/report"
    *   fetchFn      注入 fetch（默认全局 fetch）
@@ -205,13 +220,39 @@
    *   setInterval / clearInterval              注入定时器（测试模拟退避）
    *   document     注入 document（测试读 token）
    *   baseIntervalMs / maxIntervalMs          退避参数
+   *
+   * 模式判定：legacyDefaultTenantId > tenantId > 默认（v1 全局键，历史行为）。
+   * 模式只影响「键选择 / 快照 / flush 校验 / 载荷形态」这一层外壳；防丢骨架
+   * （原子持久化、死信迁移、按 clientBatchId 出队、401/403 停止与恢复、退避
+   * 重排）完全不变（§14.2）。
    * ------------------------------------------------------------------ */
   function createOutbox(opts) {
     opts = opts || {};
 
     var storage = opts.storage ||
       (typeof localStorage !== "undefined" ? localStorage : null);
-    var key = (typeof opts.key === "string" && opts.key) ? opts.key : DEFAULT_STORAGE_KEY;
+    var legacyTenantId = (typeof opts.legacyDefaultTenantId === "string" && opts.legacyDefaultTenantId)
+      ? opts.legacyDefaultTenantId : null;
+    var tenantId = (typeof opts.tenantId === "string" && opts.tenantId) ? opts.tenantId : null;
+    var credentialId = (typeof opts.credentialId === "string" && opts.credentialId) ? opts.credentialId : "";
+    // flush 校验基准：当前凭证绑定的租户。缺省 = 队列自身租户（自洽，恒通过）。
+    var boundTenantId = (typeof opts.boundTenantId === "string" && opts.boundTenantId)
+      ? opts.boundTenantId
+      : (tenantId || legacyTenantId);
+    // 租户绑定模式（v2 或 legacy 快照）：入队快照 + flush 校验。
+    var tenantBound = !!(tenantId || legacyTenantId);
+    // legacy 模式走 JSON 载荷（携带 tenant_id 标识，服务端按凭证解析租户）。
+    var jsonPayloadMode = !!legacyTenantId;
+    var key;
+    if (typeof opts.key === "string" && opts.key) {
+      key = opts.key; // 显式键（share 通道等自定义 outbox）
+    } else if (legacyTenantId) {
+      key = DEFAULT_STORAGE_KEY; // legacy 模式：v1 全局键（队列原位，不迁移）
+    } else if (tenantId) {
+      key = OUTBOX_KEY_V2_PREFIX + tenantId; // v2：按租户分键
+    } else {
+      key = DEFAULT_STORAGE_KEY; // 历史默认（无租户语义）
+    }
     var tokenOpt = opts.token; // string | function | undefined
     var endpoint = (typeof opts.endpoint === "string" && opts.endpoint) ? opts.endpoint : DEFAULT_ENDPOINT;
     var fetchFn = opts.fetchFn ||
@@ -495,22 +536,55 @@
       return "retry";
     }
 
+    /* ---------- legacy 快照模式的 JSON 载荷（合同 §7.6） ----------
+     * v1 队列 + legacy-default 身份 flush 时发送 JSON：批次快照的 tenant_id
+     * 随载荷声明（服务端按凭证解析租户，客户端字段仅自证）。照片 dataURL
+     * 保留在 records 内随 JSON 上传（服务端解码）；视频 Blob 无法进 JSON
+     * 载荷——与「reload 后丢视频」同一取舍：丢视频可接受，丢记录不可接受。 */
+    function buildJsonPayload(item) {
+      var b = item.batch || {};
+      var payload = {};
+      if (b.tenant_id != null) payload.tenant_id = b.tenant_id;
+      if (b.cage_id != null) payload.cage_id = b.cage_id;
+      if (b.strain != null) payload.strain = b.strain;
+      if (b.project_id != null) payload.project_id = b.project_id;
+      if (b.device_id != null) payload.device_id = b.device_id;
+      if (b.weight_source != null) payload.weight_source = b.weight_source;
+      payload.records = b.records || [];
+      if (item.readings && typeof item.readings === "object") payload.readings = item.readings;
+      return JSON.stringify(payload);
+    }
+
     /* ---------- 发送单批 ---------- */
     function sendOne(item) {
-      var fd;
-      try { fd = buildFormData(item); }
-      catch (e) { return Promise.resolve({ kind: "dead", reason: "formdata-error", error: e }); }
       var headers = {};
       var tok = currentToken();
       if (tok) headers["X-MouseVision-Token"] = tok;
 
+      var bodyPromise;
+      if (jsonPayloadMode) {
+        headers["Content-Type"] = "application/json";
+        bodyPromise = Promise.resolve(buildJsonPayload(item));
+      } else {
+        bodyPromise = Promise.resolve()
+          .then(function () { return buildFormData(item); })
+          .catch(function (e) {
+            return { formdataError: e };
+          });
+      }
+
+      return bodyPromise.then(function (bodyOrErr) {
+        if (bodyOrErr && bodyOrErr.formdataError) {
+          return { kind: "dead", reason: "formdata-error", error: bodyOrErr.formdataError };
+        }
+
       if (!fetchFn) {
         // 无 fetch（node 测试未注入 / 浏览器降级）→ 视为 retry，不丢数据
-        return Promise.resolve({ kind: "retry", reason: "no-fetch" });
+        return { kind: "retry", reason: "no-fetch" };
       }
 
       return Promise.resolve()
-        .then(function () { return fetchFn(endpoint, { method: "POST", headers: headers, body: fd }); })
+        .then(function () { return fetchFn(endpoint, { method: "POST", headers: headers, body: bodyOrErr }); })
         .then(function (res) {
           // 尝试解析 body（res.json() 或注入的假 fetch 直接返回 _body）
           var bodyP;
@@ -545,18 +619,49 @@
           // 网络/拒绝 → retry（离线不丢）
           return { kind: "retry" };
         });
+      });
+    }
+
+    /* ---------- flush 前的租户一致性校验（合同 §7.4） ----------
+     * 当前凭证绑定的租户（boundTenantId）必须与每个批次的租户快照一致；
+     * 任一不一致 → 拒绝本轮 flush（一个批次都不发、全部留在原队列），返回
+     * 被拒批次清单供 UI 提示「上一工作区还有 N 条未上传」。旧 v1 批次
+     * （无快照）在 legacy 模式下视为 legacy-default。
+     * 返回 null = 校验通过；非 null = 被拒批次数组。 */
+    function collectTenantMismatch() {
+      if (!tenantBound) return null;
+      var expected = boundTenantId || legacyTenantId || tenantId;
+      var rejected = [];
+      for (var i = 0; i < queue.length; i++) {
+        var qitem = queue[i];
+        var t = qitem && qitem.batch ? qitem.batch.tenant_id : null;
+        if (!t && legacyTenantId) t = legacyTenantId;
+        if (t !== expected) {
+          rejected.push({
+            clientBatchId: qitem ? qitem.clientBatchId : "",
+            batch_tenant_id: t || null,
+            bound_tenant_id: expected
+          });
+        }
+      }
+      return rejected.length ? rejected : null;
     }
 
     /* ---------- flush：按入队顺序逐批发送 ---------- */
     function flush() {
-      if (inFlight) return Promise.resolve({ sent: 0, remaining: queue.length });
+      if (inFlight) return Promise.resolve({ sent: 0, remaining: queue.length, rejected: [] });
+      // 租户不一致：拒绝发送、批次原队列保留（一个都不发，防错传，§7.4/§7.5）。
+      var mismatched = collectTenantMismatch();
+      if (mismatched) {
+        return Promise.resolve({ sent: 0, remaining: queue.length, rejected: mismatched });
+      }
       inFlight = true;
       var sentCount = 0;
 
       function step() {
         if (queue.length === 0) {
           inFlight = false;
-          return { sent: sentCount, remaining: 0 };
+          return { sent: sentCount, remaining: 0, rejected: [] };
         }
         var item = queue[0];
         return sendOne(item).then(function (r) {
@@ -617,7 +722,7 @@
               inFlight = false;
               consecutiveFailures += 1;
               rescheduleRetry();
-              return { sent: sentCount, remaining: queue.length };
+              return { sent: sentCount, remaining: queue.length, rejected: [] };
             }
             // 死信已落盘：按 clientBatchId 精确移出主队列并写主队列持久化。
             removeQueueItemById(dead.clientBatchId);
@@ -632,14 +737,14 @@
             inFlight = false;
             consecutiveFailures += 1;
             rescheduleRetry();
-            return { sent: sentCount, remaining: queue.length };
+            return { sent: sentCount, remaining: queue.length, rejected: [] };
           }
           // retry：停止，保留该批及后续（离线不丢）
           inFlight = false;
           // 失败一次 → 累加连续失败，触发退避重排
           consecutiveFailures += 1;
           rescheduleRetry();
-          return { sent: sentCount, remaining: queue.length };
+          return { sent: sentCount, remaining: queue.length, rejected: [] };
         });
       }
 
@@ -655,7 +760,7 @@
         inFlight = false;
         consecutiveFailures += 1;
         rescheduleRetry();
-        return { sent: sentCount, remaining: queue.length, error: e };
+        return { sent: sentCount, remaining: queue.length, rejected: [], error: e };
       });
     }
 
@@ -705,10 +810,22 @@
         if (!Array.isArray(batch.records)) {
           throw new Error("enqueue: batch.records 必须是数组");
         }
+        var storedBatch = batch;
+        if (tenantBound) {
+          // 租户绑定模式：批次内固化 {tenant_id, credential_id} 快照（§7.3）。
+          // 拷贝而不改写调用方对象；快照以当前绑定为准（覆盖同名客户端字段，
+          // 服务端也从不信任客户端租户字段，见 §4.3）。
+          storedBatch = {};
+          for (var bk in batch) {
+            if (Object.prototype.hasOwnProperty.call(batch, bk)) storedBatch[bk] = batch[bk];
+          }
+          storedBatch.tenant_id = legacyTenantId || tenantId;
+          if (!legacyTenantId && credentialId) storedBatch.credential_id = credentialId;
+        }
         var item = {
           clientBatchId: uuid(),
           enqueuedAt: now(),
-          batch: batch
+          batch: storedBatch
         };
         if (videoOpt != null) item.videoBlobRef = videoOpt;
         if (readingsOpt && typeof readingsOpt === "object") item.readings = readingsOpt;
@@ -943,6 +1060,25 @@
     };
   }
 
+  /* ------------------------------------------------------------------ *
+   * 读取指定 outbox 键的待传批次数（UI 显示「上一工作区还有 N 条未上传」）。
+   * 缺键 / 损坏 → 0（只读，不修复、不迁移——v1 队列绝不静默并入新身份）。
+   * ------------------------------------------------------------------ */
+  function readQueueCount(storage, key) {
+    if (!storage || typeof storage.getItem !== "function") return 0;
+    try {
+      var raw = storage.getItem(key);
+      if (!raw || typeof raw !== "string") return 0;
+      var parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.queue)) return 0;
+      return parsed.queue.filter(function (item) {
+        return item && typeof item === "object" && item.batch && Array.isArray(item.batch.records);
+      }).length;
+    } catch (_) {
+      return 0;
+    }
+  }
+
   return {
     buildRecord: buildRecord,
     createOutbox: createOutbox,
@@ -951,7 +1087,10 @@
     uuid: uuid,
     dataUrlToBlob: dataUrlToBlob,
     safePhotoStem: safePhotoStem,
+    readQueueCount: readQueueCount,
     DEFAULT_STORAGE_KEY: DEFAULT_STORAGE_KEY,
+    OUTBOX_KEY_V2_PREFIX: OUTBOX_KEY_V2_PREFIX,
+    LEGACY_DEFAULT_TENANT_ID: LEGACY_DEFAULT_TENANT_ID,
     DEFAULT_ENDPOINT: DEFAULT_ENDPOINT,
     DEFAULT_BASE_INTERVAL_MS: DEFAULT_BASE_INTERVAL_MS,
     DEFAULT_MAX_INTERVAL_MS: DEFAULT_MAX_INTERVAL_MS

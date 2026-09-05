@@ -16,10 +16,12 @@ val keystoreProps = Properties().apply {
 }
 
 // 打包 app 运行配置（构建期 -P 注入，见 README）：
-// - MICE_API_BASE：API 服务器地址，默认生产地址；
-// - MICE_SYNC_TOKEN：上报同步令牌，默认空（由主代理提供，留好通道即可）。
+// - MICE_API_BASE：API 服务器地址，默认生产地址。
 // 本地文件注入：rootProject/sync.properties（gitignored）里同名属性优先于默认值，
 // -P 命令行属性优先于文件。
+// B5（合同 §7.1/§15-B5）：不再注入共享同步令牌 MICE_SYNC_TOKEN——云版设备
+// 在首次启动时经绑定码 / 子账号登录获取专属设备凭证（见 ui/static/
+// device-credential.js），local 版纯本地无实验室通道。
 val syncPropsFile = rootProject.file("sync.properties")
 val syncProps = Properties().apply {
     if (syncPropsFile.exists()) syncPropsFile.inputStream().use { load(it) }
@@ -27,9 +29,6 @@ val syncProps = Properties().apply {
 val miceApiBase: String =
     providers.gradleProperty("MICE_API_BASE")
         .getOrElse(syncProps.getProperty("MICE_API_BASE") ?: "https://weight.pingoodmice.top:16206")
-val miceSyncToken: String =
-    providers.gradleProperty("MICE_SYNC_TOKEN")
-        .getOrElse(syncProps.getProperty("MICE_SYNC_TOKEN") ?: "")
 // 共享令牌（local 公众版「共享数据以改善应用」上传通道）。
 // 仅 local flavor 注入 config.js；cloud 版写空串（无共享通道）。
 val miceShareToken: String =
@@ -44,8 +43,8 @@ android {
         applicationId = "com.pingoodmice.miceautomatic"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.3.4"
+        versionCode = 8
+        versionName = "0.3.5"
 
         // 应用名由各 flavor 覆盖（cloud=「小鼠称重」，local=「小鼠称重·本地版」）。
         resValue("string", "app_name", "小鼠称重")
@@ -145,7 +144,7 @@ tasks.register<Copy>("syncH5Assets") {
     // config.js 为构建期按 flavor 生成，避免被源文件覆盖。
     exclude("config.js")
     inputs.property("apiBase", miceApiBase)
-    inputs.property("token", miceSyncToken)
+    inputs.property("shareToken", miceShareToken)
 }
 
 // 每个 flavor 生成其专属 config.js（edition / token 因 flavor 而异）。
@@ -189,8 +188,10 @@ listOf("cloud", "local").forEach { flavor ->
     android.sourceSets[flavor].assets.srcDir(cfgDir)
     val configTask = tasks.register<GenerateAppConfig>("generateAppConfig$flavor") {
         apiBase = miceApiBase
-        // local（公众本地版）不携带同步令牌：纯本地不上传。
-        syncToken = if (flavor == "local") "" else miceSyncToken
+        // B5（§15-B5）：两个 flavor 都不再携带共享实验室写 token（cloud 改为
+        // 运行时设备凭证绑定；local 纯本地）。config.js 仍写出 token 字段
+        // （空串），保持 H5 端 MV_CONFIG 形状兼容。
+        syncToken = ""
         // 共享通道仅 local 版注入（云版无共享上传）。
         shareToken = if (flavor == "local") miceShareToken else ""
         edition = flavor
